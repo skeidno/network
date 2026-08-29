@@ -7,6 +7,9 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+build-next/
+dist-next/
+dist-previous/
 *.spec
 /*.png
 vendor/mihomo.exe
