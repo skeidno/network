@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QSize, QThreadPool, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QPainter
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QIcon, QPainter
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -140,7 +140,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Network Manager")
         self.resize(1180, 780)
         self.setMinimumSize(940, 660)
-        self.setWindowIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
+        icon_path = Path(__file__).resolve().parents[1] / "web" / "icons" / "network-manager.ico"
+        self.setWindowIcon(QIcon(str(icon_path)))
         self._build_ui()
         self._build_tray()
         self._load_config_into_ui()

@@ -23,6 +23,7 @@ dev = [
   "pyinstaller>=6.0",
   "playwright>=1.49",
   "build>=1.2",
+  "pillow>=10.0",
 ]
 
 [project.scripts]
@@ -38,6 +39,7 @@ network_manager = [
   "web/*.css",
   "web/*.js",
   "web/icons/*.svg",
+  "web/icons/*.ico",
   "web/icons/LUCIDE_LICENSE",
 ]
 

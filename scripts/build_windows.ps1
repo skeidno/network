@@ -8,6 +8,7 @@ python -m PyInstaller `
   --clean `
   --windowed `
   --uac-admin `
+  --icon "src\network_manager\web\icons\network-manager.ico" `
   --name NetworkManager `
   --paths src `
   --add-data "src\network_manager\style.qss;network_manager" `

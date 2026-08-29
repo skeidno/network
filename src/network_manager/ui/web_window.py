@@ -16,6 +16,7 @@ from PySide6.QtCore import QObject, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QFileDialog
 
+from network_manager.browser_window import BrowserWindowController
 from network_manager.local_web_server import LocalWebServer
 from network_manager.credential_store import CredentialStore, CredentialStoreError
 from network_manager.models import (
@@ -904,6 +905,10 @@ class WebBridge(QObject):
     def openLogs(self) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(logs_dir())))
 
+    @Slot(str, result=bool)
+    def windowAction(self, action: str) -> bool:
+        return self.window.browser_window.perform(action)
+
     def _notify(self, kind: str, message: str) -> None:
         with self._toast_lock:
             self._toasts.append({"kind": kind, "message": message})
@@ -918,6 +923,8 @@ class WebBridge(QObject):
 class WebMainWindow(NativeMainWindow):
     def __init__(self, startup_launch: bool = False) -> None:
         super().__init__(startup_launch=startup_launch)
+        app_icon = Path(__file__).resolve().parents[1] / "web" / "icons" / "network-manager.ico"
+        self.browser_window = BrowserWindowController("Network Manager", app_icon)
         self.credential_store = CredentialStore(ssh_credentials_path())
         self.ssh_tunnel = SshTunnelManager(ssh_known_hosts_path())
         self.web_bridge = WebBridge(self)
@@ -952,6 +959,7 @@ class WebMainWindow(NativeMainWindow):
             "deleteSshServer",
             "testSshExit",
             "pickSshKey",
+            "windowAction",
         }
         self.web_server = LocalWebServer(web_root, self.web_bridge, allowed_methods)
         self.web_url = self.web_server.start()
@@ -961,6 +969,8 @@ class WebMainWindow(NativeMainWindow):
 
     def open_web_ui(self) -> None:
         if os.environ.get("NETWORK_MANAGER_NO_BROWSER") == "1":
+            return
+        if self.browser_window.show_existing():
             return
         now = time.monotonic()
         if now - self._last_browser_open < 1.0:
@@ -976,20 +986,34 @@ class WebMainWindow(NativeMainWindow):
         if edge is not None:
             flags = 0x08000000 if os.name == "nt" else 0
             try:
-                subprocess.Popen(
-                    [str(edge), f"--app={self.web_url}", "--new-window"],
+                window_url = self.web_url
+                if self.browser_window.supported:
+                    window_url += "?customFrame=1"
+                process = subprocess.Popen(
+                    [str(edge), f"--app={window_url}", "--new-window"],
                     close_fds=True,
                     creationflags=flags,
                 )
+                self._attach_browser_window(process.pid)
                 return
             except OSError:
                 pass
         QDesktopServices.openUrl(QUrl(self.web_url))
 
+    def _attach_browser_window(self, launch_pid: int, attempt: int = 0) -> None:
+        if self.browser_window.attach(launch_pid):
+            return
+        if attempt < 40:
+            QTimer.singleShot(
+                100,
+                lambda: self._attach_browser_window(launch_pid, attempt + 1),
+            )
+
     def show_and_raise(self) -> None:
         self.open_web_ui()
 
     def shutdown(self) -> None:
+        self.browser_window.close()
         self.web_server.close()
         self.web_bridge.close()
         super().shutdown()

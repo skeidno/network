@@ -1,6 +1,8 @@
 "use strict";
 
 const SESSION_TOKEN = document.querySelector('meta[name="network-session-token"]')?.content || "";
+const CUSTOM_FRAME = new URLSearchParams(window.location.search).get("customFrame") === "1";
+document.body.classList.toggle("custom-frame", CUSTOM_FRAME);
 let appState = null;
 let currentPage = "overview";
 let currentNodeTab = "local";
@@ -665,6 +667,15 @@ function showToast(kind, message) {
 }
 
 function bindEvents() {
+  if (CUSTOM_FRAME) {
+    byId("window-drag-region").addEventListener("pointerdown", (event) => {
+      if (event.button === 0) invoke("windowAction", "drag");
+    });
+    byId("window-drag-region").addEventListener("dblclick", () => invoke("windowAction", "maximize"));
+    document.querySelectorAll("[data-window-action]").forEach((button) => {
+      button.addEventListener("click", () => invoke("windowAction", button.dataset.windowAction));
+    });
+  }
   document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => setPage(item.dataset.page)));
   document.querySelectorAll(".tab").forEach((item) => item.addEventListener("click", () => setNodeTab(item.dataset.nodeTab)));
   byId("header-refresh").addEventListener("click", refreshState);

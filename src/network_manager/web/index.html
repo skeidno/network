@@ -9,6 +9,23 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+  <header id="window-titlebar" class="window-titlebar" aria-label="Window controls">
+    <div id="window-drag-region" class="window-drag-region">
+      <span class="window-app-icon icon" style="--icon:url('./icons/network.svg')"></span>
+      <strong>Network Manager</strong>
+    </div>
+    <div class="window-controls">
+      <button class="window-control" data-window-action="minimize" aria-label="Minimize" title="Minimize">
+        <span class="icon" style="--icon:url('./icons/minus.svg')"></span>
+      </button>
+      <button class="window-control" data-window-action="maximize" aria-label="Maximize or restore" title="Maximize or restore">
+        <span class="icon" style="--icon:url('./icons/square.svg')"></span>
+      </button>
+      <button class="window-control close" data-window-action="close" aria-label="Close" title="Close">
+        <span class="icon" style="--icon:url('./icons/x.svg')"></span>
+      </button>
+    </div>
+  </header>
   <div id="app-shell">
     <aside class="sidebar">
       <div class="brand">

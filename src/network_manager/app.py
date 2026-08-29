@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QLockFile
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox, QStyleFactory
 
 from network_manager.paths import app_data_dir
@@ -22,6 +23,8 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("NetWorkManger")
     app.setOrganizationName("NetWorkManger")
+    icon_path = Path(__file__).with_name("web") / "icons" / "network-manager.ico"
+    app.setWindowIcon(QIcon(str(icon_path)))
     app.setQuitOnLastWindowClosed(False)
     app.setStyle(QStyleFactory.create("Fusion"))
     app.setStyleSheet(_load_style())
