@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="network-session-token" content="__SESSION_TOKEN__">
+  <title>Network Manager</title>
+  <link rel="icon" href="icons/network.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark"><span class="icon" style="--icon:url('./icons/network.svg')"></span></div>
+        <div class="brand-copy">
+          <strong>Network Manager</strong>
+          <span>网络与分流</span>
+        </div>
+      </div>
+
+      <nav class="navigation" aria-label="主导航">
+        <button class="nav-item is-active" data-page="overview">
+          <span class="icon" style="--icon:url('./icons/house.svg')"></span><span>运行概览</span>
+        </button>
+        <button class="nav-item" data-page="rules">
+          <span class="icon" style="--icon:url('./icons/route.svg')"></span><span>分流规则</span>
+        </button>
+        <button class="nav-item" data-page="nodes">
+          <span class="icon" style="--icon:url('./icons/server.svg')"></span><span>代理与节点</span>
+        </button>
+        <button class="nav-item" data-page="servers">
+          <span class="icon" style="--icon:url('./icons/database.svg')"></span><span>SSH 服务器</span>
+        </button>
+        <button class="nav-item" data-page="settings">
+          <span class="icon" style="--icon:url('./icons/settings.svg')"></span><span>设置</span>
+        </button>
+        <button class="nav-item" data-page="logs">
+          <span class="icon" style="--icon:url('./icons/file-text.svg')"></span><span>运行日志</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-runtime">
+        <div id="sidebar-traffic-chart" class="sidebar-traffic-chart" aria-label="实时上传和下载流量曲线"></div>
+        <div class="sidebar-speed">
+          <span class="icon rate-arrow" style="--icon:url('./icons/arrow-up.svg')"></span>
+          <span id="sidebar-upload" class="upload-color">0.00</span>
+          <small id="sidebar-upload-unit">B/s</small>
+        </div>
+        <div class="sidebar-speed">
+          <span class="icon rate-arrow" style="--icon:url('./icons/arrow-down.svg')"></span>
+          <span id="sidebar-download" class="download-color">0.00</span>
+          <small id="sidebar-download-unit">B/s</small>
+        </div>
+        <div class="sidebar-speed sidebar-memory" title="应用内存占用">
+          <span class="icon" style="--icon:url('./icons/settings.svg')"></span>
+          <span id="sidebar-memory">0</span>
+          <small>MB</small>
+        </div>
+      </div>
+      <div class="sidebar-version">v0.2.0 · WebGUI</div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <h1 id="page-title">运行概览</h1>
+        <div class="topbar-actions">
+          <span id="header-status" class="status-badge">已停止</span>
+          <button id="header-refresh" class="icon-button" aria-label="刷新界面" title="刷新界面">
+            <span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span>
+          </button>
+        </div>
+      </header>
+
+      <div id="page-content" class="page-content">
+        <section id="page-overview" class="page is-active">
+          <div id="admin-banner" class="notice warning is-hidden">
+            <span class="icon" style="--icon:url('./icons/shield-alert.svg')"></span>
+            <span>当前未以管理员身份运行，TUN 接管无法启动。</span>
+          </div>
+
+          <section class="panel status-panel">
+            <div class="panel-heading compact">
+              <div class="heading-icon"><span class="icon" style="--icon:url('./icons/power.svg')"></span></div>
+              <div>
+                <h2 id="overview-status-title">全流量接管已停止</h2>
+                <p id="overview-status-detail">当前不会修改系统路由</p>
+              </div>
+            </div>
+            <button id="core-toggle" class="button primary large">
+              <span class="icon" style="--icon:url('./icons/play.svg')"></span><span>启动接管</span>
+            </button>
+          </section>
+
+          <section class="panel mode-panel">
+            <div class="panel-heading compact">
+              <div class="heading-icon"><span class="icon" style="--icon:url('./icons/route.svg')"></span></div>
+              <div><h2>代理模式</h2><p id="mode-description">按分流规则选择出口</p></div>
+            </div>
+            <div id="mode-switch" class="segmented" aria-label="代理模式"></div>
+          </section>
+
+          <div class="overview-grid">
+            <section class="panel">
+              <div class="panel-heading">
+                <div class="heading-icon"><span class="icon" style="--icon:url('./icons/plug-zap.svg')"></span></div>
+                <div><h2>本地代理源</h2><p>兼容现有 Clash 与 v2ray 端口</p></div>
+              </div>
+              <div class="source-list">
+                <div class="source-row">
+                  <div><strong>Clash</strong><span id="overview-clash-endpoint">127.0.0.1:7897</span></div>
+                  <span id="overview-clash-status" class="source-status">检测中</span>
+                </div>
+                <div class="source-row">
+                  <div><strong>v2ray</strong><span id="overview-v2ray-endpoint">127.0.0.1:10808</span></div>
+                  <span id="overview-v2ray-status" class="source-status">检测中</span>
+                </div>
+                <div class="source-row">
+                  <div><strong>SSH</strong><span id="overview-ssh-endpoint">尚未配置</span></div>
+                  <span id="overview-ssh-status" class="source-status">未连接</span>
+                </div>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-heading">
+                <div class="heading-icon"><span class="icon" style="--icon:url('./icons/list-filter.svg')"></span></div>
+                <div><h2>规则摘要</h2><p>当前生效配置</p></div>
+              </div>
+              <div class="summary-grid">
+                <div><strong id="summary-process">0</strong><span>程序规则</span></div>
+                <div><strong id="summary-network">0</strong><span>域名 / IP</span></div>
+                <div><strong id="summary-nodes">0</strong><span>内置节点</span></div>
+                <div><strong id="summary-default">直连</strong><span>默认出口</span></div>
+              </div>
+            </section>
+          </div>
+
+          <section class="panel traffic-panel">
+            <div class="panel-heading traffic-heading">
+              <div class="heading-icon"><span class="icon" style="--icon:url('./icons/activity.svg')"></span></div>
+              <div><h2>实时流量</h2><p>最近 60 秒</p></div>
+              <span id="traffic-status" class="small-status">接管停止</span>
+            </div>
+            <div class="traffic-metrics">
+              <div class="traffic-metric download"><strong id="traffic-download">0 B/s</strong><span>下载</span></div>
+              <div class="traffic-metric upload"><strong id="traffic-upload">0 B/s</strong><span>上传</span></div>
+              <div class="traffic-metric"><strong id="traffic-connections">0</strong><span>活跃连接</span></div>
+              <div class="traffic-total"><span>累计下载</span><strong id="traffic-download-total">0 B</strong></div>
+              <div class="traffic-total"><span>累计上传</span><strong id="traffic-upload-total">0 B</strong></div>
+            </div>
+            <div id="traffic-chart" class="traffic-chart" aria-label="最近 60 秒上传和下载速率"></div>
+          </section>
+
+          <section class="panel exit-panel">
+            <div class="panel-heading compact">
+              <div class="heading-icon warm"><span class="icon" style="--icon:url('./icons/earth.svg')"></span></div>
+              <div><h2>当前出口</h2><p id="exit-ip">尚未检测</p></div>
+            </div>
+            <button id="test-exit" class="button secondary">
+              <span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span><span>检测出口 IP</span>
+            </button>
+          </section>
+        </section>
+
+        <section id="page-rules" class="page">
+          <div class="page-toolbar">
+            <button id="add-rule" class="button primary">
+              <span class="icon" style="--icon:url('./icons/circle-plus.svg')"></span><span>添加规则</span>
+            </button>
+            <span class="toolbar-context">规则按从上到下的顺序匹配</span>
+          </div>
+          <section class="table-surface">
+            <table>
+              <thead><tr><th>状态</th><th>类型</th><th>匹配内容</th><th>去向</th><th>备注</th><th class="actions-column">操作</th></tr></thead>
+              <tbody id="rules-body"></tbody>
+            </table>
+            <div id="rules-empty" class="empty-state is-hidden">暂无分流规则</div>
+          </section>
+        </section>
+
+        <section id="page-nodes" class="page">
+          <div class="tab-bar" role="tablist">
+            <button class="tab is-active" data-node-tab="local">本地兼容</button>
+            <button class="tab" data-node-tab="imported">内置节点</button>
+            <button class="tab" data-node-tab="subscriptions">订阅</button>
+          </div>
+
+          <div id="node-tab-local" class="node-tab is-active">
+            <div id="source-editor" class="source-editor"></div>
+            <div class="form-actions"><button id="save-sources" class="button primary"><span class="icon" style="--icon:url('./icons/save.svg')"></span><span>保存代理源</span></button></div>
+          </div>
+
+          <div id="node-tab-imported" class="node-tab">
+            <div class="page-toolbar">
+              <button id="import-paste" class="button primary"><span class="icon" style="--icon:url('./icons/circle-plus.svg')"></span><span>粘贴导入</span></button>
+              <button id="import-file" class="button secondary"><span class="icon" style="--icon:url('./icons/folder-open.svg')"></span><span>配置文件</span></button>
+              <button id="test-all-nodes" class="button secondary"><span class="icon" style="--icon:url('./icons/activity.svg')"></span><span>批量测速</span></button>
+            </div>
+            <div id="node-grid" class="node-grid"></div>
+            <div id="nodes-empty" class="empty-state is-hidden">暂无已导入节点</div>
+          </div>
+
+          <div id="node-tab-subscriptions" class="node-tab">
+            <div class="subscription-import">
+              <input id="subscription-name" type="text" value="我的订阅" aria-label="订阅名称">
+              <input id="subscription-url" type="url" placeholder="粘贴订阅地址" aria-label="订阅地址">
+              <button id="add-subscription" class="button primary"><span class="icon" style="--icon:url('./icons/circle-plus.svg')"></span><span>添加</span></button>
+              <button id="refresh-subscriptions" class="icon-button" aria-label="刷新全部订阅" title="刷新全部订阅"><span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span></button>
+            </div>
+            <div id="subscription-grid" class="subscription-grid"></div>
+            <div id="subscriptions-empty" class="empty-state compact is-hidden">暂无订阅记录</div>
+          </div>
+        </section>
+
+        <section id="page-servers" class="page">
+          <section class="panel ssh-status-panel">
+            <div class="panel-heading compact">
+              <div class="heading-icon"><span class="icon" style="--icon:url('./icons/database.svg')"></span></div>
+              <div><h2 id="ssh-status-title">SSH 隧道未连接</h2><p id="ssh-status-detail">选择服务器后建立本地 SOCKS5 出口</p></div>
+            </div>
+            <div class="ssh-status-actions">
+              <button id="test-ssh-exit" class="button secondary" disabled><span class="icon" style="--icon:url('./icons/earth.svg')"></span><span>检测出口</span></button>
+              <button id="stop-ssh" class="button secondary" disabled><span class="icon" style="--icon:url('./icons/square.svg')"></span><span>停止</span></button>
+            </div>
+          </section>
+          <div class="page-toolbar">
+            <button id="add-ssh-server" class="button primary"><span class="icon" style="--icon:url('./icons/circle-plus.svg')"></span><span>添加服务器</span></button>
+            <span class="toolbar-context">通过 SSH 建立本地 SOCKS5 隧道，不修改远端服务器</span>
+          </div>
+          <div id="ssh-server-grid" class="ssh-server-grid"></div>
+          <div id="ssh-servers-empty" class="empty-state is-hidden">暂无 SSH 服务器配置</div>
+        </section>
+
+        <section id="page-settings" class="page">
+          <form id="settings-form" class="settings-layout">
+            <section class="panel settings-section">
+              <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/server.svg')"></span></div><div><h2>本地服务</h2><p>核心入口与控制端口</p></div></div>
+              <div class="form-grid three">
+                <label><span>HTTP / SOCKS 入口</span><input id="setting-mixed-port" type="number" min="1024" max="65535"></label>
+                <label><span>核心控制端口</span><input id="setting-controller-port" type="number" min="1024" max="65535"></label>
+                <label><span>内部 DNS 端口</span><input id="setting-dns-port" type="number" min="1024" max="65535"></label>
+              </div>
+            </section>
+            <section class="panel settings-section">
+              <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/settings.svg')"></span></div><div><h2>运行行为</h2><p>启动、路由与托盘设置</p></div></div>
+              <div class="switch-list">
+                <label class="switch-row"><span><strong>严格路由</strong><small>减少 DNS 和流量泄漏</small></span><input id="setting-strict-route" type="checkbox"><i></i></label>
+                <label class="switch-row"><span><strong>打开后自动接管</strong><small>软件启动后自动运行核心</small></span><input id="setting-start-on-launch" type="checkbox"><i></i></label>
+                <label class="switch-row"><span><strong>关闭到系统托盘</strong><small>关闭窗口时保持后台运行</small></span><input id="setting-close-to-tray" type="checkbox"><i></i></label>
+                <label class="switch-row"><span><strong>随 Windows 登录启动</strong><small>登录后自动打开网络管理器</small></span><input id="setting-start-with-windows" type="checkbox"><i></i></label>
+              </div>
+            </section>
+            <div><button type="submit" class="button primary"><span class="icon" style="--icon:url('./icons/save.svg')"></span><span>保存设置</span></button></div>
+          </form>
+        </section>
+
+        <section id="page-logs" class="page logs-page">
+          <div class="page-toolbar">
+            <button id="clear-logs" class="button secondary"><span class="icon" style="--icon:url('./icons/trash-2.svg')"></span><span>清空显示</span></button>
+            <button id="open-logs" class="button secondary"><span class="icon" style="--icon:url('./icons/folder-open.svg')"></span><span>打开日志目录</span></button>
+          </div>
+          <pre id="log-output" class="log-output">暂无运行日志</pre>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="app-modal">
+    <div class="modal-header"><h2 id="modal-title"></h2><button id="modal-close" class="icon-button" aria-label="关闭"><span class="icon" style="--icon:url('./icons/x.svg')"></span></button></div>
+    <div id="modal-content" class="modal-content"></div>
+    <div id="modal-actions" class="modal-actions"></div>
+  </dialog>
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

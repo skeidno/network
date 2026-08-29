@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.smoke-data/
+.venv/
+*.egg-info/
+build/
+dist/
+*.spec
+/*.png
+vendor/mihomo.exe
+vendor/*.zip
+vendor/*.tmp
+vendor/release.json
+ssh-credentials.json
+settings.json
