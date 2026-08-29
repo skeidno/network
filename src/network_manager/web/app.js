@@ -347,8 +347,9 @@ function renderSources() {
 }
 
 function renderNodes() {
-  const nodes = appState.nodes;
-  const testing = nodes.some((node) => node.latencyStatus === "testing");
+  const sourceNodes = appState.nodes;
+  const testing = sourceNodes.some((node) => node.latencyStatus === "testing");
+  const nodes = testing ? sourceNodes : [...sourceNodes].sort(compareNodeLatency);
   const testButton = byId("test-all-nodes");
   testButton.disabled = !appState.core.running || nodes.length === 0 || testing;
   testButton.querySelector("span:last-child").textContent = testing ? "测速中" : "批量测速";
@@ -380,6 +381,19 @@ function renderNodes() {
         </div>
       </article>`;
   }).join("");
+}
+
+function compareNodeLatency(left, right) {
+  const rank = (node) => {
+    if (node.latencyStatus === "ok" && Number.isFinite(Number(node.latency))) {
+      return [0, Number(node.latency)];
+    }
+    if (node.latencyStatus === "idle") return [1, Number.POSITIVE_INFINITY];
+    return [2, Number.POSITIVE_INFINITY];
+  };
+  const [leftGroup, leftDelay] = rank(left);
+  const [rightGroup, rightDelay] = rank(right);
+  return leftGroup - rightGroup || leftDelay - rightDelay || left.index - right.index;
 }
 
 function saveSourcesFromForm() {
