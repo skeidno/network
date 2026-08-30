@@ -11,10 +11,12 @@ build-next/
 dist-next/
 build-repair/
 dist-repair/
+build-release/
+dist-release/
+release-assets/
 dist-previous/
 build-webview/
 dist-webview/
-*.spec
 /*.png
 vendor/mihomo.exe
 vendor/*.zip
