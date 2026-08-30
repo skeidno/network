@@ -33,16 +33,17 @@ class FakeWindow:
 
 
 class FakeBridge:
-    def __init__(self, profile: SshServerProfile) -> None:
+    def __init__(self, profile: SshServerProfile, target_in_use: bool = False) -> None:
         self._bridge_closed = False
         self.window = FakeWindow(profile)
         self.notifications: list[tuple[str, str]] = []
+        self.target_in_use = target_in_use
 
     def _ssh_profile(self, profile_id: str) -> SshServerProfile | None:
         return self.window.profile if self.window.profile.profile_id == profile_id else None
 
     def _ssh_target_in_use(self) -> bool:
-        return False
+        return self.target_in_use
 
     def _notify(self, kind: str, message: str) -> None:
         self.notifications.append((kind, message))
@@ -64,8 +65,25 @@ def test_successful_ssh_connection_persists_requested_credential() -> None:
     assert bridge.window.credential_store.saved == [(profile.profile_id, "secret")]
     assert profile.remember_password is True
     assert bridge.window.store.saved == 1
-    assert bridge.window.applied == 1
+    assert bridge.window.applied == 0
     assert bridge.notifications[0][0] == "success"
+
+
+def test_successful_ssh_connection_reloads_core_only_when_ssh_target_is_used() -> None:
+    profile = SshServerProfile(
+        profile_id="server-1",
+        name="Test server",
+        host="192.0.2.1",
+        remember_password=False,
+    )
+    bridge = FakeBridge(profile, target_in_use=True)
+
+    WebBridge._ssh_task_finished(
+        bridge, "start", profile.profile_id, True, "connected", ""
+    )
+
+    assert bridge.window.applied == 1
+    assert bridge.notifications == [("success", "connected")]
 
 
 def test_failed_ssh_connection_does_not_persist_credential() -> None:

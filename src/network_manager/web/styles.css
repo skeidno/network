@@ -387,6 +387,71 @@ input, select, textarea {
   background: #fff;
 }
 input:focus, select:focus, textarea:focus { border-color: #55a6ff; box-shadow: 0 0 0 2px #ddecff; }
+.enhanced-native-select {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  min-height: 1px;
+  padding: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.custom-select { position: relative; width: 100%; }
+.custom-select-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid #d8dde3;
+  border-radius: 6px;
+  color: #20262e;
+  background: #fff;
+  text-align: left;
+}
+.custom-select-trigger:hover { border-color: #b8c1cb; background: #fbfcfd; }
+.custom-select-trigger:focus-visible,
+.custom-select.is-open .custom-select-trigger { border-color: #55a6ff; outline: none; box-shadow: 0 0 0 2px #ddecff; }
+.custom-select-trigger .icon { width: 16px; height: 16px; color: #66717d; transition: transform 120ms; }
+.custom-select.is-open .custom-select-trigger .icon { transform: rotate(180deg); }
+.custom-select-menu {
+  position: absolute;
+  z-index: 60;
+  top: calc(100% + 5px);
+  right: 0;
+  left: 0;
+  display: none;
+  max-height: 230px;
+  overflow: auto;
+  padding: 5px;
+  border: 1px solid #d8dde3;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 10px 28px rgba(25, 35, 47, .16);
+}
+.custom-select.is-open .custom-select-menu { display: grid; gap: 2px; }
+.custom-select.opens-up .custom-select-menu { top: auto; bottom: calc(100% + 5px); }
+.custom-select-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-height: 32px;
+  padding: 5px 9px;
+  border: 0;
+  border-radius: 5px;
+  color: #27303a;
+  background: transparent;
+  text-align: left;
+}
+.custom-select-option:hover,
+.custom-select-option:focus-visible { outline: none; background: #eef6ff; }
+.custom-select-option .icon { width: 15px; height: 15px; color: transparent; }
+.custom-select-option.is-selected { color: #0874e9; font-weight: 600; background: #f3f8ff; }
+.custom-select-option.is-selected .icon { color: #0874e9; }
 textarea { min-height: 150px; resize: vertical; }
 label > span { display: block; margin-bottom: 7px; color: #5f6873; font-size: 12px; }
 .field-label { display: block; margin-bottom: 7px; color: #5f6873; font-size: 12px; }

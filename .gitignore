@@ -9,6 +9,8 @@ build/
 dist/
 build-next/
 dist-next/
+build-repair/
+dist-repair/
 dist-previous/
 build-webview/
 dist-webview/

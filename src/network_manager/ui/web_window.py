@@ -886,7 +886,7 @@ class WebBridge(QObject):
         try:
             future.result()
             success = True
-            message = "SSH 隧道已连接" if action == "start" else "SSH 隧道已停止"
+            message = "SSH 本地代理已连接" if action == "start" else "SSH 隧道已停止"
         except (SshTunnelError, OSError, ValueError) as exc:
             success = False
             message = str(exc) or "SSH 操作失败"
@@ -910,8 +910,8 @@ class WebBridge(QObject):
         if self._bridge_closed:
             return
         if success and action == "start":
+            profile = self._ssh_profile(profile_id)
             if credential:
-                profile = self._ssh_profile(profile_id)
                 if profile is not None:
                     try:
                         self.window.credential_store.set(profile_id, credential)
@@ -920,7 +920,10 @@ class WebBridge(QObject):
                         message += "，凭据已安全保存"
                     except CredentialStoreError as exc:
                         message += f"；凭据保存失败：{exc}"
-            self.window._save_and_apply("SSH 服务器出口已就绪")
+            if self._ssh_target_in_use():
+                self.window._save_and_apply("SSH 服务器出口已就绪")
+            elif profile is not None:
+                message += f"；本机 SOCKS5 127.0.0.1:{profile.local_port} 可直接使用"
         elif success and action == "stop" and self._ssh_target_in_use():
             if self.window.core.is_running:
                 self.window.stop_core()

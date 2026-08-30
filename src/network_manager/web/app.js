@@ -9,8 +9,12 @@ let currentNodeTab = "local";
 let sourceSignature = "";
 let settingsInitialized = false;
 let refreshing = false;
+let logsRefreshing = false;
+let lastLogsRefreshAt = 0;
 let coreActionPending = false;
 let coreActionObservedBusy = false;
+let requestedPage = currentPage;
+let pageSwitchFrame = 0;
 
 const PAGE_TITLES = {
   overview: "运行概览",
@@ -93,8 +97,23 @@ async function performWindowAction(action) {
   return invoke("windowAction", action);
 }
 
-function setPage(page) {
-  if (!PAGE_TITLES[page]) return;
+function renderActivePage() {
+  if (!appState) return;
+  if (currentPage === "overview") renderOverview();
+  else if (currentPage === "rules") renderRules();
+  else if (currentPage === "nodes") {
+    renderSources();
+    renderNodes();
+    renderSubscriptions();
+  } else if (currentPage === "servers") renderSshServers();
+  else if (currentPage === "settings") renderSettings();
+  else if (currentPage === "logs") refreshLogs();
+}
+
+function commitPageSwitch() {
+  pageSwitchFrame = 0;
+  const page = requestedPage;
+  if (page === currentPage) return;
   currentPage = page;
   document.querySelectorAll(".nav-item").forEach((item) => {
     item.classList.toggle("is-active", item.dataset.page === page);
@@ -103,7 +122,13 @@ function setPage(page) {
     item.classList.toggle("is-active", item.id === `page-${page}`);
   });
   byId("page-title").textContent = PAGE_TITLES[page];
-  if (page === "logs") refreshLogs();
+  renderActivePage();
+}
+
+function setPage(page) {
+  if (!PAGE_TITLES[page]) return;
+  requestedPage = page;
+  if (!pageSwitchFrame) pageSwitchFrame = window.requestAnimationFrame(commitPageSwitch);
 }
 
 function setNodeTab(tab) {
@@ -134,14 +159,7 @@ async function refreshState() {
 function renderState() {
   if (!appState) return;
   renderChrome();
-  renderOverview();
-  renderRules();
-  renderSources();
-  renderNodes();
-  renderSubscriptions();
-  renderSshServers();
-  renderSettings();
-  if (currentPage === "logs") refreshLogs();
+  renderActivePage();
 }
 
 function renderChrome() {
@@ -365,7 +383,8 @@ function renderSources() {
   if (signature === sourceSignature) return;
   if (byId("source-editor").contains(document.activeElement)) return;
   sourceSignature = signature;
-  byId("source-editor").innerHTML = ["clash", "v2ray"].map((key) => {
+  const root = byId("source-editor");
+  root.innerHTML = ["clash", "v2ray"].map((key) => {
     const source = sources[key];
     const label = key === "clash" ? "Clash" : "v2ray";
     return `<section class="source-card">
@@ -381,6 +400,7 @@ function renderSources() {
       <div class="subscription-meta"><span class="${source.available ? "download-color" : ""}">${escapeHtml(source.status)}</span><button class="mini-button" data-source-test="${key}" title="检测端口">${icon("refresh-cw")}</button></div>
     </section>`;
   }).join("");
+  enhanceSelects(root);
 }
 
 function renderNodes() {
@@ -466,7 +486,10 @@ function renderSshServers() {
   const labels = {
     stopped: ["SSH 隧道未连接", "选择服务器后建立本地 SOCKS5 出口"],
     connecting: ["正在连接 SSH 服务器", "正在验证服务器与账号，请稍候"],
-    connected: ["SSH 隧道已连接", `本地 SOCKS5：127.0.0.1:${tunnel.localPort}`],
+    connected: [
+      "SSH 本地代理已连接",
+      `本机程序可直接使用 SOCKS5：127.0.0.1:${tunnel.localPort}`,
+    ],
     error: ["SSH 隧道连接失败", tunnel.error || "请检查服务器和认证信息"],
   };
   const [title, detail] = labels[tunnel.status] || labels.stopped;
@@ -510,14 +533,118 @@ function renderSettings() {
 }
 
 async function refreshLogs() {
+  const now = Date.now();
+  if (currentPage !== "logs" || logsRefreshing || now - lastLogsRefreshAt < 900) return;
+  logsRefreshing = true;
+  lastLogsRefreshAt = now;
   try {
     const response = await apiRequest("/api/logs");
     const logs = await response.text();
+    if (currentPage !== "logs") return;
     const output = byId("log-output");
     const shouldFollow = output.scrollTop + output.clientHeight >= output.scrollHeight - 30;
     output.textContent = logs || "暂无运行日志";
     if (shouldFollow) output.scrollTop = output.scrollHeight;
   } catch (_error) { /* state polling reports connectivity */ }
+  finally { logsRefreshing = false; }
+}
+
+function closeCustomSelects(except = null) {
+  document.querySelectorAll(".custom-select.is-open").forEach((root) => {
+    if (root === except) return;
+    root.classList.remove("is-open");
+    root.classList.remove("opens-up");
+    root.querySelector(".custom-select-trigger")?.setAttribute("aria-expanded", "false");
+  });
+}
+
+function enhanceSelect(select) {
+  if (select.dataset.enhanced === "true") return;
+  select.dataset.enhanced = "true";
+  select.classList.add("enhanced-native-select");
+
+  const root = document.createElement("div");
+  root.className = "custom-select";
+  const trigger = document.createElement("button");
+  trigger.type = "button";
+  trigger.className = "custom-select-trigger";
+  trigger.setAttribute("aria-haspopup", "listbox");
+  trigger.setAttribute("aria-expanded", "false");
+  const menu = document.createElement("div");
+  menu.className = "custom-select-menu";
+  menu.setAttribute("role", "listbox");
+
+  const sync = () => {
+    const selected = select.selectedOptions[0];
+    trigger.innerHTML = `<span>${escapeHtml(selected?.textContent || "请选择")}</span>${icon("chevron-down")}`;
+    menu.querySelectorAll(".custom-select-option").forEach((item) => {
+      const active = item.dataset.value === select.value;
+      item.classList.toggle("is-selected", active);
+      item.setAttribute("aria-selected", String(active));
+    });
+  };
+
+  [...select.options].forEach((option) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "custom-select-option";
+    item.dataset.value = option.value;
+    item.disabled = option.disabled;
+    item.setAttribute("role", "option");
+    item.innerHTML = `<span>${escapeHtml(option.textContent)}</span>${icon("check")}`;
+    item.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (select.value !== option.value) {
+        select.value = option.value;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      sync();
+      closeCustomSelects();
+      trigger.focus();
+    });
+    menu.append(item);
+  });
+
+  trigger.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const opening = !root.classList.contains("is-open");
+    closeCustomSelects(root);
+    root.classList.toggle("is-open", opening);
+    trigger.setAttribute("aria-expanded", String(opening));
+    if (opening) {
+      const boundary = root.closest(".modal-content")?.getBoundingClientRect()
+        || { top: 8, bottom: window.innerHeight - 8 };
+      const triggerRect = trigger.getBoundingClientRect();
+      const menuHeight = Math.min(menu.scrollHeight, 230) + 6;
+      const roomBelow = boundary.bottom - triggerRect.bottom;
+      const roomAbove = triggerRect.top - boundary.top;
+      root.classList.toggle("opens-up", roomBelow < menuHeight && roomAbove > roomBelow);
+      menu.querySelector(".is-selected")?.scrollIntoView({ block: "nearest" });
+    }
+  });
+  trigger.addEventListener("keydown", (event) => {
+    if (!["ArrowDown", "ArrowUp", "Escape"].includes(event.key)) return;
+    event.preventDefault();
+    if (event.key === "Escape") {
+      closeCustomSelects();
+      return;
+    }
+    const options = [...menu.querySelectorAll(".custom-select-option:not(:disabled)")];
+    const index = Math.max(0, options.findIndex((item) => item.dataset.value === select.value));
+    const offset = event.key === "ArrowDown" ? 1 : -1;
+    options[(index + offset + options.length) % options.length]?.click();
+  });
+
+  root.append(trigger, menu);
+  select.insertAdjacentElement("afterend", root);
+  select.addEventListener("change", sync);
+  sync();
+}
+
+function enhanceSelects(container) {
+  container.querySelectorAll("select").forEach(enhanceSelect);
 }
 
 function openRuleDialog(rule = null) {
@@ -727,10 +854,12 @@ function openModal(title, content, actions) {
     button.addEventListener("click", action.action);
     actionRoot.append(button);
   });
+  enhanceSelects(byId("modal-content"));
   dialog.showModal();
 }
 
 function closeModal() {
+  closeCustomSelects();
   const dialog = byId("app-modal");
   if (dialog.open) dialog.close();
 }
@@ -754,6 +883,12 @@ function bindEvents() {
     });
   }
   document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => setPage(item.dataset.page)));
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest(".custom-select")) closeCustomSelects();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeCustomSelects();
+  });
   document.querySelectorAll(".tab").forEach((item) => item.addEventListener("click", () => setNodeTab(item.dataset.nodeTab)));
   byId("header-refresh").addEventListener("click", refreshState);
   byId("core-toggle").addEventListener("click", toggleCoreFromUi);
