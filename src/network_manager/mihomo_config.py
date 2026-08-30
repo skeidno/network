@@ -68,11 +68,16 @@ def build_mihomo_config(config: AppConfig) -> dict[str, Any]:
                 config.v2ray.protocol,
             )
         )
+    ssh_target_used = (
+        config.mode == "GLOBAL_SSH"
+        or (config.mode == "RULE" and config.default_target == "SSH")
+        or any(rule.enabled and rule.target == "SSH" for rule in config.rules)
+    )
     ssh_profile = next(
         (
             profile
             for profile in config.ssh_servers
-            if profile.profile_id == config.selected_ssh_server
+            if ssh_target_used and profile.profile_id == config.selected_ssh_server
         ),
         None,
     )

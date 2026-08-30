@@ -10,7 +10,7 @@ from urllib.parse import quote, urlsplit
 
 import psutil
 import requests
-from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QFileDialog
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QFileDialog
 from network_manager.local_web_server import LocalWebServer
 from network_manager.credential_store import CredentialStore, CredentialStoreError
 from network_manager.models import (
+    ImportedNode,
     RoutingRule,
     SshServerProfile,
     Upstream,
@@ -26,12 +27,18 @@ from network_manager.models import (
     validate_config,
     validate_rule,
 )
+from network_manager.server_deployer import (
+    DeploymentResult,
+    ServerDeploymentError,
+    ServerProxyDeployer,
+    deployment_source_id,
+    shadowsocks_share_link,
+)
 from network_manager.paths import (
     logs_dir,
     ssh_credentials_path,
     ssh_known_hosts_path,
 )
-from network_manager.ssh_tunnel import SshTunnelError, SshTunnelManager
 from network_manager.ui.dialogs import RULE_LABELS, TARGET_LABELS
 from network_manager.ui.main_window import MODE_LABELS, MainWindow as NativeMainWindow
 from network_manager.windows_startup import is_admin
@@ -40,7 +47,7 @@ COMMON_OVERSEAS_GROUP = "common-overseas"
 
 
 class WebBridge(QObject):
-    ssh_completed = Signal(str, str, bool, str, str)
+    server_deploy_completed = Signal(str, bool, str, str, str)
 
     def __init__(self, window: NativeMainWindow) -> None:
         super().__init__(window)
@@ -53,7 +60,9 @@ class WebBridge(QObject):
         self._node_executor = ThreadPoolExecutor(
             max_workers=8, thread_name_prefix="node-delay"
         )
-        self._ssh_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ssh-tunnel")
+        self._ssh_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="server-deploy")
+        self._deployment_lock = Lock()
+        self._deployment_states: dict[str, dict[str, str]] = {}
         self._bridge_closed = False
         self._toast_lock = Lock()
         self._toasts: deque[dict[str, str]] = deque(maxlen=40)
@@ -62,13 +71,12 @@ class WebBridge(QObject):
             for rule in default_routing_rules()
             if rule.rule_type != "PROCESS-NAME"
         }
-        self.ssh_completed.connect(self._ssh_task_finished)
+        self.server_deploy_completed.connect(self._server_deploy_finished)
 
     @Slot(result=str)
     def getState(self) -> str:
         config = self.window.config
         running = self.window.core.is_running
-        ssh_tunnel_state = self.window.ssh_tunnel.state()
         selected_ssh = next(
             (
                 profile
@@ -77,6 +85,11 @@ class WebBridge(QObject):
             ),
             None,
         )
+        with self._deployment_lock:
+            deployment_states = {
+                profile_id: dict(value)
+                for profile_id, value in self._deployment_states.items()
+            }
         if self.window._operation_active:
             core_status = "处理中"
         elif running:
@@ -147,14 +160,16 @@ class WebBridge(QObject):
                 "clash": self._source_state("clash", config.clash),
                 "v2ray": self._source_state("v2ray", config.v2ray),
                 "ssh": {
-                    "enabled": selected_ssh is not None,
+                    "enabled": bool(selected_ssh and selected_ssh.deployed_node_id),
                     "endpoint": (
-                        f"127.0.0.1:{selected_ssh.local_port}"
-                        if selected_ssh is not None
+                        f"{selected_ssh.host}:{selected_ssh.proxy_port}"
+                        if selected_ssh and selected_ssh.deployed_node_id
                         else "尚未配置"
                     ),
-                    "status": self._ssh_status_label(ssh_tunnel_state),
-                    "available": bool(ssh_tunnel_state["running"]),
+                    "status": (
+                        "已部署" if selected_ssh and selected_ssh.deployed_node_id else "未部署"
+                    ),
+                    "available": bool(selected_ssh and selected_ssh.deployed_node_id),
                 },
             },
             "traffic": {
@@ -174,6 +189,12 @@ class WebBridge(QObject):
             },
             "exitIp": self.window.exit_ip_label.text(),
             "rules": rules,
+            "fallbackRule": {
+                "target": config.default_target,
+                "targetLabel": TARGET_LABELS.get(
+                    config.default_target, config.default_target
+                ),
+            },
             "nodes": nodes,
             "subscriptions": subscriptions,
             "sshServers": [
@@ -183,17 +204,26 @@ class WebBridge(QObject):
                     "host": profile.host,
                     "port": profile.port,
                     "username": profile.username,
-                    "localPort": profile.local_port,
+                    "proxyPort": profile.proxy_port,
                     "authMethod": profile.auth_method,
                     "keyPath": profile.key_path,
                     "rememberPassword": profile.remember_password,
                     "hasCredential": self._has_credential(profile),
-                    "autoConnect": profile.auto_connect,
                     "selected": profile.profile_id == config.selected_ssh_server,
+                    "deployed": bool(profile.deployed_node_id),
+                    "deployedAt": profile.deployed_at,
+                    "deployedVersion": profile.deployed_version,
+                    "nodeName": (
+                        self._deployed_node(profile).name if self._deployed_node(profile) else ""
+                    ),
+                    "shareLink": self._deployed_share_link(profile),
+                    "deployment": deployment_states.get(
+                        profile.profile_id,
+                        {"status": "idle", "stage": "", "error": ""},
+                    ),
                 }
                 for profile in config.ssh_servers
             ],
-            "sshTunnel": ssh_tunnel_state,
             "selectedNode": config.selected_node,
             "importing": not self.window.import_button.isEnabled(),
             "settings": {
@@ -223,15 +253,21 @@ class WebBridge(QObject):
         except CredentialStoreError:
             return False
 
-    @staticmethod
-    def _ssh_status_label(state: dict[str, object]) -> str:
-        labels = {
-            "stopped": "未连接",
-            "connecting": "连接中",
-            "connected": "已连接",
-            "error": "连接失败",
-        }
-        return labels.get(str(state.get("status", "stopped")), "未连接")
+    def _deployed_node(self, profile: SshServerProfile) -> ImportedNode | None:
+        source_id = deployment_source_id(profile.profile_id)
+        return next(
+            (node for node in self.window.config.imported_nodes if node.source_id == source_id),
+            None,
+        )
+
+    def _deployed_share_link(self, profile: SshServerProfile) -> str:
+        node = self._deployed_node(profile)
+        if node is None or node.protocol != "ss":
+            return ""
+        try:
+            return shadowsocks_share_link(node.config)
+        except (KeyError, TypeError, ValueError):
+            return ""
 
     def _rule_key(self, rule: RoutingRule) -> tuple[str, str]:
         return (rule.rule_type, normalize_rule_value(rule.rule_type, rule.value))
@@ -327,7 +363,7 @@ class WebBridge(QObject):
             response = requests.get(
                 endpoint,
                 headers=headers,
-                params={"timeout": 8000, "url": "https://www.gstatic.com/generate_204"},
+                params={"timeout": 8000, "url": "http://www.gstatic.com/generate_204"},
                 timeout=(3, 11),
             )
             response.raise_for_status()
@@ -365,7 +401,6 @@ class WebBridge(QObject):
             self._node_test_generation += 1
             self._node_test_remaining = 0
         self._node_executor.shutdown(wait=False, cancel_futures=True)
-        self.window.ssh_tunnel.stop()
         self._ssh_executor.shutdown(wait=False, cancel_futures=True)
 
     @Slot(result=str)
@@ -456,6 +491,24 @@ class WebBridge(QObject):
         if self.window._save_and_apply("常用海外站点去向已更新"):
             self.window._refresh_rules_table()
             self._notify("success", "规则组已统一切换")
+
+    @Slot(str)
+    def setDefaultTarget(self, target: str) -> None:
+        if target not in {"CLASH", "V2RAY", "BUILTIN", "DIRECT"}:
+            self._notify("error", "保底规则去向无效")
+            return
+        previous = self.window.config.default_target
+        self.window.config.default_target = target
+        errors = validate_config(self.window.config)
+        if errors:
+            self.window.config.default_target = previous
+            self._notify("error", errors[0])
+            return
+        if self.window._save_and_apply("强制保底规则已更新"):
+            self.window._refresh_rules_table()
+            self._notify("success", "强制保底规则已更新")
+        else:
+            self.window.config.default_target = previous
 
     @Slot(str, str)
     def ruleGroupAction(self, group_id: str, action: str) -> None:
@@ -692,50 +745,76 @@ class WebBridge(QObject):
                 ),
                 None,
             )
-            if (
-                existing
-                and self.window.ssh_tunnel.profile_id == profile_id
-                and self.window.ssh_tunnel.status != "stopped"
-            ):
-                raise ValueError("请先停止当前 SSH 隧道再修改配置")
+            with self._deployment_lock:
+                if self._deployment_states.get(profile_id, {}).get("status") == "deploying":
+                    raise ValueError("服务器正在部署，请等待当前任务完成")
             profile = SshServerProfile(
                 profile_id=profile_id or __import__("secrets").token_hex(8),
                 name=str(payload.get("name", "SSH 服务器")).strip() or "SSH 服务器",
                 host=str(payload["host"]).strip(),
                 port=int(payload.get("port", 22)),
                 username=str(payload.get("username", "root")).strip(),
-                local_port=int(payload.get("localPort", 10888)),
                 auth_method=str(payload.get("authMethod", "password")).lower(),
                 key_path=str(payload.get("keyPath", "")).strip(),
                 remember_password=bool(payload.get("rememberPassword", False)),
-                auto_connect=bool(payload.get("autoConnect", False)),
+                proxy_port=int(payload.get("proxyPort", 24443)),
+                deployed_node_id=existing.deployed_node_id if existing else "",
+                deployed_at=existing.deployed_at if existing else "",
+                deployed_version=existing.deployed_version if existing else "",
             )
             if profile.auth_method == "key" and not Path(profile.key_path).is_file():
                 raise ValueError("SSH 私钥文件不存在")
-            existing_credential = self._has_credential(existing) if existing else False
-            if (
-                profile.auto_connect
-                and profile.auth_method == "password"
-                and not (password or existing_credential)
-            ):
-                raise ValueError("密码认证自动连接需要勾选记住凭据并填写密码")
+            endpoint_changed = bool(
+                existing
+                and (existing.host != profile.host or existing.proxy_port != profile.proxy_port)
+            )
+            if endpoint_changed:
+                profile.deployed_node_id = ""
+                profile.deployed_at = ""
+                profile.deployed_version = ""
             candidate_profiles = list(self.window.config.ssh_servers)
             if existing is None:
                 candidate_profiles.append(profile)
             else:
                 candidate_profiles[candidate_profiles.index(existing)] = profile
             previous_profiles = self.window.config.ssh_servers
+            previous_nodes = self.window.config.imported_nodes
+            previous_selected_node = self.window.config.selected_node
             self.window.config.ssh_servers = candidate_profiles
+            removed_names: set[str] = set()
+            if endpoint_changed:
+                source_id = deployment_source_id(profile.profile_id)
+                removed_names = {
+                    node.name
+                    for node in self.window.config.imported_nodes
+                    if node.source_id == source_id
+                }
+                self.window.config.imported_nodes = [
+                    node
+                    for node in self.window.config.imported_nodes
+                    if node.source_id != source_id
+                ]
+                if self.window.config.selected_node in removed_names:
+                    self.window.config.selected_node = (
+                        self.window.config.imported_nodes[0].name
+                        if self.window.config.imported_nodes
+                        else ""
+                    )
             errors = validate_config(self.window.config)
             if errors:
                 self.window.config.ssh_servers = previous_profiles
+                self.window.config.imported_nodes = previous_nodes
+                self.window.config.selected_node = previous_selected_node
                 raise ValueError(errors[0])
             if profile.remember_password and password:
                 self.window.credential_store.set(profile.profile_id, password)
             elif not profile.remember_password:
                 self.window.credential_store.delete(profile.profile_id)
-            self.window.store.save(self.window.config)
-            self._notify("success", "SSH 服务器配置已保存")
+            if endpoint_changed:
+                self.window._save_and_apply("服务器地址已更新，旧节点已移除")
+            else:
+                self.window.store.save(self.window.config)
+            self._notify("success", "服务器登录配置已保存")
         except (
             KeyError,
             TypeError,
@@ -743,19 +822,23 @@ class WebBridge(QObject):
             json.JSONDecodeError,
             CredentialStoreError,
         ) as exc:
-            self._notify("error", str(exc) or "SSH 服务器配置无效")
+            self._notify("error", str(exc) or "服务器配置无效")
 
     @Slot(str, str, bool)
-    def startSshServer(
+    def deploySshServer(
         self, profile_id: str, password: str, remember_credential: bool = False
     ) -> None:
         profile = self._ssh_profile(profile_id)
         if profile is None:
             self._notify("error", "SSH 服务器不存在")
             return
-        if self.window.ssh_tunnel.status in {"connecting", "connected"}:
-            self._notify("info", "请先停止当前 SSH 隧道")
-            return
+        with self._deployment_lock:
+            if any(
+                state.get("status") == "deploying"
+                for state in self._deployment_states.values()
+            ):
+                self._notify("info", "已有服务器部署任务正在执行")
+                return
         if not password and profile.remember_password:
             try:
                 password = self.window.credential_store.get(profile.profile_id)
@@ -764,88 +847,93 @@ class WebBridge(QObject):
                 return
         self.window.config.selected_ssh_server = profile.profile_id
         self.window.store.save(self.window.config)
-        self._notify("info", f"正在连接 {profile.name}")
-        future = self._ssh_executor.submit(self.window.ssh_tunnel.start, profile, password)
+        with self._deployment_lock:
+            self._deployment_states[profile_id] = {
+                "status": "deploying",
+                "stage": "等待部署任务",
+                "error": "",
+            }
+
+        def progress(stage: str) -> None:
+            with self._deployment_lock:
+                self._deployment_states[profile_id] = {
+                    "status": "deploying",
+                    "stage": stage,
+                    "error": "",
+                }
+
+        self._notify("info", f"正在通过 SSH 部署 {profile.name}")
+        future = self._ssh_executor.submit(
+            self.window.server_deployer.deploy, profile, password, progress
+        )
         future.add_done_callback(
-            lambda completed: self._finish_ssh_future(
-                "start",
+            lambda completed: self._finish_server_deploy_future(
                 profile.profile_id,
                 completed,
                 password if remember_credential else "",
             )
         )
 
-    @Slot()
-    def stopSshServer(self) -> None:
-        if self.window.ssh_tunnel.status == "stopped":
+    @Slot(str)
+    def copyServerNode(self, profile_id: str) -> None:
+        profile = self._ssh_profile(profile_id)
+        link = self._deployed_share_link(profile) if profile else ""
+        if not link:
+            self._notify("error", "该服务器尚未生成可复制的代理节点")
             return
-        profile_id = self.window.ssh_tunnel.profile_id
-        self._notify("info", "正在停止 SSH 隧道")
-        future = self._ssh_executor.submit(self.window.ssh_tunnel.stop)
-        future.add_done_callback(
-            lambda completed: self._finish_ssh_future("stop", profile_id, completed)
-        )
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.clipboard().setText(link)
+        self._notify("success", "代理节点链接已复制，可在其他设备导入")
 
     @Slot(str)
     def deleteSshServer(self, profile_id: str) -> None:
-        if (
-            self.window.ssh_tunnel.profile_id == profile_id
-            and self.window.ssh_tunnel.status != "stopped"
-        ):
-            self._notify("error", "请先停止当前 SSH 隧道")
-            return
+        with self._deployment_lock:
+            if self._deployment_states.get(profile_id, {}).get("status") == "deploying":
+                self._notify("error", "服务器正在部署，暂时不能删除")
+                return
         profile = self._ssh_profile(profile_id)
         if profile is None:
             return
         previous = list(self.window.config.ssh_servers)
         previous_selected = self.window.config.selected_ssh_server
+        previous_nodes = list(self.window.config.imported_nodes)
+        previous_selected_node = self.window.config.selected_node
         self.window.config.ssh_servers = [
             item for item in previous if item.profile_id != profile_id
         ]
         if self.window.config.selected_ssh_server == profile_id:
             self.window.config.selected_ssh_server = ""
+        source_id = deployment_source_id(profile_id)
+        removed_names = {
+            node.name
+            for node in self.window.config.imported_nodes
+            if node.source_id == source_id
+        }
+        self.window.config.imported_nodes = [
+            node for node in self.window.config.imported_nodes if node.source_id != source_id
+        ]
+        if self.window.config.selected_node in removed_names:
+            self.window.config.selected_node = (
+                self.window.config.imported_nodes[0].name
+                if self.window.config.imported_nodes
+                else ""
+            )
         errors = validate_config(self.window.config)
         if errors:
             self.window.config.ssh_servers = previous
             self.window.config.selected_ssh_server = previous_selected
+            self.window.config.imported_nodes = previous_nodes
+            self.window.config.selected_node = previous_selected_node
             self._notify("error", errors[0])
             return
         self.window.credential_store.delete(profile_id)
         self.window.store.save(self.window.config)
-        self._notify("success", "SSH 服务器已删除")
-
-    @Slot()
-    def testSshExit(self) -> None:
-        state = self.window.ssh_tunnel.state()
-        if not state["running"]:
-            self._notify("error", "请先连接 SSH 隧道")
-            return
-        local_port = int(state["localPort"])
-
-        def probe() -> str:
-            response = requests.get(
-                "https://api.ipify.org?format=json",
-                proxies={
-                    "http": f"socks5h://127.0.0.1:{local_port}",
-                    "https": f"socks5h://127.0.0.1:{local_port}",
-                },
-                timeout=(5, 15),
-            )
-            response.raise_for_status()
-            return str(response.json().get("ip", "未知"))
-
-        future = self._ssh_executor.submit(probe)
-
-        def finished(completed: Future[str]) -> None:
-            try:
-                message = f"SSH 出口 IP：{completed.result()}"
-                success = True
-            except (requests.RequestException, ValueError, TypeError) as exc:
-                message = f"SSH 出口检测失败：{exc}"
-                success = False
-            self.ssh_completed.emit("test", "", success, message, "")
-
-        future.add_done_callback(finished)
+        with self._deployment_lock:
+            self._deployment_states.pop(profile_id, None)
+        if self.window.core.is_running and removed_names:
+            self.window._save_and_apply("服务器节点已从本地移除")
+        self._notify("success", "本地服务器记录和对应内置节点已删除；远端服务未卸载")
 
     @Slot(result=str)
     def pickSshKey(self) -> str:
@@ -857,13 +945,6 @@ class WebBridge(QObject):
         )
         return path
 
-    def start_auto_connect(self) -> None:
-        profile = next(
-            (item for item in self.window.config.ssh_servers if item.auto_connect), None
-        )
-        if profile is not None:
-            self.startSshServer(profile.profile_id, "")
-
     def _ssh_profile(self, profile_id: str) -> SshServerProfile | None:
         return next(
             (
@@ -874,69 +955,111 @@ class WebBridge(QObject):
             None,
         )
 
-    def _finish_ssh_future(
+    def _finish_server_deploy_future(
         self,
-        action: str,
         profile_id: str,
-        future: Future[None],
+        future: Future[DeploymentResult],
         credential: str = "",
     ) -> None:
         if self._bridge_closed:
             return
         try:
-            future.result()
+            result = future.result()
             success = True
-            message = "SSH 本地代理已连接" if action == "start" else "SSH 隧道已停止"
-        except (SshTunnelError, OSError, ValueError) as exc:
+            message = "服务器代理部署完成"
+            result_json = json.dumps(
+                {
+                    "node": result.node_config,
+                    "shareLink": result.share_link,
+                    "version": result.version,
+                    "deployedAt": result.deployed_at,
+                    "firewall": result.firewall,
+                },
+                ensure_ascii=False,
+            )
+        except (ServerDeploymentError, OSError, ValueError) as exc:
             success = False
-            message = str(exc) or "SSH 操作失败"
-        self.ssh_completed.emit(
-            action,
+            message = str(exc) or "服务器代理部署失败"
+            result_json = ""
+        self.server_deploy_completed.emit(
             profile_id,
             success,
             message,
+            result_json,
             credential if success else "",
         )
 
-    @Slot(str, str, bool, str, str)
-    def _ssh_task_finished(
+    @Slot(str, bool, str, str, str)
+    def _server_deploy_finished(
         self,
-        action: str,
         profile_id: str,
         success: bool,
         message: str,
+        result_json: str,
         credential: str,
     ) -> None:
         if self._bridge_closed:
             return
-        if success and action == "start":
-            profile = self._ssh_profile(profile_id)
-            if credential:
-                if profile is not None:
-                    try:
-                        self.window.credential_store.set(profile_id, credential)
-                        profile.remember_password = True
-                        self.window.store.save(self.window.config)
-                        message += "，凭据已安全保存"
-                    except CredentialStoreError as exc:
-                        message += f"；凭据保存失败：{exc}"
-            if self._ssh_target_in_use():
-                self.window._save_and_apply("SSH 服务器出口已就绪")
-            elif profile is not None:
-                message += f"；本机 SOCKS5 127.0.0.1:{profile.local_port} 可直接使用"
-        elif success and action == "stop" and self._ssh_target_in_use():
-            if self.window.core.is_running:
-                self.window.stop_core()
-            message += "，使用 SSH 的接管核心已停止"
-        self._notify("success" if success else "error", message)
-
-    def _ssh_target_in_use(self) -> bool:
-        config = self.window.config
-        return (
-            config.mode == "GLOBAL_SSH"
-            or (config.mode == "RULE" and config.default_target == "SSH")
-            or any(rule.enabled and rule.target == "SSH" for rule in config.rules)
+        profile = self._ssh_profile(profile_id)
+        if not success or profile is None:
+            with self._deployment_lock:
+                self._deployment_states[profile_id] = {
+                    "status": "error",
+                    "stage": "部署失败",
+                    "error": message,
+                }
+            self._notify("error", message)
+            return
+        payload = json.loads(result_json)
+        node_config = dict(payload["node"])
+        source_id = deployment_source_id(profile_id)
+        current = self._deployed_node(profile)
+        other_names = {
+            node.name
+            for node in self.window.config.imported_nodes
+            if node.source_id != source_id
+        }
+        base_name = str(node_config.get("name") or profile.name)
+        node_name = base_name
+        suffix = 2
+        while node_name in other_names:
+            node_name = f"{base_name} ({suffix})"
+            suffix += 1
+        node_config["name"] = node_name
+        node = ImportedNode(
+            node_id=current.node_id if current else __import__("secrets").token_hex(8),
+            source=f"服务器部署 · {profile.name}",
+            config=node_config,
+            source_id=source_id,
         )
+        self.window.config.imported_nodes = [
+            item for item in self.window.config.imported_nodes if item.source_id != source_id
+        ]
+        self.window.config.imported_nodes.append(node)
+        self.window.config.selected_node = node.name
+        self.window.config.selected_ssh_server = profile_id
+        profile.deployed_node_id = node.node_id
+        profile.deployed_at = str(payload.get("deployedAt", ""))
+        profile.deployed_version = str(payload.get("version", ""))
+        if credential:
+            try:
+                self.window.credential_store.set(profile_id, credential)
+                profile.remember_password = True
+                message += "，SSH 凭据已安全保存"
+            except CredentialStoreError as exc:
+                message += f"；凭据保存失败：{exc}"
+        self.window.store.save(self.window.config)
+        if self.window.core.is_running:
+            self.window._save_and_apply("服务器代理节点已加入内置节点")
+        with self._deployment_lock:
+            self._deployment_states[profile_id] = {
+                "status": "ready",
+                "stage": "已部署并加入内置节点",
+                "error": "",
+            }
+        if payload.get("firewall") == "unmanaged":
+            message += "；请确认云服务器安全组已放行代理 TCP/UDP 端口"
+        self._notify("success", message)
 
     @Slot()
     def clearLogs(self) -> None:
@@ -965,7 +1088,7 @@ class WebMainWindow(NativeMainWindow):
     def __init__(self, startup_launch: bool = False) -> None:
         super().__init__(startup_launch=startup_launch)
         self.credential_store = CredentialStore(ssh_credentials_path())
-        self.ssh_tunnel = SshTunnelManager(ssh_known_hosts_path())
+        self.server_deployer = ServerProxyDeployer(ssh_known_hosts_path())
         self.web_bridge = WebBridge(self)
         web_root = Path(__file__).resolve().parents[1] / "web"
         allowed_methods = {
@@ -977,6 +1100,7 @@ class WebMainWindow(NativeMainWindow):
             "ruleAction",
             "saveRuleGroup",
             "ruleGroupAction",
+            "setDefaultTarget",
             "saveSources",
             "saveSettings",
             "addSubscription",
@@ -993,10 +1117,9 @@ class WebMainWindow(NativeMainWindow):
             "clearLogs",
             "openLogs",
             "saveSshServer",
-            "startSshServer",
-            "stopSshServer",
+            "deploySshServer",
+            "copyServerNode",
             "deleteSshServer",
-            "testSshExit",
             "pickSshKey",
             "windowAction",
         }
@@ -1012,7 +1135,6 @@ class WebMainWindow(NativeMainWindow):
         self.web_view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.setCentralWidget(self.web_view)
         self.web_view.setUrl(QUrl(f"{self.web_url}?customFrame=1"))
-        QTimer.singleShot(750, self.web_bridge.start_auto_connect)
 
     def open_web_ui(self) -> None:
         if os.environ.get("NETWORK_MANAGER_NO_BROWSER") == "1":

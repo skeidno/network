@@ -1,16 +1,18 @@
 # Network Manager
 
-一个 Windows 优先的 TUN 分流管理器。它使用 Mihomo 接管流量，提供独立 WebGUI、订阅与节点管理、实时流量监控、规则组和 SSH 服务器出口。
+一个 Windows 优先的 TUN 分流管理器。它使用 Mihomo 接管流量，提供独立 WebGUI、订阅与节点管理、实时流量监控、规则组和远端代理自动部署。
 
 ## 当前能力
 
-- 规则分流、全局 Clash、全局 v2ray、全局内置节点、全局 SSH 和直连模式
+- 规则分流、全局 Clash、全局 v2ray、全局内置节点和直连模式
 - Clash YAML、Base64 订阅以及 VLESS、VMess、Trojan、Shadowsocks 等常见分享链接
 - 兼容需要特定 User-Agent 的订阅，并支持 Clash `proxy-providers`
 - 内置节点卡片选择与批量延迟测试
 - Google、ChatGPT、Claude、YouTube、GitHub 等常用海外站点预置规则组
+- 始终位于规则末尾的强制保底规则，默认直连，可切换到本地端口或内置节点组
 - 最近 60 秒上传、下载、累计流量和连接数监控
-- SSH 密码、私钥或 SSH Agent 认证，本地 SOCKS5 隧道和出口 IP 检测
+- 通过 SSH 自动部署独立 Shadowsocks 2022 服务，并生成可复制的跨设备节点
+- 多端点出口 IP 检测，避免单个检测服务限流造成误报
 - 系统托盘、登录启动和配置自动校验
 
 WebGUI 由仅监听 `127.0.0.1` 的会话令牌 API 提供，并通过 Qt WebEngine 直接嵌入 Network Manager 主窗口。界面、托盘和后台管理属于同一个应用实例，不会再打开 Edge 窗口；Mihomo 仍作为受控子进程独立运行。
@@ -27,11 +29,15 @@ powershell -ExecutionPolicy Bypass -File scripts/run_windows_admin.ps1
 
 普通权限也可执行 `python -m network_manager` 查看和编辑配置，但不能启动 TUN 接管。
 
-## SSH 服务器出口
+## 服务器代理部署
 
-在“SSH 服务器”页面填写服务器 IP/域名、SSH 端口、用户名、本地 SOCKS5 端口和认证方式。连接后可在规则或全局模式中选择“SSH 服务器”。
+在“服务器部署”页面填写 Linux 服务器 IP/域名、SSH 端口、用户名、远端代理端口和认证方式，然后点击“部署代理”。当前自动部署要求服务器使用 systemd 且 SSH 用户为 `root`。
 
-该功能使用 SSH `direct-tcpip` 通道，不会在远端安装软件，也不会向公网开放代理端口。Windows 下“记住凭据”使用当前登录用户的 DPAPI 加密；明文密码不会写入 `settings.json`。首次连接的主机密钥会保存到应用数据目录，之后密钥变化会被拒绝。
+程序会安装经过固定 SHA-256 校验的 sing-box，使用独立的 `/etc/network-manager-proxy` 配置和 `network-manager-proxy.service`，不会覆盖服务器已有的 sing-box 配置。部署完成后 SSH 会断开，代理服务由 systemd 独立运行；生成的节点会自动加入“内置节点”，也可复制 `ss://` 链接到 Windows、macOS 或 Android 的兼容客户端。
+
+代理端口会监听公网 TCP/UDP。程序会处理已启用的 `ufw` 或 `firewalld`，但云厂商安全组仍需自行确认放行。重新部署会轮换节点密码并重启服务；若重启失败，会恢复旧配置。删除本地服务器记录不会卸载远端服务。
+
+Windows 下“记住凭据”使用当前登录用户的 DPAPI 加密，SSH 明文密码不会写入 `settings.json`。首次连接的主机密钥会保存到应用数据目录，之后密钥变化会被拒绝。代理节点自身的连接参数与其他导入节点一样保存在用户配置中，请勿公开分享配置文件。
 
 ## 构建 Windows 包
 
@@ -55,7 +61,7 @@ node --check src/network_manager/web/app.js
 python scripts/smoke_webgui.py http://127.0.0.1:<port>/ --poll-seconds 10
 ```
 
-测试覆盖配置迁移、订阅格式、Mihomo 配置、实时流量计算、本地 API 鉴权、Windows 凭据加密以及 SOCKS5 数据转发。
+测试覆盖配置迁移、订阅格式、Mihomo 配置、实时流量计算、本地 API 鉴权、Windows 凭据加密、服务器部署配置和分享链接回读。
 
 ## 数据与安全
 
@@ -69,6 +75,6 @@ python scripts/smoke_webgui.py http://127.0.0.1:<port>/ --poll-seconds 10
 
 ## 平台范围
 
-Windows 11 是当前完整支持和测试的平台。核心模型、本地 WebGUI 和 SSH 隧道使用跨平台实现，为 macOS 客户端保留了迁移路径；macOS 的权限、TUN 打包和启动项仍需单独适配。Android 需要原生 VPNService 外壳，不在当前桌面版本支持范围内。
+Windows 11 是当前完整支持和测试的平台。自动部署生成的标准 Shadowsocks 2022 节点可复制到 macOS 和 Android 兼容客户端；Network Manager 本体的 macOS 权限、TUN 打包和启动项仍需单独适配，Android 版本还需要原生 VPNService 外壳。
 
 项目界面和核心管理思路参考了 [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev)，代理核心使用 [Mihomo](https://github.com/MetaCubeX/mihomo)。第三方许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

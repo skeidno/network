@@ -32,8 +32,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    uac_admin=True,
     version='NetworkManager.version.txt',
+    uac_admin=True,
     icon=['src\\network_manager\\web\\icons\\network-manager.ico'],
 )
 coll = COLLECT(

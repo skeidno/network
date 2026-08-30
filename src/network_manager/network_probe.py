@@ -7,7 +7,11 @@ import requests
 from network_manager.models import Upstream
 
 
-IP_CHECK_URL = "https://api.ipify.org?format=json"
+IP_CHECKS = (
+    ("https://1.1.1.1/cdn-cgi/trace", "trace"),
+    ("https://api.ipify.org?format=json", "json"),
+    ("http://api.ipify.org?format=json", "json"),
+)
 
 
 def port_is_open(host: str, port: int, timeout: float = 0.35) -> bool:
@@ -26,14 +30,26 @@ def proxy_url(upstream: Upstream) -> str:
 def exit_ip_through_proxy(url: str, timeout: float = 12.0) -> str:
     session = requests.Session()
     session.trust_env = False
-    response = session.get(
-        IP_CHECK_URL,
-        timeout=timeout,
-        proxies={"http": url, "https": url},
-    )
-    response.raise_for_status()
-    payload = response.json()
-    return str(payload["ip"])
+    proxies = {"http": url, "https": url}
+    failures: list[str] = []
+    for endpoint, response_type in IP_CHECKS:
+        try:
+            response = session.get(endpoint, timeout=timeout, proxies=proxies)
+            response.raise_for_status()
+            if response_type == "json":
+                address = str(response.json()["ip"]).strip()
+            else:
+                address = next(
+                    line.split("=", 1)[1].strip()
+                    for line in response.text.splitlines()
+                    if line.startswith("ip=")
+                )
+            if address:
+                return address
+        except (requests.RequestException, ValueError, KeyError, StopIteration) as exc:
+            failures.append(str(exc))
+    detail = failures[-1] if failures else "检测端点没有返回 IP"
+    raise requests.RequestException(f"所有出口检测端点均失败：{detail}")
 
 
 def test_upstream(upstream: Upstream) -> tuple[bool, str]:

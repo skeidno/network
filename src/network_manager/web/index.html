@@ -47,7 +47,7 @@
           <span class="icon" style="--icon:url('./icons/server.svg')"></span><span>代理与节点</span>
         </button>
         <button class="nav-item" data-page="servers">
-          <span class="icon" style="--icon:url('./icons/database.svg')"></span><span>SSH 服务器</span>
+          <span class="icon" style="--icon:url('./icons/database.svg')"></span><span>服务器部署</span>
         </button>
         <button class="nav-item" data-page="settings">
           <span class="icon" style="--icon:url('./icons/settings.svg')"></span><span>设置</span>
@@ -75,7 +75,7 @@
           <small>MB</small>
         </div>
       </div>
-      <div class="sidebar-version">v0.2.1 · WebGUI</div>
+      <div class="sidebar-version">v0.3.0 · WebGUI</div>
     </aside>
 
     <main class="main-area">
@@ -133,8 +133,8 @@
                   <span id="overview-v2ray-status" class="source-status">检测中</span>
                 </div>
                 <div class="source-row">
-                  <div><strong>SSH</strong><span id="overview-ssh-endpoint">尚未配置</span></div>
-                  <span id="overview-ssh-status" class="source-status">未连接</span>
+                  <div><strong>服务器节点</strong><span id="overview-ssh-endpoint">尚未部署</span></div>
+                  <span id="overview-ssh-status" class="source-status">未部署</span>
                 </div>
               </div>
             </section>
@@ -234,19 +234,15 @@
           <section class="panel ssh-status-panel">
             <div class="panel-heading compact">
               <div class="heading-icon"><span class="icon" style="--icon:url('./icons/database.svg')"></span></div>
-              <div><h2 id="ssh-status-title">SSH 隧道未连接</h2><p id="ssh-status-detail">选择服务器后建立本地 SOCKS5 出口</p></div>
-            </div>
-            <div class="ssh-status-actions">
-              <button id="test-ssh-exit" class="button secondary" disabled><span class="icon" style="--icon:url('./icons/earth.svg')"></span><span>检测出口</span></button>
-              <button id="stop-ssh" class="button secondary" disabled><span class="icon" style="--icon:url('./icons/square.svg')"></span><span>停止</span></button>
+              <div><h2 id="ssh-status-title">远端代理部署</h2><p id="ssh-status-detail">SSH 仅在部署时使用，部署完成后服务器节点独立运行</p></div>
             </div>
           </section>
           <div class="page-toolbar">
             <button id="add-ssh-server" class="button primary"><span class="icon" style="--icon:url('./icons/circle-plus.svg')"></span><span>添加服务器</span></button>
-            <span class="toolbar-context">通过 SSH 建立本地 SOCKS5 隧道，不修改远端服务器</span>
+            <span class="toolbar-context">自动安装加密代理服务，并生成可跨设备导入的节点链接</span>
           </div>
           <div id="ssh-server-grid" class="ssh-server-grid"></div>
-          <div id="ssh-servers-empty" class="empty-state is-hidden">暂无 SSH 服务器配置</div>
+          <div id="ssh-servers-empty" class="empty-state is-hidden">暂无服务器，添加 SSH 登录信息后即可自动部署</div>
         </section>
 
         <section id="page-settings" class="page">

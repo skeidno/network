@@ -235,7 +235,7 @@ class MainWindow(QMainWindow):
         core_layout.addWidget(self.sidebar_core_status)
         sidebar_layout.addWidget(core_panel)
         sidebar_layout.addSpacing(12)
-        version = QLabel("Network Manager  ·  v0.2.1")
+        version = QLabel("Network Manager  ·  v0.3.0")
         version.setObjectName("sidebarVersion")
         sidebar_layout.addWidget(version)
 

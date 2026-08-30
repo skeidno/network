@@ -8,6 +8,7 @@ python -m PyInstaller `
   --clean `
   --windowed `
   --uac-admin `
+  --version-file "NetworkManager.version.txt" `
   --icon "src\network_manager\web\icons\network-manager.ico" `
   --name NetworkManager `
   --paths src `

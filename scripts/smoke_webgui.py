@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 import time
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import expect, sync_playwright
 
 
 def main() -> int:
@@ -27,16 +27,16 @@ def main() -> int:
         )
         page.goto(args.url, wait_until="networkidle")
         page.locator("#page-title").wait_for(state="visible")
-        assert page.locator("#page-title").inner_text() == "运行概览"
+        expect(page.locator("#page-title")).to_have_text("运行概览")
 
         page.locator('[data-page="servers"]').click()
-        assert page.locator("#page-title").inner_text() == "SSH 服务器"
-        page.locator("#add-ssh-server").click()
-        page.locator("#modal-ssh-name").fill("Smoke Test Server")
-        page.locator("#modal-ssh-host").fill("203.0.113.10")
-        page.locator("#modal-ssh-username").fill("smoke")
-        page.locator("#modal-actions .button.primary").click()
-        page.get_by_text("Smoke Test Server", exact=True).wait_for()
+        expect(page.locator("#page-title")).to_have_text("服务器部署")
+        server_cards = page.locator(".ssh-server-card")
+        if server_cards.count():
+            first_card = server_cards.first
+            assert first_card.locator('[data-ssh-action="deploy"]').is_visible()
+            if first_card.locator('[data-ssh-action="copy"]:not([disabled])').count():
+                assert "已部署" in first_card.inner_text()
 
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -45,10 +45,17 @@ def main() -> int:
             page.screenshot(path=str(args.output.with_name(args.output.stem + "-narrow.png")))
 
         page.set_viewport_size({"width": 1440, "height": 900})
+        page.locator('[data-page="rules"]').click()
+        expect(page.locator("#page-title")).to_have_text("分流规则")
+        expect(page.locator(".fallback-rule-row")).to_contain_text("强制保底")
+        expect(page.locator(".fallback-rule-row")).to_contain_text("始终位于规则末尾")
+        if args.output:
+            page.screenshot(path=str(args.output.with_name(args.output.stem + "-rules.png")))
+
         page.locator('[data-page="nodes"]').click()
-        assert page.locator("#page-title").inner_text() == "代理与节点"
+        expect(page.locator("#page-title")).to_have_text("代理与节点")
         page.locator('[data-page="settings"]').click()
-        assert page.locator("#page-title").inner_text() == "设置"
+        expect(page.locator("#page-title")).to_have_text("设置")
 
         deadline = time.monotonic() + args.poll_seconds
         while time.monotonic() < deadline:
@@ -56,10 +63,6 @@ def main() -> int:
             page.wait_for_timeout(100)
         assert "后台连接中断" not in page.locator("#overview-status-detail").inner_text()
 
-        page.locator('[data-page="servers"]').click()
-        page.locator('[data-ssh-action="delete"]').click()
-        page.locator("#modal-actions .button.danger").click()
-        page.get_by_text("暂无 SSH 服务器配置", exact=True).wait_for()
         browser.close()
 
     if errors:

@@ -18,7 +18,7 @@ MODES = (
     "GLOBAL_BUILTIN",
     "DIRECT",
 )
-CONFIG_VERSION = 5
+CONFIG_VERSION = 6
 
 DEFAULT_PROXY_DOMAINS = (
     ("discord.com", "Discord"),
@@ -184,6 +184,10 @@ class SshServerProfile:
     key_path: str = ""
     remember_password: bool = False
     auto_connect: bool = False
+    proxy_port: int = 24443
+    deployed_node_id: str = ""
+    deployed_at: str = ""
+    deployed_version: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SshServerProfile":
@@ -198,6 +202,10 @@ class SshServerProfile:
             key_path=str(data.get("key_path", "")).strip(),
             remember_password=bool(data.get("remember_password", False)),
             auto_connect=bool(data.get("auto_connect", False)),
+            proxy_port=int(data.get("proxy_port", 24443)),
+            deployed_node_id=str(data.get("deployed_node_id", "")),
+            deployed_at=str(data.get("deployed_at", "")),
+            deployed_version=str(data.get("deployed_version", "")),
         )
 
 
@@ -331,6 +339,15 @@ def migrate_config(config: AppConfig) -> bool:
         if key not in existing:
             config.rules.append(rule)
             existing.add(key)
+    if config.version < 6:
+        replacement = "BUILTIN" if config.imported_nodes else "DIRECT"
+        if config.mode == "GLOBAL_SSH":
+            config.mode = "GLOBAL_BUILTIN" if config.imported_nodes else "RULE"
+        if config.default_target == "SSH":
+            config.default_target = replacement
+        for rule in config.rules:
+            if rule.target == "SSH":
+                rule.target = replacement
     config.version = CONFIG_VERSION
     return True
 
@@ -417,7 +434,6 @@ def validate_config(config: AppConfig) -> list[str]:
     if config.selected_node and config.selected_node not in names:
         errors.append("当前选择的内置节点不存在")
     profile_ids: set[str] = set()
-    local_ports: set[int] = set(ports)
     for index, profile in enumerate(config.ssh_servers, start=1):
         if not profile.host:
             errors.append(f"第 {index} 个 SSH 服务器地址不能为空")
@@ -427,9 +443,8 @@ def validate_config(config: AppConfig) -> list[str]:
             errors.append(f"第 {index} 个 SSH 服务器端口无效")
         if not 1024 <= profile.local_port <= 65535:
             errors.append(f"第 {index} 个 SSH 本地端口必须在 1024 到 65535 之间")
-        if profile.local_port in local_ports:
-            errors.append(f"SSH 本地端口冲突：{profile.local_port}")
-        local_ports.add(profile.local_port)
+        if not 1024 <= profile.proxy_port <= 65535:
+            errors.append(f"第 {index} 个服务器代理端口必须在 1024 到 65535 之间")
         if profile.auth_method not in {"password", "key", "agent"}:
             errors.append(f"第 {index} 个 SSH 认证方式无效")
         if profile.auth_method == "key" and not profile.key_path:

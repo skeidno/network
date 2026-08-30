@@ -20,7 +20,7 @@ const PAGE_TITLES = {
   overview: "运行概览",
   rules: "分流规则",
   nodes: "代理与节点",
-  servers: "SSH 服务器",
+  servers: "服务器部署",
   settings: "设置",
   logs: "运行日志",
 };
@@ -29,7 +29,6 @@ const MODE_META = [
   ["RULE", "规则分流", "按分流规则选择出口"],
   ["GLOBAL_CLASH", "全局 Clash", "所有流量经 Clash 转发"],
   ["GLOBAL_V2RAY", "全局 v2ray", "所有流量经 v2ray 转发"],
-  ["GLOBAL_SSH", "全局 SSH", "所有流量经当前 SSH 服务器转发"],
   ["GLOBAL_BUILTIN", "全局节点", "所有流量经当前内置节点转发"],
   ["DIRECT", "全局直连", "所有流量不经过代理"],
 ];
@@ -45,7 +44,6 @@ const RULE_TYPES = [
 const TARGETS = [
   ["CLASH", "Clash"],
   ["V2RAY", "v2ray"],
-  ["SSH", "SSH 服务器"],
   ["BUILTIN", "内置节点"],
   ["DIRECT", "直连"],
 ];
@@ -225,8 +223,7 @@ function renderOverview() {
       : `${icon("play")}<span>启动接管</span>`;
 
   byId("mode-switch").innerHTML = MODE_META.map(([mode, label]) => {
-    const disabled = (mode === "GLOBAL_BUILTIN" && appState.nodes.length === 0)
-      || (mode === "GLOBAL_SSH" && appState.sshServers.length === 0);
+    const disabled = mode === "GLOBAL_BUILTIN" && appState.nodes.length === 0;
     return `<button class="segment${core.mode === mode ? " is-active" : ""}" data-mode="${mode}"${disabled ? " disabled" : ""}>${label}</button>`;
   }).join("");
   const modeMeta = MODE_META.find(([mode]) => mode === core.mode);
@@ -341,8 +338,8 @@ function formatTime(value) {
 
 function renderRules() {
   const rules = appState.rules;
-  byId("rules-empty").classList.toggle("is-hidden", rules.length > 0);
-  byId("rules-body").innerHTML = rules.map((rule) => {
+  byId("rules-empty").classList.add("is-hidden");
+  const regularRows = rules.map((rule) => {
     const statusClass = rule.partiallyEnabled ? " is-partial" : rule.enabled ? " is-enabled" : "";
     const statusText = rule.partiallyEnabled ? "部分启用" : rule.enabled ? "启用" : "停用";
     if (rule.kind === "group") {
@@ -375,6 +372,16 @@ function renderRules() {
       </td>
     </tr>`;
   }).join("");
+  const fallback = appState.fallbackRule || { target: "DIRECT", targetLabel: "直连" };
+  const fallbackRow = `<tr class="fallback-rule-row">
+    <td><span class="rule-status is-enabled">强制启用</span></td>
+    <td><span class="fallback-label">强制保底</span></td>
+    <td><strong>其他未匹配流量</strong></td>
+    <td><span class="chip">${escapeHtml(fallback.targetLabel)}</span></td>
+    <td>始终位于规则末尾</td>
+    <td class="actions"><button class="mini-button" data-fallback-action="edit" title="修改保底出口">${icon("square-pen")}</button></td>
+  </tr>`;
+  byId("rules-body").innerHTML = regularRows + fallbackRow;
 }
 
 function renderSources() {
@@ -481,37 +488,34 @@ function renderSubscriptions() {
 
 function renderSshServers() {
   const servers = appState.sshServers || [];
-  const tunnel = appState.sshTunnel || { status: "stopped", running: false };
   byId("ssh-servers-empty").classList.toggle("is-hidden", servers.length > 0);
-  const labels = {
-    stopped: ["SSH 隧道未连接", "选择服务器后建立本地 SOCKS5 出口"],
-    connecting: ["正在连接 SSH 服务器", "正在验证服务器与账号，请稍候"],
-    connected: [
-      "SSH 本地代理已连接",
-      `本机程序可直接使用 SOCKS5：127.0.0.1:${tunnel.localPort}`,
-    ],
-    error: ["SSH 隧道连接失败", tunnel.error || "请检查服务器和认证信息"],
-  };
-  const [title, detail] = labels[tunnel.status] || labels.stopped;
-  byId("ssh-status-title").textContent = title;
-  byId("ssh-status-detail").textContent = detail;
-  byId("stop-ssh").disabled = tunnel.status === "stopped";
-  byId("test-ssh-exit").disabled = !tunnel.running;
+  const deploying = servers.find((server) => server.deployment?.status === "deploying");
+  const deployedCount = servers.filter((server) => server.deployed).length;
+  byId("ssh-status-title").textContent = deploying ? "正在部署服务器代理" : "远端代理部署";
+  byId("ssh-status-detail").textContent = deploying
+    ? deploying.deployment.stage || "正在执行远端配置"
+    : `${deployedCount} 个服务器节点已就绪；SSH 无需保持连接`;
   const authLabels = { password: "密码", key: "私钥", agent: "SSH Agent" };
   byId("ssh-server-grid").innerHTML = servers.map((server) => {
-    const active = tunnel.profileId === server.profileId && tunnel.running;
-    const connecting = tunnel.profileId === server.profileId && tunnel.status === "connecting";
-    return `<article class="ssh-server-card${active ? " is-active" : ""}">
+    const task = server.deployment || { status: "idle", stage: "", error: "" };
+    const isDeploying = task.status === "deploying";
+    const hasError = task.status === "error";
+    const statusText = isDeploying ? "部署中" : hasError ? "部署失败" : server.deployed ? "已部署" : "未部署";
+    const statusClass = server.deployed && !hasError ? " is-running" : hasError ? " is-error" : "";
+    const detail = isDeploying ? task.stage : hasError ? task.error : server.deployedVersion || "等待部署";
+    return `<article class="ssh-server-card${server.deployed ? " is-active" : ""}">
       <div class="ssh-server-card-head">
         <div><h3 title="${escapeHtml(server.name)}">${escapeHtml(server.name)}</h3><p>${escapeHtml(server.username)}@${escapeHtml(server.host)}:${server.port}</p></div>
-        <span class="small-status${active ? " is-running" : ""}">${active ? "已连接" : connecting ? "连接中" : "未连接"}</span>
+        <span class="small-status${statusClass}">${statusText}</span>
       </div>
       <div class="ssh-server-meta">
         <span><small>认证</small><strong>${authLabels[server.authMethod] || server.authMethod}</strong></span>
-        <span><small>本地 SOCKS5</small><strong>127.0.0.1:${server.localPort}</strong></span>
+        <span><small>代理节点</small><strong>${escapeHtml(server.host)}:${server.proxyPort}</strong></span>
       </div>
+      <p class="deployment-detail" title="${escapeHtml(detail)}">${escapeHtml(detail)}</p>
       <div class="ssh-server-actions">
-        <button class="button primary" data-ssh-action="connect" data-profile-id="${server.profileId}"${tunnel.status === "connecting" || active ? " disabled" : ""}>${icon("play")}<span>连接</span></button>
+        <button class="button primary" data-ssh-action="deploy" data-profile-id="${server.profileId}"${isDeploying || Boolean(deploying) ? " disabled" : ""}>${icon(isDeploying ? "refresh-cw" : "hard-drive-download")}<span>${server.deployed ? "重新部署" : "部署代理"}</span></button>
+        <button class="button secondary compact-button" data-ssh-action="copy" data-profile-id="${server.profileId}"${server.shareLink ? "" : " disabled"}>${icon("link")}<span>复制节点</span></button>
         <button class="icon-button" data-ssh-action="edit" data-profile-id="${server.profileId}" title="编辑" aria-label="编辑">${icon("square-pen")}</button>
         <button class="icon-button danger" data-ssh-action="delete" data-profile-id="${server.profileId}" title="删除" aria-label="删除">${icon("trash-2")}</button>
       </div>
@@ -712,6 +716,42 @@ function openRuleGroupDialog(group) {
   });
 }
 
+function openFallbackRuleDialog() {
+  const fallback = appState.fallbackRule || { target: "DIRECT" };
+  const targetIcons = {
+    CLASH: "wifi",
+    V2RAY: "route",
+    BUILTIN: "server",
+    DIRECT: "link",
+  };
+  const targetOptions = TARGETS.map(([value, label]) => `
+    <button type="button" class="group-target-option${fallback.target === value ? " is-active" : ""}" data-group-target="${value}" role="radio" aria-checked="${fallback.target === value}">
+      ${icon(targetIcons[value])}<span>${label}</span>
+    </button>`).join("");
+  openModal("强制保底规则", `
+    <div class="form-grid">
+      <div><span class="field-label">未匹配流量去向</span><div class="group-target-options" role="radiogroup">${targetOptions}</div></div>
+      <div class="group-dialog-summary"><strong>始终启用 · 固定最后匹配</strong><span>默认直连，也可切换到本地端口或当前内置节点</span></div>
+    </div>`, [
+    { label: "取消", kind: "secondary", action: closeModal },
+    { label: "保存保底出口", kind: "primary", action: () => {
+      const target = document.querySelector(".group-target-option.is-active")?.dataset.groupTarget;
+      invoke("setDefaultTarget", target);
+      closeModal();
+      window.setTimeout(refreshState, 250);
+    } },
+  ]);
+  document.querySelectorAll(".group-target-option").forEach((option) => {
+    option.addEventListener("click", () => {
+      document.querySelectorAll(".group-target-option").forEach((item) => {
+        const selected = item === option;
+        item.classList.toggle("is-active", selected);
+        item.setAttribute("aria-checked", String(selected));
+      });
+    });
+  });
+}
+
 function openRuleGroupDomains(group) {
   const entries = Array.isArray(group.entries) ? group.entries : [];
   const rows = entries.map((entry) => `
@@ -761,18 +801,18 @@ function openPasteDialog() {
 function openSshServerDialog(server = null) {
   const authMethod = server?.authMethod || "password";
   const rememberCredential = server ? server.rememberPassword : authMethod !== "agent";
-  openModal(server ? "编辑 SSH 服务器" : "添加 SSH 服务器", `
+  openModal(server ? "编辑服务器部署" : "添加服务器部署", `
     <div class="form-grid ssh-form-grid">
       <label class="wide-field"><span>名称</span><input id="modal-ssh-name" value="${escapeHtml(server?.name || "我的服务器")}" required></label>
       <label><span>服务器 IP / 域名</span><input id="modal-ssh-host" value="${escapeHtml(server?.host || "")}" placeholder="例如 203.0.113.10" required></label>
       <label><span>SSH 端口</span><input id="modal-ssh-port" type="number" min="1" max="65535" value="${server?.port || 22}" required></label>
       <label><span>用户名</span><input id="modal-ssh-username" value="${escapeHtml(server?.username || "root")}" required></label>
-      <label><span>本地 SOCKS5 端口</span><input id="modal-ssh-local-port" type="number" min="1024" max="65535" value="${server?.localPort || 10888}" required></label>
+      <label><span>远端代理端口</span><input id="modal-ssh-proxy-port" type="number" min="1024" max="65535" value="${server?.proxyPort || 24443}" required></label>
       <label><span>认证方式</span><select id="modal-ssh-auth"><option value="password"${authMethod === "password" ? " selected" : ""}>账号密码</option><option value="key"${authMethod === "key" ? " selected" : ""}>私钥文件</option><option value="agent"${authMethod === "agent" ? " selected" : ""}>SSH Agent</option></select></label>
       <label id="modal-ssh-secret-field"><span>密码 / 私钥口令</span><input id="modal-ssh-password" type="password" autocomplete="new-password" placeholder="${server?.hasCredential ? "已安全保存，留空保持不变" : "连接凭据"}"></label>
       <label id="modal-ssh-key-field" class="wide-field"><span>私钥路径</span><div class="input-action"><input id="modal-ssh-key-path" value="${escapeHtml(server?.keyPath || "")}" placeholder="选择 OpenSSH 私钥"><button id="modal-pick-ssh-key" type="button" class="icon-button" title="选择私钥" aria-label="选择私钥">${icon("folder-open")}</button></div></label>
       <label class="switch-row wide-field"><span><strong>记住凭据</strong><small>Windows 下使用当前用户 DPAPI 加密</small></span><input id="modal-ssh-remember" type="checkbox"${rememberCredential ? " checked" : ""}><i></i></label>
-      <label class="switch-row wide-field"><span><strong>启动后自动连接</strong><small>仅在凭据可用或使用密钥时生效</small></span><input id="modal-ssh-auto" type="checkbox"${server?.autoConnect ? " checked" : ""}><i></i></label>
+      <div class="group-dialog-summary wide-field"><strong>部署内容</strong><span>在 Linux 服务器安装独立 Shadowsocks 2022 服务，SSH 断开后仍可使用。</span></div>
     </div>`, [
     { label: "取消", kind: "secondary", action: closeModal },
     { label: "保存", kind: "primary", action: () => {
@@ -782,11 +822,10 @@ function openSshServerDialog(server = null) {
         host: byId("modal-ssh-host").value,
         port: Number(byId("modal-ssh-port").value),
         username: byId("modal-ssh-username").value,
-        localPort: Number(byId("modal-ssh-local-port").value),
+        proxyPort: Number(byId("modal-ssh-proxy-port").value),
         authMethod: byId("modal-ssh-auth").value,
         keyPath: byId("modal-ssh-key-path").value,
         rememberPassword: byId("modal-ssh-remember").checked,
-        autoConnect: byId("modal-ssh-auto").checked,
       };
       invoke("saveSshServer", JSON.stringify(payload), byId("modal-ssh-password").value);
       closeModal();
@@ -809,22 +848,22 @@ function openSshServerDialog(server = null) {
   updateAuthFields();
 }
 
-function connectSshServer(server) {
+function deploySshServer(server) {
   if (server.authMethod === "agent" || server.hasCredential) {
-    invoke("startSshServer", server.profileId, "");
+    invoke("deploySshServer", server.profileId, "");
     return;
   }
   const label = server.authMethod === "key" ? "私钥口令（没有可留空）" : "SSH 密码";
-  openModal(`连接 ${server.name}`, `
+  openModal(`部署 ${server.name}`, `
     <div class="form-grid">
-      <div class="group-dialog-summary"><strong>${escapeHtml(server.username)}@${escapeHtml(server.host)}:${server.port}</strong><span>本地 SOCKS5：127.0.0.1:${server.localPort}</span></div>
+      <div class="group-dialog-summary"><strong>${escapeHtml(server.username)}@${escapeHtml(server.host)}:${server.port}</strong><span>将部署代理节点：${escapeHtml(server.host)}:${server.proxyPort}</span></div>
       <label><span>${label}</span><input id="modal-connect-password" type="password" autocomplete="current-password" autofocus></label>
-      <label class="switch-row"><span><strong>连接成功后记住凭据</strong><small>使用 Windows DPAPI 加密保存</small></span><input id="modal-connect-remember" type="checkbox" checked><i></i></label>
+      <label class="switch-row"><span><strong>部署成功后记住凭据</strong><small>后续重新部署无需再次输入</small></span><input id="modal-connect-remember" type="checkbox" checked><i></i></label>
     </div>`, [
-    { label: "取消", kind: "secondary", action: closeModal },
-    { label: "连接", kind: "primary", action: () => {
+      { label: "取消", kind: "secondary", action: closeModal },
+    { label: "开始部署", kind: "primary", action: () => {
       invoke(
-        "startSshServer",
+        "deploySshServer",
         server.profileId,
         byId("modal-connect-password").value,
         byId("modal-connect-remember").checked,
@@ -899,6 +938,11 @@ function bindEvents() {
   byId("test-exit").addEventListener("click", () => invoke("testExit"));
   byId("add-rule").addEventListener("click", () => openRuleDialog());
   byId("rules-body").addEventListener("click", (event) => {
+    const fallbackButton = event.target.closest("[data-fallback-action]");
+    if (fallbackButton) {
+      openFallbackRuleDialog();
+      return;
+    }
     const button = event.target.closest("[data-rule-action]");
     if (!button) return;
     const action = button.dataset.ruleAction;
@@ -959,16 +1003,15 @@ function bindEvents() {
     else confirmAction("删除订阅", "订阅及由它导入的节点将一并删除。", () => invoke("deleteSubscription", index));
   });
   byId("add-ssh-server").addEventListener("click", () => openSshServerDialog());
-  byId("stop-ssh").addEventListener("click", () => invoke("stopSshServer"));
-  byId("test-ssh-exit").addEventListener("click", () => invoke("testSshExit"));
   byId("ssh-server-grid").addEventListener("click", (event) => {
     const button = event.target.closest("[data-ssh-action]");
     if (!button) return;
     const server = appState.sshServers.find((item) => item.profileId === button.dataset.profileId);
     if (!server) return;
-    if (button.dataset.sshAction === "connect") connectSshServer(server);
+    if (button.dataset.sshAction === "deploy") deploySshServer(server);
+    else if (button.dataset.sshAction === "copy") invoke("copyServerNode", server.profileId);
     else if (button.dataset.sshAction === "edit") openSshServerDialog(server);
-    else confirmAction("删除 SSH 服务器", `确定删除“${server.name}”？`, () => invoke("deleteSshServer", server.profileId));
+    else confirmAction("删除服务器记录", `将删除“${server.name}”和对应内置节点，但不会卸载远端服务。确定继续？`, () => invoke("deleteSshServer", server.profileId));
   });
   byId("settings-form").addEventListener("submit", (event) => {
     event.preventDefault();
