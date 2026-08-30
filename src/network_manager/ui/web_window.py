@@ -40,7 +40,7 @@ COMMON_OVERSEAS_GROUP = "common-overseas"
 
 
 class WebBridge(QObject):
-    ssh_completed = Signal(str, str, bool, str)
+    ssh_completed = Signal(str, str, bool, str, str)
 
     def __init__(self, window: NativeMainWindow) -> None:
         super().__init__(window)
@@ -745,8 +745,10 @@ class WebBridge(QObject):
         ) as exc:
             self._notify("error", str(exc) or "SSH 服务器配置无效")
 
-    @Slot(str, str)
-    def startSshServer(self, profile_id: str, password: str) -> None:
+    @Slot(str, str, bool)
+    def startSshServer(
+        self, profile_id: str, password: str, remember_credential: bool = False
+    ) -> None:
         profile = self._ssh_profile(profile_id)
         if profile is None:
             self._notify("error", "SSH 服务器不存在")
@@ -765,7 +767,12 @@ class WebBridge(QObject):
         self._notify("info", f"正在连接 {profile.name}")
         future = self._ssh_executor.submit(self.window.ssh_tunnel.start, profile, password)
         future.add_done_callback(
-            lambda completed: self._finish_ssh_future("start", profile.profile_id, completed)
+            lambda completed: self._finish_ssh_future(
+                "start",
+                profile.profile_id,
+                completed,
+                password if remember_credential else "",
+            )
         )
 
     @Slot()
@@ -836,7 +843,7 @@ class WebBridge(QObject):
             except (requests.RequestException, ValueError, TypeError) as exc:
                 message = f"SSH 出口检测失败：{exc}"
                 success = False
-            self.ssh_completed.emit("test", "", success, message)
+            self.ssh_completed.emit("test", "", success, message, "")
 
         future.add_done_callback(finished)
 
@@ -868,7 +875,11 @@ class WebBridge(QObject):
         )
 
     def _finish_ssh_future(
-        self, action: str, profile_id: str, future: Future[None]
+        self,
+        action: str,
+        profile_id: str,
+        future: Future[None],
+        credential: str = "",
     ) -> None:
         if self._bridge_closed:
             return
@@ -879,15 +890,36 @@ class WebBridge(QObject):
         except (SshTunnelError, OSError, ValueError) as exc:
             success = False
             message = str(exc) or "SSH 操作失败"
-        self.ssh_completed.emit(action, profile_id, success, message)
+        self.ssh_completed.emit(
+            action,
+            profile_id,
+            success,
+            message,
+            credential if success else "",
+        )
 
-    @Slot(str, str, bool, str)
+    @Slot(str, str, bool, str, str)
     def _ssh_task_finished(
-        self, action: str, _profile_id: str, success: bool, message: str
+        self,
+        action: str,
+        profile_id: str,
+        success: bool,
+        message: str,
+        credential: str,
     ) -> None:
         if self._bridge_closed:
             return
         if success and action == "start":
+            if credential:
+                profile = self._ssh_profile(profile_id)
+                if profile is not None:
+                    try:
+                        self.window.credential_store.set(profile_id, credential)
+                        profile.remember_password = True
+                        self.window.store.save(self.window.config)
+                        message += "，凭据已安全保存"
+                    except CredentialStoreError as exc:
+                        message += f"；凭据保存失败：{exc}"
             self.window._save_and_apply("SSH 服务器出口已就绪")
         elif success and action == "stop" and self._ssh_target_in_use():
             if self.window.core.is_running:

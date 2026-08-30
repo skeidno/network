@@ -633,6 +633,7 @@ function openPasteDialog() {
 
 function openSshServerDialog(server = null) {
   const authMethod = server?.authMethod || "password";
+  const rememberCredential = server ? server.rememberPassword : authMethod !== "agent";
   openModal(server ? "编辑 SSH 服务器" : "添加 SSH 服务器", `
     <div class="form-grid ssh-form-grid">
       <label class="wide-field"><span>名称</span><input id="modal-ssh-name" value="${escapeHtml(server?.name || "我的服务器")}" required></label>
@@ -643,7 +644,7 @@ function openSshServerDialog(server = null) {
       <label><span>认证方式</span><select id="modal-ssh-auth"><option value="password"${authMethod === "password" ? " selected" : ""}>账号密码</option><option value="key"${authMethod === "key" ? " selected" : ""}>私钥文件</option><option value="agent"${authMethod === "agent" ? " selected" : ""}>SSH Agent</option></select></label>
       <label id="modal-ssh-secret-field"><span>密码 / 私钥口令</span><input id="modal-ssh-password" type="password" autocomplete="new-password" placeholder="${server?.hasCredential ? "已安全保存，留空保持不变" : "连接凭据"}"></label>
       <label id="modal-ssh-key-field" class="wide-field"><span>私钥路径</span><div class="input-action"><input id="modal-ssh-key-path" value="${escapeHtml(server?.keyPath || "")}" placeholder="选择 OpenSSH 私钥"><button id="modal-pick-ssh-key" type="button" class="icon-button" title="选择私钥" aria-label="选择私钥">${icon("folder-open")}</button></div></label>
-      <label class="switch-row wide-field"><span><strong>记住凭据</strong><small>Windows 下使用当前用户 DPAPI 加密</small></span><input id="modal-ssh-remember" type="checkbox"${server?.rememberPassword ? " checked" : ""}><i></i></label>
+      <label class="switch-row wide-field"><span><strong>记住凭据</strong><small>Windows 下使用当前用户 DPAPI 加密</small></span><input id="modal-ssh-remember" type="checkbox"${rememberCredential ? " checked" : ""}><i></i></label>
       <label class="switch-row wide-field"><span><strong>启动后自动连接</strong><small>仅在凭据可用或使用密钥时生效</small></span><input id="modal-ssh-auto" type="checkbox"${server?.autoConnect ? " checked" : ""}><i></i></label>
     </div>`, [
     { label: "取消", kind: "secondary", action: closeModal },
@@ -671,6 +672,9 @@ function openSshServerDialog(server = null) {
     byId("modal-ssh-remember").disabled = method === "agent";
   };
   byId("modal-ssh-auth").addEventListener("change", updateAuthFields);
+  byId("modal-ssh-password").addEventListener("input", (event) => {
+    if (event.target.value) byId("modal-ssh-remember").checked = true;
+  });
   byId("modal-pick-ssh-key").addEventListener("click", async () => {
     const path = await invoke("pickSshKey");
     if (path) byId("modal-ssh-key-path").value = path;
@@ -688,10 +692,16 @@ function connectSshServer(server) {
     <div class="form-grid">
       <div class="group-dialog-summary"><strong>${escapeHtml(server.username)}@${escapeHtml(server.host)}:${server.port}</strong><span>本地 SOCKS5：127.0.0.1:${server.localPort}</span></div>
       <label><span>${label}</span><input id="modal-connect-password" type="password" autocomplete="current-password" autofocus></label>
+      <label class="switch-row"><span><strong>连接成功后记住凭据</strong><small>使用 Windows DPAPI 加密保存</small></span><input id="modal-connect-remember" type="checkbox" checked><i></i></label>
     </div>`, [
     { label: "取消", kind: "secondary", action: closeModal },
     { label: "连接", kind: "primary", action: () => {
-      invoke("startSshServer", server.profileId, byId("modal-connect-password").value);
+      invoke(
+        "startSshServer",
+        server.profileId,
+        byId("modal-connect-password").value,
+        byId("modal-connect-remember").checked,
+      );
       closeModal();
     } },
   ]);
