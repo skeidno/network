@@ -13,7 +13,7 @@
 - SSH 密码、私钥或 SSH Agent 认证，本地 SOCKS5 隧道和出口 IP 检测
 - 系统托盘、登录启动和配置自动校验
 
-WebGUI 由仅监听 `127.0.0.1` 的会话令牌 API 提供，使用系统 Edge 应用窗口显示。网页渲染器与 Mihomo/托盘后台相互独立，关闭或崩溃网页不会结束代理核心。
+WebGUI 由仅监听 `127.0.0.1` 的会话令牌 API 提供，并通过 Qt WebEngine 直接嵌入 Network Manager 主窗口。界面、托盘和后台管理属于同一个应用实例，不会再打开 Edge 窗口；Mihomo 仍作为受控子进程独立运行。
 
 ## Windows 开发运行
 
@@ -49,7 +49,7 @@ python -m pytest -q
 node --check src/network_manager/web/app.js
 ```
 
-启动后台后还可以运行实际 Edge WebGUI 冒烟测试：
+启动程序后还可以对本地 WebGUI 执行浏览器冒烟测试：
 
 ```powershell
 python scripts/smoke_webgui.py http://127.0.0.1:<port>/ --poll-seconds 10
@@ -71,4 +71,4 @@ python scripts/smoke_webgui.py http://127.0.0.1:<port>/ --poll-seconds 10
 
 Windows 11 是当前完整支持和测试的平台。核心模型、本地 WebGUI 和 SSH 隧道使用跨平台实现，为 macOS 客户端保留了迁移路径；macOS 的权限、TUN 打包和启动项仍需单独适配。Android 需要原生 VPNService 外壳，不在当前桌面版本支持范围内。
 
-项目界面和进程隔离思路参考了 [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev)，代理核心使用 [Mihomo](https://github.com/MetaCubeX/mihomo)。第三方许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+项目界面和核心管理思路参考了 [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev)，代理核心使用 [Mihomo](https://github.com/MetaCubeX/mihomo)。第三方许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

@@ -18,7 +18,7 @@ MODES = (
     "GLOBAL_BUILTIN",
     "DIRECT",
 )
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 
 DEFAULT_PROXY_DOMAINS = (
     ("discord.com", "Discord"),
@@ -27,6 +27,7 @@ DEFAULT_PROXY_DOMAINS = (
     ("googleapis.com", "Google"),
     ("gstatic.com", "Google"),
     ("googleusercontent.com", "Google"),
+    ("arcteryx.com", "Arc'teryx"),
     ("youtube.com", "YouTube"),
     ("youtu.be", "YouTube"),
     ("ytimg.com", "YouTube"),

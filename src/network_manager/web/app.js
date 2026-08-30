@@ -9,6 +9,8 @@ let currentNodeTab = "local";
 let sourceSignature = "";
 let settingsInitialized = false;
 let refreshing = false;
+let coreActionPending = false;
+let coreActionObservedBusy = false;
 
 const PAGE_TITLES = {
   overview: "运行概览",
@@ -85,6 +87,10 @@ async function invoke(method, ...args) {
     showToast("error", error.message || "操作失败");
     return null;
   }
+}
+
+async function performWindowAction(action) {
+  return invoke("windowAction", action);
 }
 
 function setPage(page) {
@@ -180,6 +186,11 @@ function renderSidebarTrafficChart(downloadValues, uploadValues) {
 
 function renderOverview() {
   const { core, summary, sources, traffic } = appState;
+  if (coreActionPending && core.busy) coreActionObservedBusy = true;
+  if (coreActionPending && coreActionObservedBusy && !core.busy) {
+    coreActionPending = false;
+    coreActionObservedBusy = false;
+  }
   byId("admin-banner").classList.toggle("is-hidden", core.admin);
   byId("overview-status-title").textContent = core.running ? "全流量接管运行中" : "全流量接管已停止";
   byId("overview-status-detail").textContent = core.running
@@ -187,9 +198,9 @@ function renderOverview() {
     : "当前不会修改系统路由";
 
   const toggle = byId("core-toggle");
-  toggle.disabled = core.busy;
+  toggle.disabled = core.busy || coreActionPending;
   toggle.className = `button large ${core.running ? "secondary" : "primary"}`;
-  toggle.innerHTML = core.busy
+  toggle.innerHTML = (core.busy || coreActionPending)
     ? `${icon("refresh-cw")}<span>处理中</span>`
     : core.running
       ? `${icon("square")}<span>停止接管</span>`
@@ -220,6 +231,29 @@ function renderOverview() {
   byId("traffic-upload-total").textContent = traffic.uploadTotal;
   renderTrafficChart(traffic.downloadSamples, traffic.uploadSamples);
   byId("exit-ip").textContent = appState.exitIp;
+}
+
+async function toggleCoreFromUi() {
+  if (coreActionPending || appState?.core?.busy) return;
+  coreActionPending = true;
+  coreActionObservedBusy = false;
+  const toggle = byId("core-toggle");
+  toggle.disabled = true;
+  toggle.innerHTML = `${icon("refresh-cw")}<span>处理中</span>`;
+  const accepted = await invoke("toggleCore");
+  if (!accepted) {
+    coreActionPending = false;
+    await refreshState();
+    return;
+  }
+  window.setTimeout(async () => {
+    await refreshState();
+    if (!appState?.core?.busy) {
+      coreActionPending = false;
+      coreActionObservedBusy = false;
+      renderOverview();
+    }
+  }, 500);
 }
 
 function renderSourceStatus(key, source) {
@@ -301,6 +335,7 @@ function renderRules() {
         <td><span class="chip">${escapeHtml(rule.targetLabel)}</span></td>
         <td>整组共用一个出口</td>
         <td class="actions">
+          <button class="mini-button" data-rule-action="view" data-rule-group="${rule.groupId}" title="查看全部域名">${icon("file-text")}</button>
           <button class="mini-button" data-rule-action="toggle" data-rule-group="${rule.groupId}" title="${rule.enabled ? "停用整组" : "启用整组"}">${icon(rule.enabled ? "square" : "check")}</button>
           <button class="mini-button" data-rule-action="edit" data-rule-group="${rule.groupId}" title="切换整组出口">${icon("square-pen")}</button>
           <button class="mini-button danger" data-rule-action="delete" data-rule-group="${rule.groupId}" title="删除整组">${icon("trash-2")}</button>
@@ -550,6 +585,38 @@ function openRuleGroupDialog(group) {
   });
 }
 
+function openRuleGroupDomains(group) {
+  const entries = Array.isArray(group.entries) ? group.entries : [];
+  const rows = entries.map((entry) => `
+    <div class="rule-domain-row" data-domain-search="${escapeHtml(`${entry.domain} ${entry.label}`.toLowerCase())}">
+      <span class="rule-status${entry.enabled ? " is-enabled" : ""}">${entry.enabled ? "启用" : "停用"}</span>
+      <strong title="${escapeHtml(entry.domain)}">${escapeHtml(entry.domain)}</strong>
+      <span title="${escapeHtml(entry.label)}">${escapeHtml(entry.label || "其他")}</span>
+    </div>`).join("");
+  openModal("常用海外站点域名", `
+    <div class="rule-domain-browser">
+      <div class="group-dialog-summary"><strong>${group.count} 条匹配 · ${escapeHtml(group.targetLabel)}</strong><span>整组共用当前出口</span></div>
+      <label class="rule-domain-search"><span>搜索域名或分类</span><input id="rule-domain-filter" type="search" placeholder="例如 arcteryx、Google、ChatGPT" autocomplete="off"></label>
+      <div class="rule-domain-list-head"><span>状态</span><span>域名</span><span>分类</span></div>
+      <div id="rule-domain-list" class="rule-domain-list">${rows}</div>
+      <div id="rule-domain-count" class="rule-domain-count">显示 ${entries.length} / ${entries.length} 条</div>
+    </div>`, [
+    { label: "关闭", kind: "secondary", action: closeModal },
+  ]);
+  const filter = byId("rule-domain-filter");
+  filter.addEventListener("input", () => {
+    const query = filter.value.trim().toLowerCase();
+    let visible = 0;
+    document.querySelectorAll(".rule-domain-row").forEach((row) => {
+      const matches = !query || row.dataset.domainSearch.includes(query);
+      row.hidden = !matches;
+      if (matches) visible += 1;
+    });
+    byId("rule-domain-count").textContent = `显示 ${visible} / ${entries.length} 条`;
+  });
+  filter.focus();
+}
+
 function openPasteDialog() {
   openModal("粘贴导入", `
     <div class="form-grid">
@@ -669,17 +736,17 @@ function showToast(kind, message) {
 function bindEvents() {
   if (CUSTOM_FRAME) {
     byId("window-drag-region").addEventListener("pointerdown", (event) => {
-      if (event.button === 0) invoke("windowAction", "drag");
+      if (event.button === 0) performWindowAction("drag");
     });
-    byId("window-drag-region").addEventListener("dblclick", () => invoke("windowAction", "maximize"));
+    byId("window-drag-region").addEventListener("dblclick", () => performWindowAction("maximize"));
     document.querySelectorAll("[data-window-action]").forEach((button) => {
-      button.addEventListener("click", () => invoke("windowAction", button.dataset.windowAction));
+      button.addEventListener("click", () => performWindowAction(button.dataset.windowAction));
     });
   }
   document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => setPage(item.dataset.page)));
   document.querySelectorAll(".tab").forEach((item) => item.addEventListener("click", () => setNodeTab(item.dataset.nodeTab)));
   byId("header-refresh").addEventListener("click", refreshState);
-  byId("core-toggle").addEventListener("click", () => invoke("toggleCore"));
+  byId("core-toggle").addEventListener("click", toggleCoreFromUi);
   byId("mode-switch").addEventListener("click", (event) => {
     const button = event.target.closest("[data-mode]");
     if (button && !button.disabled) invoke("setMode", button.dataset.mode);
@@ -693,7 +760,8 @@ function bindEvents() {
     const groupId = button.dataset.ruleGroup;
     if (groupId) {
       const group = appState.rules.find((rule) => rule.groupId === groupId);
-      if (action === "edit") openRuleGroupDialog(group);
+      if (action === "view") openRuleGroupDomains(group);
+      else if (action === "edit") openRuleGroupDialog(group);
       else if (action === "delete") confirmAction("删除规则组", "确定删除常用海外站点规则组？", () => invoke("ruleGroupAction", groupId, "delete"));
       else invoke("ruleGroupAction", groupId, action);
       return;

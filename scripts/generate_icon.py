@@ -15,13 +15,13 @@ OUTPUT = SOURCE.with_name("network-manager.ico")
 
 
 def render_icon(size: int = 256) -> Image.Image:
-    svg = SOURCE.read_text(encoding="utf-8").replace("currentColor", "#ffffff")
+    svg = SOURCE.read_text(encoding="utf-8").replace("currentColor", "#0d8060")
     image = QImage(size, size, QImage.Format.Format_ARGB32)
     image.fill(Qt.GlobalColor.transparent)
     painter = QPainter(image)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor("#0d8060"))
+    painter.setBrush(QColor("#e7f7f1"))
     painter.drawRoundedRect(QRectF(0, 0, size, size), size * 0.19, size * 0.19)
     renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
     margin = size * 0.20

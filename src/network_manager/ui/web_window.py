@@ -5,18 +5,16 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
-import subprocess
 from threading import Lock
-import time
 from urllib.parse import quote, urlsplit
 
 import psutil
 import requests
-from PySide6.QtCore import QObject, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
+from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QFileDialog
 
-from network_manager.browser_window import BrowserWindowController
 from network_manager.local_web_server import LocalWebServer
 from network_manager.credential_store import CredentialStore, CredentialStoreError
 from network_manager.models import (
@@ -272,6 +270,14 @@ class WebBridge(QObject):
                         "ruleTypeLabel": "预置规则组",
                         "value": f"{len(common)} 条匹配",
                         "detail": "、".join(item.value for _item_index, item in common),
+                        "entries": [
+                            {
+                                "domain": item.value,
+                                "label": item.note,
+                                "enabled": item.enabled,
+                            }
+                            for _item_index, item in common
+                        ],
                         "target": target,
                         "targetLabel": (
                             TARGET_LABELS.get(target, target)
@@ -367,9 +373,9 @@ class WebBridge(QObject):
         lines = self.window.log_view.toPlainText().splitlines()
         return "\n".join(lines[-800:])
 
-    @Slot()
-    def toggleCore(self) -> None:
-        self.window.toggle_core()
+    @Slot(result=bool)
+    def toggleCore(self) -> bool:
+        return self.window.toggle_core()
 
     @Slot(str)
     def setMode(self, mode: str) -> None:
@@ -907,7 +913,7 @@ class WebBridge(QObject):
 
     @Slot(str, result=bool)
     def windowAction(self, action: str) -> bool:
-        return self.window.browser_window.perform(action)
+        return self.window.perform_window_action(action)
 
     def _notify(self, kind: str, message: str) -> None:
         with self._toast_lock:
@@ -923,8 +929,6 @@ class WebBridge(QObject):
 class WebMainWindow(NativeMainWindow):
     def __init__(self, startup_launch: bool = False) -> None:
         super().__init__(startup_launch=startup_launch)
-        app_icon = Path(__file__).resolve().parents[1] / "web" / "icons" / "network-manager.ico"
-        self.browser_window = BrowserWindowController("Network Manager", app_icon)
         self.credential_store = CredentialStore(ssh_credentials_path())
         self.ssh_tunnel = SshTunnelManager(ssh_known_hosts_path())
         self.web_bridge = WebBridge(self)
@@ -963,57 +967,41 @@ class WebMainWindow(NativeMainWindow):
         }
         self.web_server = LocalWebServer(web_root, self.web_bridge, allowed_methods)
         self.web_url = self.web_server.start()
-        self._last_browser_open = 0.0
-        self.hide()
+        self._native_central_widget = self.takeCentralWidget()
+        if self._native_central_widget is not None:
+            self._native_central_widget.hide()
+        self.statusBar().hide()
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.web_view = QWebEngineView(self)
+        self.web_view.setObjectName("webGui")
+        self.web_view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self.setCentralWidget(self.web_view)
+        self.web_view.setUrl(QUrl(f"{self.web_url}?customFrame=1"))
         QTimer.singleShot(750, self.web_bridge.start_auto_connect)
 
     def open_web_ui(self) -> None:
         if os.environ.get("NETWORK_MANAGER_NO_BROWSER") == "1":
             return
-        if self.browser_window.show_existing():
-            return
-        now = time.monotonic()
-        if now - self._last_browser_open < 1.0:
-            return
-        self._last_browser_open = now
-        edge_paths = (
-            Path(os.environ.get("PROGRAMFILES(X86)", ""))
-            / "Microsoft/Edge/Application/msedge.exe",
-            Path(os.environ.get("PROGRAMFILES", ""))
-            / "Microsoft/Edge/Application/msedge.exe",
-        )
-        edge = next((path for path in edge_paths if path.is_file()), None)
-        if edge is not None:
-            flags = 0x08000000 if os.name == "nt" else 0
-            try:
-                window_url = self.web_url
-                if self.browser_window.supported:
-                    window_url += "?customFrame=1"
-                process = subprocess.Popen(
-                    [str(edge), f"--app={window_url}", "--new-window"],
-                    close_fds=True,
-                    creationflags=flags,
-                )
-                self._attach_browser_window(process.pid)
-                return
-            except OSError:
-                pass
-        QDesktopServices.openUrl(QUrl(self.web_url))
+        super().show_and_raise()
 
-    def _attach_browser_window(self, launch_pid: int, attempt: int = 0) -> None:
-        if self.browser_window.attach(launch_pid):
-            return
-        if attempt < 40:
-            QTimer.singleShot(
-                100,
-                lambda: self._attach_browser_window(launch_pid, attempt + 1),
-            )
+    def perform_window_action(self, action: str) -> bool:
+        if action == "minimize":
+            self.showMinimized()
+        elif action == "maximize":
+            self.showNormal() if self.isMaximized() else self.showMaximized()
+        elif action == "drag":
+            handle = self.windowHandle()
+            return bool(handle and handle.startSystemMove())
+        elif action == "close":
+            self.close()
+        else:
+            return False
+        return True
 
     def show_and_raise(self) -> None:
         self.open_web_ui()
 
     def shutdown(self) -> None:
-        self.browser_window.close()
         self.web_server.close()
         self.web_bridge.close()
         super().shutdown()

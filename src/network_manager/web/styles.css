@@ -280,6 +280,19 @@ td.actions { text-align: right; overflow: visible; }
 .group-target-option:hover { border-color: #9cc9fa; background: #f6faff; }
 .group-target-option.is-active { color: #fff; border-color: var(--blue); background: var(--blue); font-weight: 600; }
 .group-target-option .icon { width: 19px; height: 19px; }
+.rule-domain-browser { display: grid; gap: 13px; }
+.rule-domain-search { display: grid; gap: 6px; }
+.rule-domain-search span { color: #69727d; font-size: 12px; }
+.rule-domain-list-head, .rule-domain-row { display: grid; grid-template-columns: 74px minmax(180px, 1fr) minmax(120px, .65fr); align-items: center; gap: 12px; }
+.rule-domain-list-head { padding: 0 10px; color: #7d8691; font-size: 11px; }
+.rule-domain-list { overflow: auto; max-height: 360px; border: 1px solid #e1e5e9; border-radius: 6px; }
+.rule-domain-row { min-height: 44px; padding: 7px 10px; border-bottom: 1px solid #edf0f2; }
+.rule-domain-row[hidden] { display: none; }
+.rule-domain-row:last-child { border-bottom: 0; }
+.rule-domain-row:hover { background: #f7faff; }
+.rule-domain-row strong, .rule-domain-row > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rule-domain-row > span:last-child { color: #69727d; }
+.rule-domain-count { color: #7d8691; font-size: 12px; text-align: right; }
 .empty-state { padding: 70px 20px; color: #929aa4; text-align: center; }
 .empty-state.compact { padding: 36px 20px; }
 

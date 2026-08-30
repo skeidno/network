@@ -10,6 +10,8 @@ dist/
 build-next/
 dist-next/
 dist-previous/
+build-webview/
+dist-webview/
 *.spec
 /*.png
 vendor/mihomo.exe

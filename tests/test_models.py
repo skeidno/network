@@ -19,6 +19,7 @@ def test_default_config_contains_discord_process_rule() -> None:
     assert any(rule.value == "google.com" for rule in config.rules)
     assert any(rule.value == "chatgpt.com" for rule in config.rules)
     assert any(rule.value == "claude.ai" for rule in config.rules)
+    assert any(rule.value == "arcteryx.com" for rule in config.rules)
     assert validate_config(config) == []
 
 
@@ -31,6 +32,7 @@ def test_config_migration_adds_missing_defaults_without_overriding_user_rule() -
     google_rules = [rule for rule in config.rules if rule.value == "google.com"]
     assert google_rules == [RoutingRule("DOMAIN-SUFFIX", "google.com", "DIRECT")]
     assert any(rule.value == "chatgpt.com" for rule in config.rules)
+    assert any(rule.value == "arcteryx.com" for rule in config.rules)
     assert not migrate_config(config)
 
 

@@ -1261,13 +1261,14 @@ class MainWindow(QMainWindow):
         self._update_summary()
         return True
 
-    def toggle_core(self) -> None:
+    def toggle_core(self) -> bool:
         if self._operation_active:
-            return
+            return False
         if self.core.is_running:
             self.stop_core()
         else:
             self.start_core()
+        return self._operation_active
 
     def start_core(self) -> None:
         if self._operation_active:
