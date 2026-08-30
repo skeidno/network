@@ -514,7 +514,7 @@ function renderSshServers() {
       </div>
       <p class="deployment-detail" title="${escapeHtml(detail)}">${escapeHtml(detail)}</p>
       <div class="ssh-server-actions">
-        <button class="button primary" data-ssh-action="deploy" data-profile-id="${server.profileId}"${isDeploying || Boolean(deploying) ? " disabled" : ""}>${icon(isDeploying ? "refresh-cw" : "hard-drive-download")}<span>${server.deployed ? "重新部署" : "部署代理"}</span></button>
+        <button class="button primary" data-ssh-action="deploy" data-profile-id="${server.profileId}"${isDeploying || Boolean(deploying) ? " disabled" : ""}>${icon(isDeploying || server.deployed ? "refresh-cw" : "hard-drive-download")}<span>${server.deployed ? "检查服务" : "部署代理"}</span></button>
         <button class="button secondary compact-button" data-ssh-action="copy" data-profile-id="${server.profileId}"${server.shareLink ? "" : " disabled"}>${icon("link")}<span>复制节点</span></button>
         <button class="icon-button" data-ssh-action="edit" data-profile-id="${server.profileId}" title="编辑" aria-label="编辑">${icon("square-pen")}</button>
         <button class="icon-button danger" data-ssh-action="delete" data-profile-id="${server.profileId}" title="删除" aria-label="删除">${icon("trash-2")}</button>
@@ -854,14 +854,14 @@ function deploySshServer(server) {
     return;
   }
   const label = server.authMethod === "key" ? "私钥口令（没有可留空）" : "SSH 密码";
-  openModal(`部署 ${server.name}`, `
+  openModal(`${server.deployed ? "检查或修复" : "部署"} ${server.name}`, `
     <div class="form-grid">
-      <div class="group-dialog-summary"><strong>${escapeHtml(server.username)}@${escapeHtml(server.host)}:${server.port}</strong><span>将部署代理节点：${escapeHtml(server.host)}:${server.proxyPort}</span></div>
+      <div class="group-dialog-summary"><strong>${escapeHtml(server.username)}@${escapeHtml(server.host)}:${server.port}</strong><span>${server.deployed ? "先检查远端服务；仅在服务缺失或停止时修复" : `将部署代理节点：${escapeHtml(server.host)}:${server.proxyPort}`}</span></div>
       <label><span>${label}</span><input id="modal-connect-password" type="password" autocomplete="current-password" autofocus></label>
-      <label class="switch-row"><span><strong>部署成功后记住凭据</strong><small>后续重新部署无需再次输入</small></span><input id="modal-connect-remember" type="checkbox" checked><i></i></label>
+      <label class="switch-row"><span><strong>成功后记住凭据</strong><small>后续检查或修复无需再次输入</small></span><input id="modal-connect-remember" type="checkbox" checked><i></i></label>
     </div>`, [
       { label: "取消", kind: "secondary", action: closeModal },
-    { label: "开始部署", kind: "primary", action: () => {
+    { label: server.deployed ? "检查服务" : "开始部署", kind: "primary", action: () => {
       invoke(
         "deploySshServer",
         server.profileId,

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 from threading import Lock
+from typing import Callable
 from urllib.parse import quote, urlsplit
 
 import psutil
@@ -862,9 +863,19 @@ class WebBridge(QObject):
                     "error": "",
                 }
 
-        self._notify("info", f"正在通过 SSH 部署 {profile.name}")
+        existing_node = self._deployed_node(profile)
+        existing_config = dict(existing_node.config) if existing_node else None
+        self._notify(
+            "info",
+            f"正在检查 {profile.name}" if existing_config else f"正在通过 SSH 部署 {profile.name}",
+        )
         future = self._ssh_executor.submit(
-            self.window.server_deployer.deploy, profile, password, progress
+            self._deploy_server_if_needed,
+            profile,
+            password,
+            existing_config,
+            profile.deployed_at,
+            progress,
         )
         future.add_done_callback(
             lambda completed: self._finish_server_deploy_future(
@@ -873,6 +884,30 @@ class WebBridge(QObject):
                 password if remember_credential else "",
             )
         )
+
+    def _deploy_server_if_needed(
+        self,
+        profile: SshServerProfile,
+        credential: str,
+        existing_node_config: dict[str, object] | None,
+        deployed_at: str,
+        progress: Callable[[str], None],
+    ) -> DeploymentResult:
+        if existing_node_config:
+            progress("正在检查远端代理服务")
+            inspection = self.window.server_deployer.inspect(profile, credential)
+            if inspection.get("status") == "active":
+                node = dict(existing_node_config)
+                return DeploymentResult(
+                    node_config=node,
+                    share_link=shadowsocks_share_link(node),
+                    version=inspection.get("version") or profile.deployed_version,
+                    deployed_at=deployed_at,
+                    firewall="unchanged",
+                    reused=True,
+                )
+            progress("远端服务未运行，正在修复部署")
+        return self.window.server_deployer.deploy(profile, credential, progress)
 
     @Slot(str)
     def copyServerNode(self, profile_id: str) -> None:
@@ -966,7 +1001,11 @@ class WebBridge(QObject):
         try:
             result = future.result()
             success = True
-            message = "服务器代理部署完成"
+            message = (
+                "远端代理已存在并正常运行，无需重复部署"
+                if result.reused
+                else "服务器代理部署完成"
+            )
             result_json = json.dumps(
                 {
                     "node": result.node_config,
@@ -974,6 +1013,7 @@ class WebBridge(QObject):
                     "version": result.version,
                     "deployedAt": result.deployed_at,
                     "firewall": result.firewall,
+                    "reused": result.reused,
                 },
                 ensure_ascii=False,
             )
@@ -1011,6 +1051,24 @@ class WebBridge(QObject):
             self._notify("error", message)
             return
         payload = json.loads(result_json)
+        if payload.get("reused"):
+            profile.deployed_version = str(payload.get("version", profile.deployed_version))
+            if credential:
+                try:
+                    self.window.credential_store.set(profile_id, credential)
+                    profile.remember_password = True
+                    message += "，SSH 凭据已安全保存"
+                except CredentialStoreError as exc:
+                    message += f"；凭据保存失败：{exc}"
+            self.window.store.save(self.window.config)
+            with self._deployment_lock:
+                self._deployment_states[profile_id] = {
+                    "status": "ready",
+                    "stage": "远端服务已存在并运行中",
+                    "error": "",
+                }
+            self._notify("success", message)
+            return
         node_config = dict(payload["node"])
         source_id = deployment_source_id(profile_id)
         current = self._deployed_node(profile)

@@ -41,6 +41,7 @@ class DeploymentResult:
     version: str
     deployed_at: str
     firewall: str
+    reused: bool = False
 
 
 def deployment_source_id(profile_id: str) -> str:

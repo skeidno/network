@@ -34,9 +34,11 @@ def main() -> int:
         server_cards = page.locator(".ssh-server-card")
         if server_cards.count():
             first_card = server_cards.first
-            assert first_card.locator('[data-ssh-action="deploy"]').is_visible()
+            deploy_button = first_card.locator('[data-ssh-action="deploy"]')
+            assert deploy_button.is_visible()
             if first_card.locator('[data-ssh-action="copy"]:not([disabled])').count():
                 assert "已部署" in first_card.inner_text()
+                expect(deploy_button).to_contain_text("检查服务")
 
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)

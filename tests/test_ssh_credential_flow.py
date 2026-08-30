@@ -201,3 +201,47 @@ def test_fallback_rule_target_is_persisted() -> None:
     assert bridge.window.config.default_target == "V2RAY"
     assert bridge.window.applied == 1
     assert bridge.notifications == [("success", "强制保底规则已更新")]
+
+
+def test_existing_active_server_service_is_reused_without_deploying() -> None:
+    profile = SshServerProfile(
+        "server-1",
+        "Test server",
+        "192.0.2.1",
+        deployed_node_id="node-1",
+        deployed_at="2026-08-30T12:00:00+08:00",
+        deployed_version="sing-box version 1.13.20",
+    )
+    bridge = FakeBridge(profile)
+
+    class ExistingServiceDeployer:
+        def inspect(self, _profile, _credential):
+            return {"status": "active", "version": "sing-box version 1.13.20"}
+
+        def deploy(self, *_args, **_kwargs):
+            raise AssertionError("active remote service must not be redeployed")
+
+    bridge.window.server_deployer = ExistingServiceDeployer()
+    node_config = {
+        "name": profile.name,
+        "type": "ss",
+        "server": profile.host,
+        "port": profile.proxy_port,
+        "cipher": "2022-blake3-aes-128-gcm",
+        "password": "base64-password",
+    }
+    stages: list[str] = []
+
+    result = WebBridge._deploy_server_if_needed(
+        bridge,
+        profile,
+        "credential",
+        node_config,
+        profile.deployed_at,
+        stages.append,
+    )
+
+    assert result.reused is True
+    assert result.node_config == node_config
+    assert result.deployed_at == profile.deployed_at
+    assert stages == ["正在检查远端代理服务"]
