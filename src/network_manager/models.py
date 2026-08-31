@@ -16,6 +16,7 @@ MODES = (
     "GLOBAL_V2RAY",
     "GLOBAL_SSH",
     "GLOBAL_BUILTIN",
+    "SMART",
     "DIRECT",
 )
 CONFIG_VERSION = 6
@@ -413,6 +414,8 @@ def validate_config(config: AppConfig) -> list[str]:
     elif config.mode == "GLOBAL_SSH":
         active_targets.add("SSH")
     elif config.mode == "GLOBAL_BUILTIN":
+        active_targets.add("BUILTIN")
+    elif config.mode == "SMART":
         active_targets.add("BUILTIN")
     active_targets.update(rule.target for rule in config.rules if rule.enabled)
     for target in sorted(active_targets):

@@ -5,8 +5,9 @@ NetWorkManger launches the official Mihomo executable as a separate process.
 - Mihomo: Copyright the MetaCubeX contributors, licensed under GPL-3.0.
   Source and license: https://github.com/MetaCubeX/mihomo
 - sing-box: Copyright the SagerNet contributors, licensed under GPL-3.0-or-later.
-  The application can install the official binary as an independent service on a user-managed
-  Linux server. Source and license: https://github.com/SagerNet/sing-box
+  The Android client embeds the official libbox library, and the desktop application can
+  install the official binary as an independent service on a user-managed Linux server.
+  Source and license: https://github.com/SagerNet/sing-box
 - PySide6 / Qt for Python: Copyright The Qt Company, licensed under LGPLv3/GPLv3
   and applicable commercial terms. Source and license: https://code.qt.io/cgit/pyside/pyside-setup.git/
 - Lucide icons: Copyright the Lucide contributors, licensed under the ISC License.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,7 @@ MODE_LABELS = {
     "GLOBAL_V2RAY": "全局 v2ray",
     "GLOBAL_SSH": "全局 SSH",
     "GLOBAL_BUILTIN": "全局内置节点",
+    "SMART": "智能节点",
     "DIRECT": "全部直连",
 }
 
@@ -98,6 +100,7 @@ MODE_DESCRIPTIONS = {
     "GLOBAL_V2RAY": "所有流量经 v2ray 转发",
     "GLOBAL_SSH": "所有流量经当前 SSH 服务器转发",
     "GLOBAL_BUILTIN": "所有流量经当前内置节点转发",
+    "SMART": "自动选择低延迟节点，变慢或失效时切换",
     "DIRECT": "绕过代理，所有流量直接连接",
 }
 
@@ -128,6 +131,10 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self._tasks: set[Task] = set()
         self._operation_active = False
+        self._core_desired_running = False
+        self._core_unhealthy_polls = 0
+        self._auto_recovery_attempts = 0
+        self._next_auto_recovery_at = 0.0
         self._force_close = False
         self._tray_notice_shown = False
         self._last_running = False
@@ -235,7 +242,7 @@ class MainWindow(QMainWindow):
         core_layout.addWidget(self.sidebar_core_status)
         sidebar_layout.addWidget(core_panel)
         sidebar_layout.addSpacing(12)
-        version = QLabel("Network Manager  ·  v0.3.1")
+        version = QLabel("Network Manager  ·  v0.4.0")
         version.setObjectName("sidebarVersion")
         sidebar_layout.addWidget(version)
 
@@ -907,6 +914,7 @@ class MainWindow(QMainWindow):
         self.selected_node_combo.setCurrentIndex(selected_index)
         self.selected_node_combo.blockSignals(False)
         self.mode_buttons["GLOBAL_BUILTIN"].setEnabled(bool(self.config.imported_nodes))
+        self.mode_buttons["SMART"].setEnabled(bool(self.config.imported_nodes))
         self._update_summary()
 
     def _refresh_subscriptions_table(self) -> None:
@@ -1124,7 +1132,7 @@ class MainWindow(QMainWindow):
             self.config.selected_node = (
                 self.config.imported_nodes[0].name if self.config.imported_nodes else ""
             )
-        if self.config.mode == "GLOBAL_BUILTIN" and not self.config.imported_nodes:
+        if self.config.mode in {"GLOBAL_BUILTIN", "SMART"} and not self.config.imported_nodes:
             self.config.mode = "RULE"
         self._save_and_apply("节点已删除")
         self._refresh_nodes_table()
@@ -1208,6 +1216,12 @@ class MainWindow(QMainWindow):
         self._refresh_subscriptions_table()
 
     def _save_settings(self) -> None:
+        old_runtime_settings = (
+            self.config.mixed_port,
+            self.config.controller_port,
+            self.config.dns_port,
+            self.config.strict_route,
+        )
         old_controller_port = self.config.controller_port
         self.config.mixed_port = self.mixed_port_spin.value()
         self.config.controller_port = self.controller_port_spin.value()
@@ -1223,7 +1237,16 @@ class MainWindow(QMainWindow):
             return
         if old_controller_port != self.config.controller_port:
             self.core.controller_port = self.config.controller_port
-        self._save_and_apply("设置已保存")
+        new_runtime_settings = (
+            self.config.mixed_port,
+            self.config.controller_port,
+            self.config.dns_port,
+            self.config.strict_route,
+        )
+        self._save_and_apply(
+            "设置已保存",
+            full_restart=old_runtime_settings != new_runtime_settings,
+        )
 
     def _load_mode_buttons(self) -> None:
         for mode, button in self.mode_buttons.items():
@@ -1234,7 +1257,7 @@ class MainWindow(QMainWindow):
         self._set_mode(mode)
 
     def _set_mode(self, mode: str) -> None:
-        if mode == "GLOBAL_BUILTIN" and not self.config.imported_nodes:
+        if mode in {"GLOBAL_BUILTIN", "SMART"} and not self.config.imported_nodes:
             QMessageBox.information(self, "没有内置节点", "请先导入至少一个节点。")
             self._load_mode_buttons()
             return
@@ -1248,7 +1271,7 @@ class MainWindow(QMainWindow):
         self._load_mode_buttons()
         self.mode_caption.setText(MODE_DESCRIPTIONS.get(mode, ""))
 
-    def _save_and_apply(self, message: str) -> bool:
+    def _save_and_apply(self, message: str, *, full_restart: bool = False) -> bool:
         errors = validate_config(self.config)
         if errors:
             QMessageBox.warning(self, "配置无效", "\n".join(errors[:12]))
@@ -1257,7 +1280,10 @@ class MainWindow(QMainWindow):
         write_mihomo_config(self.config, generated_config_path())
         self.statusBar().showMessage(message, 4000)
         if self.core.is_running:
-            self._restart_core_async()
+            if full_restart:
+                self._restart_core_async()
+            else:
+                self._reload_core_async()
         self._update_summary()
         return True
 
@@ -1270,24 +1296,40 @@ class MainWindow(QMainWindow):
             self.start_core()
         return self._operation_active
 
-    def start_core(self) -> None:
+    def start_core(self, recovery: bool = False) -> None:
         if self._operation_active:
             return
         if not is_admin():
+            self._core_desired_running = False
             QMessageBox.warning(self, "需要管理员权限", "TUN 接管必须以管理员身份运行。")
             return
         errors = validate_config(self.config)
         if errors:
             QMessageBox.warning(self, "配置无效", "\n".join(errors[:12]))
             return
+        self._core_desired_running = True
+        if not recovery:
+            self._auto_recovery_attempts = 0
+            self._next_auto_recovery_at = 0.0
         self.store.save(self.config)
         write_mihomo_config(self.config, generated_config_path())
         self._operation_active = True
         self._update_status("正在启动 TUN 核心...")
 
         def success(_result: object) -> None:
+            self._auto_recovery_attempts = 0
+            self._next_auto_recovery_at = 0.0
+            self._core_unhealthy_polls = 0
             self.statusBar().showMessage("全流量接管已启动", 5000)
             self._update_status()
+
+        def failed(message: str) -> None:
+            if recovery:
+                self.core.log_event(f"自动恢复失败：{message}")
+                self.statusBar().showMessage("自动恢复失败，将按退避策略重试", 5000)
+            else:
+                self._core_desired_running = False
+                QMessageBox.warning(self, "启动失败", message)
 
         def finished() -> None:
             self._operation_active = False
@@ -1298,11 +1340,15 @@ class MainWindow(QMainWindow):
             success,
             "启动失败",
             finished,
+            failed,
         )
 
     def stop_core(self) -> None:
         if self._operation_active:
             return
+        self._core_desired_running = False
+        self._auto_recovery_attempts = 0
+        self._next_auto_recovery_at = 0.0
         self._operation_active = True
         self._update_status("正在停止并恢复网络...")
 
@@ -1312,7 +1358,7 @@ class MainWindow(QMainWindow):
 
         self._run_task(self.core.stop, lambda _result: None, "停止失败", finished)
 
-    def _restart_core_async(self) -> None:
+    def _restart_core_async(self, recovery: bool = False) -> None:
         if self._operation_active:
             return
         self._operation_active = True
@@ -1322,9 +1368,50 @@ class MainWindow(QMainWindow):
             self._operation_active = False
             self._update_status()
 
+        def success(_result: object) -> None:
+            self._auto_recovery_attempts = 0
+            self._next_auto_recovery_at = 0.0
+            self._core_unhealthy_polls = 0
+            self.statusBar().showMessage(
+                "TUN 核心已自动恢复" if recovery else "配置已应用",
+                3000,
+            )
+
+        def failed(message: str) -> None:
+            if self._core_desired_running:
+                self._next_auto_recovery_at = time.monotonic() + 2.0
+            if recovery:
+                self.core.log_event(f"自动恢复失败：{message}")
+            else:
+                QMessageBox.warning(self, "应用配置失败", message)
+
         self._run_task(
             lambda: self.core.restart(generated_config_path()),
-            lambda _result: self.statusBar().showMessage("配置已应用", 3000),
+            success,
+            "应用配置失败",
+            finished,
+            failed,
+        )
+
+    def _reload_core_async(self) -> None:
+        if self._operation_active:
+            return
+        self._operation_active = True
+        self._update_status("正在热加载配置...")
+
+        def finished() -> None:
+            self._operation_active = False
+            self._update_status()
+
+        self._run_task(
+            lambda: self.core.reload(
+                generated_config_path(),
+                self.config.controller_secret,
+            ),
+            lambda _result: self.statusBar().showMessage(
+                "配置已应用，现有连接保持运行",
+                3000,
+            ),
             "应用配置失败",
             finished,
         )
@@ -1388,6 +1475,41 @@ class MainWindow(QMainWindow):
         running = self.core.is_running
         if self._last_running and not running and not self._operation_active:
             self.statusBar().showMessage("TUN 核心意外停止，请查看运行日志", 7000)
+            if self._core_desired_running and not self._next_auto_recovery_at:
+                self._next_auto_recovery_at = time.monotonic() + 2.0
+        if running:
+            if self.core.is_healthy:
+                self._core_unhealthy_polls = 0
+            else:
+                self._core_unhealthy_polls += 1
+                if (
+                    self._core_unhealthy_polls >= 8
+                    and self._core_desired_running
+                    and not self._operation_active
+                    and self._auto_recovery_attempts < 3
+                ):
+                    self._auto_recovery_attempts += 1
+                    self._core_unhealthy_polls = 0
+                    self.core.log_event("控制端口持续无响应，正在自动恢复核心")
+                    self._restart_core_async(recovery=True)
+        elif (
+            self._core_desired_running
+            and not self._operation_active
+            and self._next_auto_recovery_at
+            and time.monotonic() >= self._next_auto_recovery_at
+        ):
+            if self._auto_recovery_attempts < 3:
+                self._auto_recovery_attempts += 1
+                delay = (2.0, 5.0, 10.0)[self._auto_recovery_attempts - 1]
+                self._next_auto_recovery_at = time.monotonic() + delay
+                self.core.log_event(
+                    f"正在执行第 {self._auto_recovery_attempts}/3 次自动恢复"
+                )
+                self.start_core(recovery=True)
+            else:
+                self._core_desired_running = False
+                self._next_auto_recovery_at = 0.0
+                self.statusBar().showMessage("TUN 核心连续恢复失败，请检查运行日志", 8000)
         self._last_running = running
         self._update_status()
 
@@ -1519,11 +1641,16 @@ class MainWindow(QMainWindow):
         on_success: Any,
         error_title: str,
         on_finished: Any | None = None,
+        on_error: Any | None = None,
     ) -> None:
         task = Task(function)
         self._tasks.add(task)
         task.signals.result.connect(on_success)
-        task.signals.error.connect(lambda message: QMessageBox.warning(self, error_title, message))
+        task.signals.error.connect(
+            on_error
+            if on_error is not None
+            else lambda message: QMessageBox.warning(self, error_title, message)
+        )
 
         def finished() -> None:
             self._tasks.discard(task)

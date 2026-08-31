@@ -31,9 +31,13 @@ def test_core_manager_repeated_start_stop_without_tun(tmp_path) -> None:
     manager = CoreManager(core_path(), tmp_path, config.controller_port)
 
     try:
-        for _iteration in range(5):
+        for iteration in range(5):
             manager.start(path)
             assert manager.is_running
+            assert manager.is_healthy
+            if iteration == 0:
+                manager.reload(path, config.controller_secret)
+                assert manager.is_healthy
             manager.stop()
             assert not manager.is_running
     finally:

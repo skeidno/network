@@ -30,6 +30,7 @@ const MODE_META = [
   ["GLOBAL_CLASH", "全局 Clash", "所有流量经 Clash 转发"],
   ["GLOBAL_V2RAY", "全局 v2ray", "所有流量经 v2ray 转发"],
   ["GLOBAL_BUILTIN", "全局节点", "所有流量经当前内置节点转发"],
+  ["SMART", "智能节点", "自动选择低延迟节点，变慢或失效时切换"],
   ["DIRECT", "全局直连", "所有流量不经过代理"],
 ];
 
@@ -223,7 +224,7 @@ function renderOverview() {
       : `${icon("play")}<span>启动接管</span>`;
 
   byId("mode-switch").innerHTML = MODE_META.map(([mode, label]) => {
-    const disabled = mode === "GLOBAL_BUILTIN" && appState.nodes.length === 0;
+    const disabled = ["GLOBAL_BUILTIN", "SMART"].includes(mode) && appState.nodes.length === 0;
     return `<button class="segment${core.mode === mode ? " is-active" : ""}" data-mode="${mode}"${disabled ? " disabled" : ""}>${label}</button>`;
   }).join("");
   const modeMeta = MODE_META.find(([mode]) => mode === core.mode);
@@ -372,6 +373,14 @@ function renderRules() {
       </td>
     </tr>`;
   }).join("");
+  const lanBypassRow = `<tr class="system-rule-row">
+    <td><span class="rule-status is-enabled">强制启用</span></td>
+    <td><span class="fallback-label">系统直连</span></td>
+    <td><strong>内网与局域网</strong></td>
+    <td><span class="chip">直连</span></td>
+    <td>优先匹配，不受保底出口影响</td>
+    <td class="actions"></td>
+  </tr>`;
   const fallback = appState.fallbackRule || { target: "DIRECT", targetLabel: "直连" };
   const fallbackRow = `<tr class="fallback-rule-row">
     <td><span class="rule-status is-enabled">强制启用</span></td>
@@ -381,7 +390,7 @@ function renderRules() {
     <td>始终位于规则末尾</td>
     <td class="actions"><button class="mini-button" data-fallback-action="edit" title="修改保底出口">${icon("square-pen")}</button></td>
   </tr>`;
-  byId("rules-body").innerHTML = regularRows + fallbackRow;
+  byId("rules-body").innerHTML = lanBypassRow + regularRows + fallbackRow;
 }
 
 function renderSources() {
@@ -417,6 +426,12 @@ function renderNodes() {
   const testButton = byId("test-all-nodes");
   testButton.disabled = !appState.core.running || nodes.length === 0 || testing;
   testButton.querySelector("span:last-child").textContent = testing ? "测速中" : "批量测速";
+  const errorCount = sourceNodes.filter((node) => node.latencyStatus === "error").length;
+  const deleteErrorButton = byId("delete-error-nodes");
+  deleteErrorButton.disabled = errorCount === 0 || testing;
+  deleteErrorButton.querySelector("span:last-child").textContent = errorCount
+    ? `删除 Error (${errorCount})`
+    : "删除 Error";
   byId("nodes-empty").classList.toggle("is-hidden", nodes.length > 0);
   byId("node-grid").innerHTML = nodes.map((node) => {
     const latencyText = node.latencyStatus === "testing"
@@ -436,7 +451,11 @@ function renderNodes() {
     return `<article class="node-card${node.selected ? " is-selected" : ""}" data-node-select="${escapeHtml(node.name)}" tabindex="0" role="button" aria-label="选择节点 ${escapeHtml(node.name)}">
         <div class="node-card-head">
           <strong title="${escapeHtml(node.name)}">${escapeHtml(node.name)}</strong>
-          <div class="node-card-actions"><span class="node-latency ${latencyLevel}">${latencyText}</span><button class="mini-button danger" data-node-delete="${node.index}" title="删除节点" aria-label="删除节点">${icon("trash-2")}</button></div>
+          <div class="node-card-actions">
+            <span class="node-latency ${latencyLevel}">${latencyText}</span>
+            <button class="mini-button" data-node-test="${escapeHtml(node.name)}" title="测试该节点" aria-label="测试该节点"${!appState.core.running || node.latencyStatus === "testing" ? " disabled" : ""}>${icon("wifi")}</button>
+            <button class="mini-button danger" data-node-delete="${node.index}" title="删除节点" aria-label="删除节点">${icon("trash-2")}</button>
+          </div>
         </div>
         <div class="node-card-meta"><span class="node-badge">${escapeHtml(node.protocol)}</span></div>
         <div class="node-card-foot">
@@ -971,8 +990,25 @@ function bindEvents() {
   byId("save-sources").addEventListener("click", saveSourcesFromForm);
   byId("import-paste").addEventListener("click", openPasteDialog);
   byId("import-file").addEventListener("click", () => invoke("importFile"));
+  byId("portable-config-import").addEventListener("click", () => invoke("importPortableConfig"));
+  byId("portable-config-export").addEventListener("click", () => invoke("exportPortableConfig"));
   byId("test-all-nodes").addEventListener("click", () => invoke("testAllNodes"));
+  byId("delete-error-nodes").addEventListener("click", () => {
+    const count = appState.nodes.filter((node) => node.latencyStatus === "error").length;
+    if (!count) return;
+    confirmAction(
+      "删除测速失败节点",
+      `确定删除 ${count} 个 Error 节点？订阅记录会保留，之后刷新原订阅即可恢复。`,
+      () => invoke("deleteErrorNodes"),
+    );
+  });
   byId("node-grid").addEventListener("click", (event) => {
+    const testButton = event.target.closest("[data-node-test]");
+    if (testButton) {
+      event.stopPropagation();
+      invoke("testNode", testButton.dataset.nodeTest);
+      return;
+    }
     const button = event.target.closest("[data-node-delete]");
     if (button) {
       event.stopPropagation();

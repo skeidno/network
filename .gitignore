@@ -14,6 +14,7 @@ dist-repair/
 build-release/
 dist-release/
 release-assets/
+artifacts/
 dist-previous/
 build-webview/
 dist-webview/
@@ -24,3 +25,13 @@ vendor/*.tmp
 vendor/release.json
 ssh-credentials.json
 settings.json
+
+# Android
+apps/android/.gradle/
+apps/android/.kotlin/
+apps/android/local.properties
+apps/android/**/build/
+apps/android/app/libs/*.aar
+apps/android/captures/
+apps/android/signing.properties
+apps/android/*.keystore

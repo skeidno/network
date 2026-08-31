@@ -28,6 +28,7 @@ def main() -> int:
         page.goto(args.url, wait_until="networkidle")
         page.locator("#page-title").wait_for(state="visible")
         expect(page.locator("#page-title")).to_have_text("运行概览")
+        expect(page.locator('[data-mode="SMART"]')).to_be_visible()
 
         page.locator('[data-page="servers"]').click()
         expect(page.locator("#page-title")).to_have_text("服务器部署")
@@ -56,6 +57,10 @@ def main() -> int:
 
         page.locator('[data-page="nodes"]').click()
         expect(page.locator("#page-title")).to_have_text("代理与节点")
+        page.locator('[data-node-tab="imported"]').click()
+        expect(page.locator("#delete-error-nodes")).to_be_visible()
+        if args.output:
+            page.screenshot(path=str(args.output.with_name(args.output.stem + "-nodes.png")))
         page.locator('[data-page="settings"]').click()
         expect(page.locator("#page-title")).to_have_text("设置")
 

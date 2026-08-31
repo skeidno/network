@@ -4,16 +4,20 @@
 
 ## 当前能力
 
-- 规则分流、全局 Clash、全局 v2ray、全局内置节点和直连模式
+- 规则分流、全局 Clash、全局 v2ray、全局内置节点、智能节点和直连模式
 - Clash YAML、Base64 订阅以及 VLESS、VMess、Trojan、Shadowsocks 等常见分享链接
 - 兼容需要特定 User-Agent 的订阅，并支持 Clash `proxy-providers`
-- 内置节点卡片选择与批量延迟测试
+- 内置节点卡片选择、单节点测速与批量延迟测试；结果自动按低延迟优先、失败节点置后
+- 智能节点每 60 秒执行真实 URL 健康检查；候选节点变慢、失效或出现明显更快节点时自动切换
 - Google、ChatGPT、Claude、YouTube、GitHub 等常用海外站点预置规则组
 - 始终位于规则末尾的强制保底规则，默认直连，可切换到本地端口或内置节点组
+- 局域网、回环、链路本地和保留地址固定直连，并从 TUN 路由中排除，不受全局或保底规则影响
 - 最近 60 秒上传、下载、累计流量和连接数监控
 - 通过 SSH 自动部署独立 Shadowsocks 2022 服务，并生成可复制的跨设备节点
 - 多端点出口 IP 检测，避免单个检测服务限流造成误报
-- 系统托盘、登录启动和配置自动校验
+- TUN 就绪检测、配置热加载、异常退出自动退避恢复，避免改规则时反复重建网卡
+- Windows 与 Android 通用配置文件快速导入导出；SSH 凭据、桌面进程规则和本地端口不会跨设备导出
+- 系统托盘、登录启动、桌面快捷方式和配置自动校验
 
 WebGUI 由仅监听 `127.0.0.1` 的会话令牌 API 提供，并通过 Qt WebEngine 直接嵌入 Network Manager 主窗口。界面、托盘和后台管理属于同一个应用实例，不会再打开 Edge 窗口；Mihomo 仍作为受控子进程独立运行。
 
@@ -47,6 +51,24 @@ powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1
 
 输出位于 `dist/NetworkManager/`。构建为稳定的一目录包并带管理员清单；Mihomo 作为独立子进程运行，主程序异常退出时 Windows Job Object 会清理核心。
 
+构建脚本会为当前用户创建桌面快捷方式。也可单独执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/create_desktop_shortcut.ps1
+```
+
+## Android 开发与测试
+
+Android 原生客户端位于 `apps/android/`，使用系统 `VpnService` 和 sing-box libbox。它支持与 Windows 相同的订阅、节点、常用海外站点规则、强制保底、智能节点、实时流量及通用配置导入导出，但不包含 SSH 服务器部署。
+
+```powershell
+cd apps/android
+.\scripts\fetch_libbox.ps1
+.\gradlew.bat testDebugUnitTest assembleDebug assembleDebugAndroidTest
+```
+
+连接模拟器或 Android 设备后，可按 `apps/android/README.md` 运行设备测试。通用配置字段见 `docs/portable-config-v1.md`。
+
 ## 测试
 
 ```powershell
@@ -75,6 +97,6 @@ python scripts/smoke_webgui.py http://127.0.0.1:<port>/ --poll-seconds 10
 
 ## 平台范围
 
-Windows 11 是当前完整支持和测试的平台。自动部署生成的标准 Shadowsocks 2022 节点可复制到 macOS 和 Android 兼容客户端；Network Manager 本体的 macOS 权限、TUN 打包和启动项仍需单独适配，Android 版本还需要原生 VPNService 外壳。
+Windows 11 是当前完整支持的平台。Android 原生客户端已实现并通过 API 36 模拟器的 VPN 接管与设备测试；macOS 与 iOS 目录已建立，但系统扩展、TUN 权限、签名和打包仍待实现。平台边界见 `PLATFORMS.md`。
 
 项目界面和核心管理思路参考了 [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev)，代理核心使用 [Mihomo](https://github.com/MetaCubeX/mihomo)。第三方许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

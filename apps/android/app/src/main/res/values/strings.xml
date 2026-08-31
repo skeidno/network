@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Network Manager</string>
+    <string name="vpn_channel_name">VPN 接管</string>
+    <string name="vpn_running">Network Manager 正在接管网络</string>
+</resources>

@@ -75,7 +75,7 @@
           <small>MB</small>
         </div>
       </div>
-      <div class="sidebar-version">v0.3.1 · WebGUI</div>
+      <div class="sidebar-version">v0.4.0 · WebGUI</div>
     </aside>
 
     <main class="main-area">
@@ -213,6 +213,7 @@
               <button id="import-paste" class="button primary"><span class="icon" style="--icon:url('./icons/circle-plus.svg')"></span><span>粘贴导入</span></button>
               <button id="import-file" class="button secondary"><span class="icon" style="--icon:url('./icons/folder-open.svg')"></span><span>配置文件</span></button>
               <button id="test-all-nodes" class="button secondary"><span class="icon" style="--icon:url('./icons/activity.svg')"></span><span>批量测速</span></button>
+              <button id="delete-error-nodes" class="button danger" disabled><span class="icon" style="--icon:url('./icons/trash-2.svg')"></span><span>删除 Error</span></button>
             </div>
             <div id="node-grid" class="node-grid"></div>
             <div id="nodes-empty" class="empty-state is-hidden">暂无已导入节点</div>
@@ -262,6 +263,16 @@
                 <label class="switch-row"><span><strong>打开后自动接管</strong><small>软件启动后自动运行核心</small></span><input id="setting-start-on-launch" type="checkbox"><i></i></label>
                 <label class="switch-row"><span><strong>关闭到系统托盘</strong><small>关闭窗口时保持后台运行</small></span><input id="setting-close-to-tray" type="checkbox"><i></i></label>
                 <label class="switch-row"><span><strong>随 Windows 登录启动</strong><small>登录后自动打开网络管理器</small></span><input id="setting-start-with-windows" type="checkbox"><i></i></label>
+              </div>
+            </section>
+            <section class="panel settings-section">
+              <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/link.svg')"></span></div><div><h2>跨设备配置</h2><p>Windows、Android、macOS 与 iOS 共用同一格式</p></div></div>
+              <div class="portable-config-row">
+                <div><strong>节点、订阅与分流规则</strong><small>SSH、本机端口和启动行为不会写入导出文件；文件内可能包含节点密码。</small></div>
+                <div class="portable-config-actions">
+                  <button id="portable-config-import" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/folder-open.svg')"></span><span>导入配置</span></button>
+                  <button id="portable-config-export" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/save.svg')"></span><span>导出配置</span></button>
+                </div>
               </div>
             </section>
             <div><button type="submit" class="button primary"><span class="icon" style="--icon:url('./icons/save.svg')"></span><span>保存设置</span></button></div>

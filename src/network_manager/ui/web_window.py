@@ -40,6 +40,7 @@ from network_manager.paths import (
     ssh_credentials_path,
     ssh_known_hosts_path,
 )
+from network_manager.portable_config import export_portable_config, import_portable_config
 from network_manager.ui.dialogs import RULE_LABELS, TARGET_LABELS
 from network_manager.ui.main_window import MODE_LABELS, MainWindow as NativeMainWindow
 from network_manager.windows_startup import is_admin
@@ -57,7 +58,9 @@ class WebBridge(QObject):
         self._node_delay_lock = Lock()
         self._node_delays: dict[str, dict[str, object]] = {}
         self._node_test_generation = 0
-        self._node_test_remaining = 0
+        self._node_test_pending: dict[str, int] = {}
+        self._node_batch_generation: int | None = None
+        self._node_batch_pending: set[str] = set()
         self._node_executor = ThreadPoolExecutor(
             max_workers=8, thread_name_prefix="node-delay"
         )
@@ -376,23 +379,44 @@ class WebBridge(QObject):
             return {"status": "error", "delay": None, "message": str(exc)}
 
     def _node_delay_finished(
-        self, generation: int, node_name: str, future: Future[dict[str, object]]
+        self,
+        generation: int,
+        node_name: str,
+        future: Future[dict[str, object]],
+        batch_generation: int | None = None,
     ) -> None:
         try:
             result = future.result()
         except Exception as exc:  # pragma: no cover - executor boundary
             result = {"status": "error", "delay": None, "message": str(exc)}
         with self._node_delay_lock:
-            if generation != self._node_test_generation:
+            if self._node_test_pending.get(node_name) != generation:
                 return
+            self._node_test_pending.pop(node_name, None)
             self._node_delays[node_name] = result
-            self._node_test_remaining -= 1
-            finished = self._node_test_remaining == 0
-            success_count = sum(
-                item.get("status") == "ok" for item in self._node_delays.values()
+            is_batch = (
+                batch_generation is not None
+                and batch_generation == self._node_batch_generation
             )
-        if finished:
-            self._notify("success", f"批量测速完成，{success_count} 个节点可用")
+            if is_batch:
+                self._node_batch_pending.discard(node_name)
+                batch_finished = not self._node_batch_pending
+                success_count = sum(
+                    self._node_delays.get(name, {}).get("status") == "ok"
+                    for name in self._node_delays
+                )
+                if batch_finished:
+                    self._node_batch_generation = None
+            else:
+                batch_finished = False
+                success_count = 0
+        if is_batch:
+            if batch_finished:
+                self._notify("success", f"批量测速完成，{success_count} 个节点可用")
+        elif result.get("status") == "ok":
+            self._notify("success", f"{node_name}：{result['delay']} ms")
+        else:
+            self._notify("error", f"{node_name} 测速失败")
 
     def close(self) -> None:
         if self._bridge_closed:
@@ -400,7 +424,9 @@ class WebBridge(QObject):
         self._bridge_closed = True
         with self._node_delay_lock:
             self._node_test_generation += 1
-            self._node_test_remaining = 0
+            self._node_test_pending.clear()
+            self._node_batch_generation = None
+            self._node_batch_pending.clear()
         self._node_executor.shutdown(wait=False, cancel_futures=True)
         self._ssh_executor.shutdown(wait=False, cancel_futures=True)
 
@@ -631,6 +657,59 @@ class WebBridge(QObject):
         if path:
             self.window._execute_import({"kind": "file", "path": path})
 
+    @Slot()
+    def exportPortableConfig(self) -> None:
+        path, _filter = QFileDialog.getSaveFileName(
+            self.window,
+            "导出跨设备配置",
+            str(Path.home() / "NetworkManager-config.json"),
+            "Network Manager 配置 (*.json)",
+        )
+        if not path:
+            return
+        try:
+            payload = export_portable_config(self.window.config)
+            Path(path).write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            self._notify("error", f"配置导出失败：{exc}")
+            return
+        self._notify("success", "跨设备配置已导出")
+
+    @Slot()
+    def importPortableConfig(self) -> None:
+        if self.window.core.is_running or self.window._operation_active:
+            self._notify("error", "请先停止接管，再导入跨设备配置")
+            return
+        path, _filter = QFileDialog.getOpenFileName(
+            self.window,
+            "导入跨设备配置",
+            "",
+            "Network Manager 配置 (*.json);;所有文件 (*)",
+        )
+        if not path:
+            return
+        try:
+            source = Path(path)
+            if source.stat().st_size > 10 * 1024 * 1024:
+                raise ValueError("配置文件不能超过 10 MB")
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("配置文件根节点必须是对象")
+            imported = import_portable_config(self.window.config, payload)
+            self.window.store.save(imported)
+            self.window.config = imported
+            self.window._load_config_into_ui()
+            self.window._refresh_rules_table()
+            self.window._refresh_nodes_table()
+            self.window._refresh_subscriptions_table()
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self._notify("error", f"配置导入失败：{exc}")
+            return
+        self._notify("success", "跨设备配置已导入，SSH 与本机设置保持不变")
+
     @Slot(int)
     def refreshSubscription(self, index: int) -> None:
         source = self.window._subscription_at_row(index)
@@ -681,12 +760,58 @@ class WebBridge(QObject):
                 if self.window.config.imported_nodes
                 else ""
             )
-        if self.window.config.mode == "GLOBAL_BUILTIN" and not self.window.config.imported_nodes:
+        if self.window.config.mode in {"GLOBAL_BUILTIN", "SMART"} and not self.window.config.imported_nodes:
             self.window.config.mode = "RULE"
         self.window._save_and_apply("节点已删除")
         self.window._refresh_nodes_table()
         self.window._refresh_subscriptions_table()
         self._notify("success", "节点已删除")
+
+    @Slot()
+    def deleteErrorNodes(self) -> None:
+        with self._node_delay_lock:
+            if self._node_test_pending:
+                self._notify("info", "请等待当前节点测速完成")
+                return
+            failed_names = {
+                name
+                for name, result in self._node_delays.items()
+                if result.get("status") == "error"
+            }
+        if not failed_names:
+            self._notify("info", "当前没有 Error 节点")
+            return
+        before = len(self.window.config.imported_nodes)
+        self.window.config.imported_nodes = [
+            node
+            for node in self.window.config.imported_nodes
+            if node.name not in failed_names
+        ]
+        removed_count = before - len(self.window.config.imported_nodes)
+        if not removed_count:
+            self._notify("info", "Error 节点已不存在")
+            return
+        if self.window.config.selected_node in failed_names:
+            self.window.config.selected_node = (
+                self.window.config.imported_nodes[0].name
+                if self.window.config.imported_nodes
+                else ""
+            )
+        if (
+            self.window.config.mode in {"GLOBAL_BUILTIN", "SMART"}
+            and not self.window.config.imported_nodes
+        ):
+            self.window.config.mode = "RULE"
+        with self._node_delay_lock:
+            for name in failed_names:
+                self._node_delays.pop(name, None)
+        self.window._save_and_apply("Error 节点已批量删除")
+        self.window._refresh_nodes_table()
+        self.window._refresh_subscriptions_table()
+        self._notify(
+            "success",
+            f"已删除 {removed_count} 个 Error 节点；刷新原订阅可恢复",
+        )
 
     @Slot(str)
     def selectNode(self, name: str) -> None:
@@ -715,23 +840,58 @@ class WebBridge(QObject):
             self._notify("error", "没有可测试的内置节点")
             return
         with self._node_delay_lock:
-            if self._node_test_remaining:
+            if self._node_test_pending:
                 self._notify("info", "节点测速正在进行")
                 return
             self._node_test_generation += 1
-            generation = self._node_test_generation
-            self._node_test_remaining = len(nodes)
+            batch_generation = self._node_test_generation
+            self._node_batch_generation = batch_generation
+            self._node_batch_pending = {node.name for node in nodes}
             self._node_delays = {
                 node.name: {"status": "testing", "delay": None} for node in nodes
             }
+            generations: dict[str, int] = {}
+            for node in nodes:
+                self._node_test_generation += 1
+                generations[node.name] = self._node_test_generation
+            self._node_test_pending.update(generations)
         self._notify("info", f"正在并发测试 {len(nodes)} 个节点")
         for node in nodes:
             future = self._node_executor.submit(self._measure_node_delay, node.name)
             future.add_done_callback(
                 lambda completed, name=node.name: self._node_delay_finished(
-                    generation, name, completed
+                    generations[name], name, completed, batch_generation
                 )
             )
+
+    @Slot(str)
+    def testNode(self, name: str) -> None:
+        if not self.window.core.is_running:
+            self._notify("error", "请先启动接管核心再进行节点测速")
+            return
+        node = next(
+            (item for item in self.window.config.imported_nodes if item.name == name),
+            None,
+        )
+        if node is None:
+            self._notify("error", "节点不存在或已被删除")
+            return
+        with self._node_delay_lock:
+            if self._node_batch_generation is not None:
+                self._notify("info", "批量测速正在进行")
+                return
+            if name in self._node_test_pending:
+                self._notify("info", f"{name} 正在测速")
+                return
+            self._node_test_generation += 1
+            generation = self._node_test_generation
+            self._node_test_pending[name] = generation
+            self._node_delays[name] = {"status": "testing", "delay": None}
+        self._notify("info", f"正在测试 {name}")
+        future = self._node_executor.submit(self._measure_node_delay, name)
+        future.add_done_callback(
+            lambda completed: self._node_delay_finished(generation, name, completed)
+        )
 
     @Slot(str, str)
     def saveSshServer(self, payload_json: str, password: str) -> None:
@@ -1164,14 +1324,18 @@ class WebMainWindow(NativeMainWindow):
             "addSubscription",
             "importPaste",
             "importFile",
+            "exportPortableConfig",
+            "importPortableConfig",
             "refreshSubscription",
             "refreshAllSubscriptions",
             "deleteSubscription",
             "deleteNode",
+            "deleteErrorNodes",
             "selectNode",
             "testExit",
             "testSource",
             "testAllNodes",
+            "testNode",
             "clearLogs",
             "openLogs",
             "saveSshServer",

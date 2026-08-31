@@ -29,6 +29,27 @@ UPSTREAM_PROCESSES = (
     "pythonw.exe",
 )
 
+LAN_DOMAIN_SUFFIXES = ("lan", "local", "home.arpa")
+LAN_IPV4_CIDRS = (
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+)
+LAN_IPV6_CIDRS = ("::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8")
+
+
+def _lan_bypass_rules() -> list[str]:
+    rules = [f"DOMAIN-SUFFIX,{suffix},DIRECT" for suffix in LAN_DOMAIN_SUFFIXES]
+    rules.extend(f"IP-CIDR,{cidr},DIRECT,no-resolve" for cidr in LAN_IPV4_CIDRS)
+    rules.extend(f"IP-CIDR6,{cidr},DIRECT,no-resolve" for cidr in LAN_IPV6_CIDRS)
+    return rules
+
 
 def _proxy_entry(name: str, host: str, port: int, protocol: str) -> dict[str, Any]:
     entry: dict[str, Any] = {
@@ -94,6 +115,7 @@ def build_mihomo_config(config: AppConfig) -> dict[str, Any]:
     proxies.extend(dict(node.config) for node in config.imported_nodes)
 
     rules = [f"PROCESS-NAME,{name},DIRECT" for name in UPSTREAM_PROCESSES]
+    rules.extend(_lan_bypass_rules())
     if config.mode == "RULE":
         rules.extend(_rule_line(rule) for rule in config.rules if rule.enabled)
         final_target = TARGET_NAMES[config.default_target]
@@ -105,6 +127,8 @@ def build_mihomo_config(config: AppConfig) -> dict[str, Any]:
         final_target = TARGET_NAMES["SSH"]
     elif config.mode == "GLOBAL_BUILTIN":
         final_target = TARGET_NAMES["BUILTIN"]
+    elif config.mode == "SMART":
+        final_target = "SMART-NODES"
     else:
         final_target = "DIRECT"
     rules.append(f"MATCH,{final_target}")
@@ -130,12 +154,8 @@ def build_mihomo_config(config: AppConfig) -> dict[str, Any]:
             "strict-route": config.strict_route,
             "dns-hijack": ["any:53", "tcp://any:53"],
             "route-exclude-address": [
-                "10.0.0.0/8",
-                "127.0.0.0/8",
-                "169.254.0.0/16",
-                "172.16.0.0/12",
-                "192.168.0.0/16",
-                "224.0.0.0/4",
+                *LAN_IPV4_CIDRS,
+                *LAN_IPV6_CIDRS,
             ],
         },
         "sniffer": {
@@ -182,7 +202,16 @@ def build_mihomo_config(config: AppConfig) -> dict[str, Any]:
                 "name": TARGET_NAMES["BUILTIN"],
                 "type": "select",
                 "proxies": node_names,
-            }
+            },
+            {
+                "name": "SMART-NODES",
+                "type": "url-test",
+                "proxies": node_names,
+                "url": "https://www.gstatic.com/generate_204",
+                "interval": 60,
+                "tolerance": 120,
+                "lazy": False,
+            },
         ]
     return result
 
