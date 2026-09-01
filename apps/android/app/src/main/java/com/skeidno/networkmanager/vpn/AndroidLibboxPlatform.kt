@@ -11,6 +11,7 @@ import android.os.Process
 import android.system.ErrnoException
 import android.system.OsConstants
 import android.util.Base64
+import androidx.annotation.RequiresApi
 import io.nekohasekai.libbox.ConnectionOwner
 import io.nekohasekai.libbox.InterfaceUpdateListener
 import io.nekohasekai.libbox.Libbox
@@ -57,7 +58,26 @@ class AndroidLibboxPlatform(private val service: NetworkVpnService) : PlatformIn
         destinationAddress: String,
         destinationPort: Int,
     ): ConnectionOwner {
-        check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) { "当前系统不支持进程识别" }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            error("当前系统不支持进程识别")
+        }
+        return findConnectionOwnerQ(
+            ipProtocol,
+            sourceAddress,
+            sourcePort,
+            destinationAddress,
+            destinationPort,
+        )
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun findConnectionOwnerQ(
+        ipProtocol: Int,
+        sourceAddress: String,
+        sourcePort: Int,
+        destinationAddress: String,
+        destinationPort: Int,
+    ): ConnectionOwner {
         val uid = connectivity.getConnectionOwnerUid(
             ipProtocol,
             InetSocketAddress(sourceAddress, sourcePort),
@@ -224,7 +244,18 @@ class AndroidLibboxPlatform(private val service: NetworkVpnService) : PlatformIn
         override fun raw(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
 
         override fun exchange(context: io.nekohasekai.libbox.ExchangeContext, message: ByteArray) {
-            check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                context.errorCode(RCODE_NXDOMAIN)
+                return
+            }
+            exchangeQ(context, message)
+        }
+
+        @RequiresApi(Build.VERSION_CODES.Q)
+        private fun exchangeQ(
+            context: io.nekohasekai.libbox.ExchangeContext,
+            message: ByteArray,
+        ) {
             val network = networkProvider()
             runBlocking {
                 suspendCancellableCoroutine { continuation ->

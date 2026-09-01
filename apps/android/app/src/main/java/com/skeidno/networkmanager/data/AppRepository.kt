@@ -35,6 +35,13 @@ class AppRepository private constructor(private val context: Context) {
         update(current.copy(ruleGroup = current.ruleGroup.copy(enabled = enabled)))
     }
 
+    fun setRuleGroupDomains(values: List<String>): Int {
+        val domains = ruleGroupDomainsFromValues(values)
+        val current = mutableState.value
+        update(current.copy(ruleGroup = current.ruleGroup.copy(domains = domains)))
+        return domains.size
+    }
+
     fun setCommonRuleTarget(target: FallbackTarget) =
         update(mutableState.value.copy(commonRuleTarget = target))
 
@@ -309,7 +316,8 @@ class AppRepository private constructor(private val context: Context) {
                         "commonOverseas",
                         JSONObject()
                             .put("enabled", state.ruleGroup.enabled)
-                            .put("target", state.commonRuleTarget.portableValue()),
+                            .put("target", state.commonRuleTarget.portableValue())
+                            .put("domains", JSONArray(state.ruleGroup.domains)),
                     ),
             )
             .put("selectedNodeId", state.selectedNodeId)
@@ -386,6 +394,14 @@ class AppRepository private constructor(private val context: Context) {
         }
         val routing = root.optJSONObject("routing") ?: JSONObject()
         val common = routing.optJSONObject("commonOverseas") ?: JSONObject()
+        val commonDomainsArray = common.optJSONArray("domains")
+        val commonDomains = if (commonDomainsArray == null) {
+            DEFAULT_PROXY_DOMAINS
+        } else {
+            ruleGroupDomainsFromValues(
+                List(commonDomainsArray.length()) { index -> commonDomainsArray.optString(index) },
+            )
+        }
         val selected = root.optString("selectedNodeId")
             .takeIf { id -> nodes.any { it.id == id } } ?: nodes.firstOrNull()?.id.orEmpty()
         update(
@@ -401,7 +417,10 @@ class AppRepository private constructor(private val context: Context) {
                 nodes = nodes,
                 nodeGroups = nodeGroups,
                 subscriptions = subscriptions,
-                ruleGroup = defaultOverseasRuleGroup().copy(enabled = common.optBoolean("enabled", true)),
+                ruleGroup = defaultOverseasRuleGroup().copy(
+                    domains = commonDomains,
+                    enabled = common.optBoolean("enabled", true),
+                ),
                 commonRuleTarget = common.optString("target", "proxy").toFallbackTarget(),
                 portableRules = rules,
             ),
@@ -505,6 +524,7 @@ class AppRepository private constructor(private val context: Context) {
             .putString("mode", state.mode.name)
             .putString("fallback", state.fallbackTarget.name)
             .putBoolean("ruleGroupEnabled", state.ruleGroup.enabled)
+            .putString("ruleGroupDomains", JSONArray(state.ruleGroup.domains).toString())
             .putString("commonRuleTarget", state.commonRuleTarget.name)
             .putString(
                 "portableRules",
@@ -578,6 +598,10 @@ class AppRepository private constructor(private val context: Context) {
                 )
             }
         }.getOrDefault(emptyList())
+        val ruleGroupDomains = runCatching {
+            val array = JSONArray(preferences.getString("ruleGroupDomains", null))
+            ruleGroupDomainsFromValues(List(array.length()) { index -> array.optString(index) })
+        }.getOrDefault(DEFAULT_PROXY_DOMAINS)
         return AppState(
             mode = enumPreference("mode", RoutingMode.Rule),
             fallbackTarget = enumPreference("fallback", FallbackTarget.Direct),
@@ -590,6 +614,7 @@ class AppRepository private constructor(private val context: Context) {
             ).distinct(),
             subscriptions = subscriptions,
             ruleGroup = defaultOverseasRuleGroup().copy(
+                domains = ruleGroupDomains,
                 enabled = preferences.getBoolean("ruleGroupEnabled", true),
             ),
             commonRuleTarget = enumPreference("commonRuleTarget", FallbackTarget.Proxy),

@@ -106,6 +106,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.skeidno.networkmanager.R
 import com.skeidno.networkmanager.data.AppState
+import com.skeidno.networkmanager.data.DEFAULT_PROXY_DOMAINS
 import com.skeidno.networkmanager.data.FallbackTarget
 import com.skeidno.networkmanager.data.InstalledApp
 import com.skeidno.networkmanager.data.LatencyStatus
@@ -180,6 +181,7 @@ fun NetworkManagerApp(
                             state = state,
                             installedApps = installedApps,
                             onRuleEnabled = viewModel::setRuleGroupEnabled,
+                            onRuleDomains = viewModel::setRuleGroupDomains,
                             onCommonTarget = viewModel::setCommonRuleTarget,
                             onFallback = viewModel::setFallback,
                             onSavePortableRules = viewModel::savePortableRules,
@@ -397,6 +399,7 @@ private fun RulesPage(
     state: AppState,
     installedApps: List<InstalledApp>,
     onRuleEnabled: (Boolean) -> Unit,
+    onRuleDomains: (List<String>) -> Boolean,
     onCommonTarget: (FallbackTarget) -> Unit,
     onFallback: (FallbackTarget) -> Unit,
     onSavePortableRules: (Int?, String, List<String>, FallbackTarget) -> Boolean,
@@ -404,6 +407,9 @@ private fun RulesPage(
     onShowNodes: () -> Unit,
 ) {
     var showDomains by rememberSaveable { mutableStateOf(false) }
+    var commonDomainsText by remember(state.ruleGroup.domains) {
+        mutableStateOf(state.ruleGroup.domains.joinToString("\n"))
+    }
     var showPortableRules by rememberSaveable { mutableStateOf(false) }
     var showRuleEditor by rememberSaveable { mutableStateOf(false) }
     var editingRuleIndex by rememberSaveable { mutableStateOf<Int?>(null) }
@@ -435,7 +441,10 @@ private fun RulesPage(
             }
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { showDomains = true }) { Text("查看全部域名") }
+                OutlinedButton(
+                    modifier = Modifier.testTag("common-rules-edit"),
+                    onClick = { showDomains = true },
+                ) { Text("编辑匹配内容") }
                 TextButton(onClick = onShowNodes) { Text("更换出口") }
             }
             Spacer(Modifier.height(10.dp))
@@ -481,18 +490,54 @@ private fun RulesPage(
         }
     }
     if (showDomains) {
+        val lines = commonDomainsText.lineSequence().map(String::trim).filter(String::isNotBlank).toList()
+        val uniqueCount = lines.distinctBy { it.lowercase() }.size
         AlertDialog(
             onDismissRequest = { showDomains = false },
-            title = { Text("常用海外站点") },
+            title = { Text("编辑常用海外站点") },
             text = {
-                LazyColumn(Modifier.heightIn(max = 440.dp)) {
-                    items(state.ruleGroup.domains) { domain ->
-                        Text(domain, Modifier.fillMaxWidth().padding(vertical = 9.dp))
-                        HorizontalDivider()
+                Column(
+                    modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    OutlinedTextField(
+                        value = commonDomainsText,
+                        onValueChange = { commonDomainsText = it },
+                        label = { Text("匹配内容（一行一个域名）") },
+                        minLines = 10,
+                        maxLines = 16,
+                        modifier = Modifier.fillMaxWidth().testTag("common-rule-values"),
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            if (lines.size == uniqueCount) "$uniqueCount 条匹配内容" else "$uniqueCount 条有效 · ${lines.size - uniqueCount} 条重复",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Row {
+                            TextButton(onClick = {
+                                commonDomainsText = lines.distinctBy { it.lowercase() }.joinToString("\n")
+                            }) { Text("整理去重") }
+                            TextButton(onClick = {
+                                commonDomainsText = DEFAULT_PROXY_DOMAINS.joinToString("\n")
+                            }) { Text("恢复默认") }
+                        }
                     }
                 }
             },
-            confirmButton = { TextButton(onClick = { showDomains = false }) { Text("完成") } },
+            confirmButton = {
+                TextButton(
+                    enabled = uniqueCount > 0,
+                    onClick = {
+                        if (onRuleDomains(lines)) showDomains = false
+                    },
+                ) { Text("保存") }
+            },
+            dismissButton = { TextButton(onClick = { showDomains = false }) { Text("取消") } },
         )
     }
     if (showPortableRules) {
@@ -1254,7 +1299,7 @@ private fun SettingsPage(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         SectionCard(title = "应用信息", icon = Icons.Default.Settings) {
-            InfoRow("版本", "Android 0.5.0")
+            InfoRow("版本", "Android 0.6.0")
             HorizontalDivider()
             InfoRow("代理核心", "sing-box 1.13.20 · libbox")
             HorizontalDivider()

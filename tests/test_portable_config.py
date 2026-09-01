@@ -85,6 +85,40 @@ def test_smart_mode_round_trips_between_devices() -> None:
     assert imported.mode == "SMART"
 
 
+def test_custom_common_domains_round_trip_between_devices() -> None:
+    source = default_config()
+    common = [rule for rule in source.rules if rule.group == "common-overseas"]
+    first_index = source.rules.index(common[0])
+    source.rules = [rule for rule in source.rules if rule.group != "common-overseas"]
+    source.rules[first_index:first_index] = [
+        RoutingRule(
+            "DOMAIN-SUFFIX",
+            "custom.example",
+            "DIRECT",
+            note="自定义",
+            group="common-overseas",
+        ),
+        RoutingRule(
+            "DOMAIN-SUFFIX",
+            "github.com",
+            "DIRECT",
+            note="GitHub",
+            group="common-overseas",
+        ),
+    ]
+
+    payload = export_portable_config(source)
+    imported = import_portable_config(default_config(), payload)
+    restored = [rule for rule in imported.rules if rule.group == "common-overseas"]
+
+    assert payload["routing"]["commonOverseas"]["domains"] == [
+        "custom.example",
+        "github.com",
+    ]
+    assert [rule.value for rule in restored] == ["custom.example", "github.com"]
+    assert all(rule.target == "DIRECT" for rule in restored)
+
+
 def test_custom_node_groups_round_trip_between_devices() -> None:
     source = default_config()
     node = _node()

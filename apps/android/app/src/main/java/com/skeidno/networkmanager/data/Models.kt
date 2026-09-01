@@ -109,6 +109,14 @@ fun portableRulesFromValues(
     }
 }
 
+fun ruleGroupDomainsFromValues(values: List<String>, limit: Int = 500): List<String> =
+    portableRulesFromValues(
+        type = "domain_suffix",
+        values = values,
+        target = FallbackTarget.Proxy,
+        limit = limit,
+    ).map(PortableRule::value)
+
 private fun normalizePortableRuleValue(type: String, rawValue: String): String {
     var value = rawValue.trim()
     if (type in setOf("domain", "domain_suffix", "domain_keyword")) {

@@ -35,6 +35,10 @@ class MainActivityTest {
         composeRule.onNodeWithText("内网与局域网").assertIsDisplayed()
         composeRule.onNodeWithText("常用海外站点").assertIsDisplayed()
         composeRule.onNodeWithText("强制保底规则").assertIsDisplayed()
+        composeRule.onNodeWithTag("common-rules-edit").performClick()
+        composeRule.onNodeWithTag("common-rule-values").assertIsDisplayed()
+        composeRule.onNodeWithText("整理去重").assertIsDisplayed()
+        composeRule.onNodeWithText("恢复默认").assertIsDisplayed()
     }
 
     @Test

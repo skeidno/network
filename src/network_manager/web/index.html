@@ -79,7 +79,7 @@
           <small>MB</small>
         </div>
       </div>
-      <div id="sidebar-version" class="sidebar-version">v0.5.0 · WebGUI</div>
+      <div id="sidebar-version" class="sidebar-version">v0.6.0 · WebGUI</div>
     </aside>
 
     <main class="main-area">
@@ -260,6 +260,9 @@
                 <label><span>HTTP / SOCKS 入口</span><input id="setting-mixed-port" type="number" min="1024" max="65535"></label>
                 <label><span>核心控制端口</span><input id="setting-controller-port" type="number" min="1024" max="65535"></label>
                 <label><span>内部 DNS 端口</span><input id="setting-dns-port" type="number" min="1024" max="65535"></label>
+              </div>
+              <div class="form-grid three ssh-deployment-setting">
+                <label><span>默认服务器部署端口</span><div class="input-action"><input id="setting-server-proxy-port" type="number" min="10000" max="65535"><button id="setting-random-server-proxy-port" type="button" class="icon-button" title="生成随机高位端口" aria-label="生成随机高位端口"><span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span></button></div><small>新服务器默认使用；已部署服务器在检查时同步到该端口</small></label>
               </div>
             </section>
             <section class="panel settings-section">

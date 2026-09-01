@@ -28,4 +28,13 @@ class PortableRuleTest {
 
         assertEquals("第 2 行：请输入有效应用包名，例如 com.example.app", error.message)
     }
+
+    @Test
+    fun commonRuleDomainsUseTheSameNormalizationAsPortableRules() {
+        val domains = ruleGroupDomainsFromValues(
+            listOf("*.Example.com", "custom.example", "EXAMPLE.COM"),
+        )
+
+        assertEquals(listOf("example.com", "custom.example"), domains)
+    }
 }

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from network_manager.models import ImportedNode, SshServerProfile, default_config
-from network_manager.server_deployer import deployment_source_id
+from network_manager.server_deployer import DeploymentResult, deployment_source_id
 from network_manager.ui.web_window import WebBridge
 
 
@@ -169,6 +169,78 @@ def test_reused_remote_service_restores_missing_local_node() -> None:
     assert bridge.window.config.imported_nodes[0].config["port"] == 443
     assert bridge.window.config.selected_node == profile.name
     assert bridge.window.applied == 1
+
+
+def test_successful_port_repair_updates_profile_and_node_together() -> None:
+    profile = SshServerProfile(
+        "server-1",
+        "Test server",
+        "192.0.2.1",
+        proxy_port=443,
+        deployed_node_id="node-1",
+    )
+    bridge = FakeBridge(profile)
+    payload = json.loads(deployment_payload(profile))
+    payload["node"]["port"] = 35123
+
+    WebBridge._server_deploy_finished(
+        bridge,
+        profile.profile_id,
+        True,
+        "旧端口 443 已自动调整为 35123",
+        json.dumps(payload),
+        "",
+    )
+
+    assert profile.proxy_port == 35123
+    assert bridge.window.config.imported_nodes[0].config["port"] == 35123
+
+
+def test_deployed_low_port_uses_configured_high_port_as_repair_candidate() -> None:
+    profile = SshServerProfile(
+        "server-1",
+        "Test server",
+        "192.0.2.1",
+        proxy_port=443,
+        deployed_node_id="node-1",
+    )
+
+    candidate, previous_port = WebBridge._server_deployment_candidate(profile, 35123)
+
+    assert previous_port == 443
+    assert candidate.proxy_port == 35123
+    assert profile.proxy_port == 443
+
+
+def test_deployed_port_matching_default_remains_check_only() -> None:
+    profile = SshServerProfile(
+        "server-1",
+        "Test server",
+        "192.0.2.1",
+        proxy_port=24443,
+        deployed_node_id="node-1",
+    )
+
+    candidate, previous_port = WebBridge._server_deployment_candidate(profile, 24443)
+
+    assert candidate is profile
+    assert previous_port == 0
+
+
+def test_deployed_different_high_port_uses_configured_port_as_repair_candidate() -> None:
+    profile = SshServerProfile(
+        "server-1",
+        "Test server",
+        "192.0.2.1",
+        proxy_port=24443,
+        deployed_node_id="node-1",
+    )
+
+    candidate, previous_port = WebBridge._server_deployment_candidate(profile, 35123)
+
+    assert previous_port == 24443
+    assert candidate.proxy_port == 35123
+    assert profile.proxy_port == 24443
 
 
 def test_failed_server_deployment_does_not_persist_credential_or_node() -> None:
@@ -371,3 +443,59 @@ def test_existing_active_server_is_discovered_without_local_node() -> None:
     assert result.node_config == node_config
     assert result.deployed_at
     assert stages == ["正在查找远端现有代理服务", "正在验证公网代理端口"]
+
+
+def test_stale_local_node_does_not_block_remote_port_repair() -> None:
+    profile = SshServerProfile(
+        "server-1",
+        "Test server",
+        "192.0.2.1",
+        proxy_port=35123,
+        deployed_node_id="node-1",
+    )
+    bridge = FakeBridge(profile)
+    old_node = {
+        "name": profile.name,
+        "type": "ss",
+        "server": profile.host,
+        "port": 443,
+        "cipher": "2022-blake3-aes-128-gcm",
+        "password": "old-password",
+    }
+    deployed_profiles: list[SshServerProfile] = []
+
+    class RepairingDeployer:
+        def inspect(self, _profile, _credential):
+            return {"status": "active", "version": "sing-box version 1.13.20"}
+
+        def deploy(self, deployed_profile, _credential, _progress):
+            deployed_profiles.append(deployed_profile)
+            node = {**old_node, "port": deployed_profile.proxy_port}
+            return DeploymentResult(
+                node_config=node,
+                share_link="ss://repaired",
+                version="sing-box version 1.13.20",
+                deployed_at="2026-09-01T12:00:00+08:00",
+                firewall="ufw",
+            )
+
+    bridge.window.server_deployer = RepairingDeployer()
+    stages: list[str] = []
+
+    with patch(
+        "network_manager.ui.web_window.check_public_tcp_endpoint",
+        return_value=(True, ""),
+    ):
+        result = WebBridge._deploy_server_if_needed(
+            bridge,
+            profile,
+            "credential",
+            old_node,
+            "",
+            stages.append,
+        )
+
+    assert deployed_profiles == [profile]
+    assert result.reused is False
+    assert result.node_config["port"] == 35123
+    assert len(stages) == 3

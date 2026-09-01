@@ -13,6 +13,7 @@ def test_config_round_trip(tmp_path) -> None:
     loaded = store.load()
     assert loaded.mode == "GLOBAL_CLASH"
     assert loaded.rules[0].value == "Discord.exe"
+    assert loaded.server_proxy_port == config.server_proxy_port
 
 
 def test_invalid_config_is_backed_up(tmp_path) -> None:
@@ -36,4 +37,6 @@ def test_old_config_is_migrated_and_saved(tmp_path) -> None:
     assert loaded.version == CONFIG_VERSION
     assert sum(rule.value == "google.com" for rule in loaded.rules) == 1
     assert any(rule.value == "claude.ai" for rule in loaded.rules)
+    assert 10000 <= loaded.server_proxy_port <= 65535
+    assert '"server_proxy_port"' in path.read_text(encoding="utf-8")
     assert f'"version": {CONFIG_VERSION}' in path.read_text(encoding="utf-8")

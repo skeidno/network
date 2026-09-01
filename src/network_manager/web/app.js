@@ -19,6 +19,7 @@ let initialRetryTimer = 0;
 let initialFailureCount = 0;
 const COLLAPSED_NODE_GROUPS_KEY = "network-manager.collapsed-node-groups";
 const DEFAULT_SERVER_PROXY_PORT = 24443;
+const MIN_RANDOM_SERVER_PROXY_PORT = 10000;
 const collapsedNodeGroups = loadCollapsedNodeGroups();
 
 function serverProxyPortError(port, sshPort) {
@@ -236,6 +237,9 @@ function applyCapabilities() {
   byId("overview-ssh-row").classList.toggle("is-hidden", !sshDeployment);
   document.querySelectorAll(".desktop-only-setting").forEach((row) => {
     row.classList.toggle("is-hidden", Boolean(capabilities.headless));
+  });
+  document.querySelectorAll(".ssh-deployment-setting").forEach((section) => {
+    section.classList.toggle("is-hidden", !sshDeployment);
   });
   byId("open-logs").classList.toggle("is-hidden", Boolean(capabilities.headless));
   byId("sidebar-version").textContent = `v${appState.version || ""} · ${capabilities.headless ? "Linux WebGUI" : "WebGUI"}`;
@@ -488,7 +492,7 @@ function renderRules() {
     return `<tr>
       <td><span class="rule-status${statusClass}">${statusText}</span></td>
       <td title="${escapeHtml(rule.ruleType)}">${escapeHtml(rule.ruleTypeLabel)}</td>
-      <td title="${escapeHtml(rule.value)}">${escapeHtml(rule.value)}</td>
+      <td title="${escapeHtml(rule.value)}"><button type="button" class="rule-value-edit" data-rule-action="edit" data-index="${rule.index}" aria-label="编辑匹配内容"><span>${escapeHtml(rule.value)}</span>${icon("square-pen")}</button></td>
       <td><span class="chip">${escapeHtml(rule.targetLabel)}</span></td>
       <td title="${escapeHtml(rule.note)}">${escapeHtml(rule.note || "-")}</td>
       <td class="actions">
@@ -720,6 +724,7 @@ function renderSettings() {
   byId("setting-mixed-port").value = settings.mixedPort;
   byId("setting-controller-port").value = settings.controllerPort;
   byId("setting-dns-port").value = settings.dnsPort;
+  byId("setting-server-proxy-port").value = settings.serverProxyPort || DEFAULT_SERVER_PROXY_PORT;
   byId("setting-strict-route").checked = settings.strictRoute;
   byId("setting-start-on-launch").checked = settings.startOnLaunch;
   byId("setting-close-to-tray").checked = settings.closeToTray;
@@ -856,6 +861,54 @@ function splitRuleValues(value) {
   return String(value || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
 }
 
+function uniqueRuleValues(value) {
+  const values = splitRuleValues(value);
+  const seen = new Set();
+  return values.filter((item) => {
+    const key = item.toLocaleLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function updateRuleValueSummary(textareaId, summaryId) {
+  const textarea = byId(textareaId);
+  const summary = byId(summaryId);
+  if (!textarea || !summary) return;
+  const values = splitRuleValues(textarea.value);
+  const unique = uniqueRuleValues(textarea.value);
+  const duplicateCount = values.length - unique.length;
+  summary.textContent = duplicateCount
+    ? `${unique.length} 条有效内容 · ${duplicateCount} 条重复`
+    : `${unique.length} 条匹配内容`;
+  summary.classList.toggle("has-warning", duplicateCount > 0);
+}
+
+function normalizeRuleValueEditor(textareaId, summaryId) {
+  const textarea = byId(textareaId);
+  if (!textarea) return;
+  textarea.value = uniqueRuleValues(textarea.value).join("\n");
+  updateRuleValueSummary(textareaId, summaryId);
+  textarea.focus();
+}
+
+function findRuleValue(textarea, search, fromStart = false) {
+  const query = search.value.trim();
+  if (!query) return;
+  const source = textarea.value.toLocaleLowerCase();
+  const needle = query.toLocaleLowerCase();
+  const start = fromStart ? 0 : Math.max(textarea.selectionEnd, 0);
+  let index = source.indexOf(needle, start);
+  if (index < 0 && start > 0) index = source.indexOf(needle);
+  if (index < 0) {
+    showToast("error", `没有找到“${query}”`);
+    return;
+  }
+  textarea.focus();
+  textarea.setSelectionRange(index, index + query.length);
+}
+
 function updateProcessPickerCount() {
   const count = document.querySelectorAll('#modal-rule-process-list input[type="checkbox"]:checked').length;
   const label = byId("modal-rule-process-count");
@@ -895,7 +948,7 @@ function openRuleDialog(rule = null) {
         </details>
         <label class="process-manual-field"><span>手动补充（可选，一行一个程序）</span><textarea id="modal-rule-process-manual" rows="3" placeholder="例如 MyApp.exe"></textarea></label>
       </div>
-      <label id="modal-rule-lines-field" class="wide-field"><span>匹配内容（一行一条）</span><textarea id="modal-rule-values" rows="7" placeholder="例如 example.com\nexample.org">${escapeHtml(rule?.ruleType === "PROCESS-NAME" ? "" : rule?.value || "")}</textarea></label>
+      <label id="modal-rule-lines-field" class="wide-field"><span>匹配内容（一行一条）</span><textarea id="modal-rule-values" rows="7" spellcheck="false" placeholder="例如 example.com\nexample.org">${escapeHtml(rule?.ruleType === "PROCESS-NAME" ? "" : rule?.value || "")}</textarea><span class="rule-value-toolbar"><small id="modal-rule-values-summary">0 条匹配内容</small><button id="modal-rule-values-normalize" type="button" class="text-button">整理并去重</button></span></label>
       <label><span>流量去向</span><select id="modal-rule-target">${targetOptions}</select></label>
       <label><span>备注</span><input id="modal-rule-note" value="${escapeHtml(rule?.note || "")}" placeholder="可选"></label>
       <label class="switch-row"><span><strong>启用规则</strong><small>保存后立即应用</small></span><input id="modal-rule-enabled" type="checkbox"${rule?.enabled === false ? "" : " checked"}><i></i></label>
@@ -935,11 +988,14 @@ function openRuleDialog(rule = null) {
       option.classList.toggle("is-hidden", !option.dataset.processSearch.includes(query));
     });
   });
+  byId("modal-rule-values").addEventListener("input", () => updateRuleValueSummary("modal-rule-values", "modal-rule-values-summary"));
+  byId("modal-rule-values-normalize").addEventListener("click", () => normalizeRuleValueEditor("modal-rule-values", "modal-rule-values-summary"));
   syncRuleValueEditor();
   updateProcessPickerCount();
+  updateRuleValueSummary("modal-rule-values", "modal-rule-values-summary");
 }
 
-function openRuleGroupDialog(group) {
+function openRuleGroupDialog(group, focusValues = false) {
   const targetIcons = {
     CLASH: "wifi",
     V2RAY: "route",
@@ -950,16 +1006,30 @@ function openRuleGroupDialog(group) {
     <button type="button" class="group-target-option${group.target === value ? " is-active" : ""}" data-group-target="${value}" role="radio" aria-checked="${group.target === value}">
       ${icon(targetIcons[value])}<span>${label}</span>
     </button>`).join("");
+  const entries = Array.isArray(group.entries) ? group.entries : [];
+  const values = entries.map((entry) => entry.domain).join("\n");
   openModal("常用海外站点", `
-    <div class="form-grid">
+    <div class="form-grid rule-group-editor">
+      <div class="wide-field">
+        <div class="rule-group-editor-head"><span class="field-label">匹配内容（一行一个域名）</span><label class="rule-value-search"><span class="sr-only">查找域名</span><input id="rule-group-search" type="search" placeholder="查找域名"><button id="rule-group-find" type="button" class="mini-button" title="查找下一个">${icon("search")}</button></label></div>
+        <textarea id="rule-group-values" rows="13" spellcheck="false" placeholder="example.com\nexample.org">${escapeHtml(values)}</textarea>
+        <div class="rule-value-toolbar"><small id="rule-group-values-summary">${entries.length} 条匹配内容</small><span><button id="rule-group-normalize" type="button" class="text-button">整理并去重</button><button id="rule-group-reset" type="button" class="text-button">恢复默认</button></span></div>
+      </div>
       <div><span class="field-label">整组流量去向</span><div class="group-target-options" role="radiogroup">${targetOptions}</div></div>
-      <div class="group-dialog-summary"><strong>${group.count} 条匹配</strong><span>Google、ChatGPT、Claude、YouTube、GitHub 等常用海外站点</span></div>
+      <div class="group-dialog-summary"><strong>按从上到下的顺序保存</strong><span>支持直接粘贴多行；空行会忽略，重复域名会自动合并</span></div>
     </div>`, [
     { label: "取消", kind: "secondary", action: closeModal },
     { label: "应用到整组", kind: "primary", action: () => {
+      const values = uniqueRuleValues(byId("rule-group-values").value);
+      if (!values.length) {
+        showToast("error", "请至少保留一条匹配内容");
+        byId("rule-group-values").focus();
+        return;
+      }
       invoke("saveRuleGroup", JSON.stringify({
         groupId: group.groupId,
         target: document.querySelector(".group-target-option.is-active")?.dataset.groupTarget,
+        values,
       }));
       closeModal();
       window.setTimeout(refreshState, 250);
@@ -974,6 +1044,24 @@ function openRuleGroupDialog(group) {
       });
     });
   });
+  const textarea = byId("rule-group-values");
+  const search = byId("rule-group-search");
+  textarea.addEventListener("input", () => updateRuleValueSummary("rule-group-values", "rule-group-values-summary"));
+  byId("rule-group-normalize").addEventListener("click", () => normalizeRuleValueEditor("rule-group-values", "rule-group-values-summary"));
+  byId("rule-group-reset").addEventListener("click", () => {
+    textarea.value = (group.defaultEntries || []).join("\n");
+    updateRuleValueSummary("rule-group-values", "rule-group-values-summary");
+    textarea.focus();
+  });
+  byId("rule-group-find").addEventListener("click", () => findRuleValue(textarea, search));
+  search.addEventListener("input", () => findRuleValue(textarea, search, true));
+  search.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    findRuleValue(textarea, search);
+  });
+  updateRuleValueSummary("rule-group-values", "rule-group-values-summary");
+  if (focusValues) window.setTimeout(() => textarea.focus(), 0);
 }
 
 function openFallbackRuleDialog() {
@@ -1211,7 +1299,7 @@ function openSshServerDialog(server = null) {
       <label><span>服务器 IP / 域名</span><input id="modal-ssh-host" value="${escapeHtml(server?.host || "")}" placeholder="例如 203.0.113.10" required></label>
       <label><span>SSH 端口</span><input id="modal-ssh-port" type="number" min="1" max="65535" value="${server?.port || 22}" required></label>
       <label><span>用户名</span><input id="modal-ssh-username" value="${escapeHtml(server?.username || "root")}" required></label>
-      <label><span>远端代理端口</span><input id="modal-ssh-proxy-port" type="number" min="1" max="65535" value="${server?.proxyPort || DEFAULT_SERVER_PROXY_PORT}" required><small>${server?.deployed ? `当前服务使用 ${server.proxyPort}；可达时无需调整` : `新部署默认建议独立端口 ${DEFAULT_SERVER_PROXY_PORT}`}</small></label>
+      <label><span>远端代理端口</span><input id="modal-ssh-proxy-port" type="number" min="1" max="65535" value="${server?.proxyPort || appState.settings.serverProxyPort || DEFAULT_SERVER_PROXY_PORT}" required><small>${server?.deployed ? `当前服务使用 ${server.proxyPort}；与默认端口不一致时检查服务会迁移` : `默认使用设置中的高位端口 ${appState.settings.serverProxyPort || DEFAULT_SERVER_PROXY_PORT}`}</small></label>
       <label><span>认证方式</span><select id="modal-ssh-auth"><option value="password"${authMethod === "password" ? " selected" : ""}>账号密码</option><option value="key"${authMethod === "key" ? " selected" : ""}>私钥文件</option><option value="agent"${authMethod === "agent" ? " selected" : ""}>SSH Agent</option></select></label>
       <label id="modal-ssh-secret-field"><span>密码 / 私钥口令</span><input id="modal-ssh-password" type="password" autocomplete="new-password" placeholder="${server?.hasCredential ? "已安全保存，留空保持不变" : "连接凭据"}"></label>
       <label id="modal-ssh-key-field" class="wide-field"><span>私钥路径</span><div class="input-action"><input id="modal-ssh-key-path" value="${escapeHtml(server?.keyPath || "")}" placeholder="选择 OpenSSH 私钥"><button id="modal-pick-ssh-key" type="button" class="icon-button" title="选择私钥" aria-label="选择私钥">${icon("folder-open")}</button></div></label>
@@ -1367,7 +1455,7 @@ function bindEvents() {
     const groupId = button.dataset.ruleGroup;
     if (groupId) {
       const group = appState.rules.find((rule) => rule.groupId === groupId);
-      if (action === "view") openRuleGroupDomains(group);
+      if (action === "view") openRuleGroupDialog(group, true);
       else if (action === "edit") openRuleGroupDialog(group);
       else if (action === "delete") confirmAction("删除规则组", "确定删除常用海外站点规则组？", () => invoke("ruleGroupAction", groupId, "delete"));
       else invoke("ruleGroupAction", groupId, action);
@@ -1492,12 +1580,19 @@ function bindEvents() {
       mixedPort: Number(byId("setting-mixed-port").value),
       controllerPort: Number(byId("setting-controller-port").value),
       dnsPort: Number(byId("setting-dns-port").value),
+      serverProxyPort: Number(byId("setting-server-proxy-port").value),
       strictRoute: byId("setting-strict-route").checked,
       startOnLaunch: byId("setting-start-on-launch").checked,
       closeToTray: true,
       startWithWindows: byId("setting-start-with-windows").checked,
     }));
     settingsInitialized = false;
+  });
+  byId("setting-random-server-proxy-port").addEventListener("click", () => {
+    const values = new Uint32Array(1);
+    crypto.getRandomValues(values);
+    byId("setting-server-proxy-port").value =
+      MIN_RANDOM_SERVER_PROXY_PORT + (values[0] % (65536 - MIN_RANDOM_SERVER_PROXY_PORT));
   });
   byId("clear-logs").addEventListener("click", () => { invoke("clearLogs"); refreshLogs(); });
   byId("open-logs").addEventListener("click", () => invoke("openLogs"));

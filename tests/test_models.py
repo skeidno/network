@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 from network_manager.models import (
+    AppConfig,
+    COMMON_OVERSEAS_GROUP,
     CONFIG_VERSION,
+    MIN_RANDOM_SERVER_PROXY_PORT,
     NODE_DIALER_POLICY_KEY,
     NODE_DIALER_PROXY_KEY,
     ImportedNode,
     RoutingRule,
     SshServerProfile,
     apply_automatic_node_dialers,
+    common_overseas_rules_from_values,
     default_config,
+    is_common_overseas_rule,
     migrate_config,
     normalize_rule_value,
     server_proxy_port_error,
@@ -29,6 +34,21 @@ def test_default_config_contains_discord_process_rule() -> None:
     assert validate_config(config) == []
 
 
+def test_default_server_deployment_port_is_random_high_port_and_round_trips() -> None:
+    config = default_config()
+
+    assert MIN_RANDOM_SERVER_PROXY_PORT <= config.server_proxy_port <= 65535
+    restored = AppConfig.from_dict(config.to_dict())
+    assert restored.server_proxy_port == config.server_proxy_port
+
+
+def test_default_server_deployment_port_rejects_low_ports() -> None:
+    config = default_config()
+    config.server_proxy_port = 9999
+
+    assert any("默认服务器部署端口" in error for error in validate_config(config))
+
+
 def test_config_migration_adds_missing_defaults_without_overriding_user_rule() -> None:
     config = default_config()
     config.version = CONFIG_VERSION - 1
@@ -45,6 +65,18 @@ def test_config_migration_adds_missing_defaults_without_overriding_user_rule() -
 def test_normalize_domain_and_process_values() -> None:
     assert normalize_rule_value("DOMAIN-SUFFIX", "https://*.Example.COM/path") == "example.com"
     assert normalize_rule_value("PROCESS-NAME", r"C:\Apps\Discord.exe") == "Discord.exe"
+
+
+def test_custom_common_rule_domains_keep_their_group_identity() -> None:
+    rules = common_overseas_rules_from_values(
+        ["*.Example.com", "example.org", "EXAMPLE.COM"],
+        "DIRECT",
+    )
+
+    assert [rule.value for rule in rules] == ["example.com", "example.org"]
+    assert all(rule.group == COMMON_OVERSEAS_GROUP for rule in rules)
+    assert all(is_common_overseas_rule(rule) for rule in rules)
+    assert rules[0].note == "自定义"
 
 
 def test_invalid_rule_is_reported() -> None:

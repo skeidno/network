@@ -236,7 +236,11 @@ class LocalWebServer:
                     "img-src 'self'; connect-src 'self'",
                 )
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                    # Browser tabs can close while a polling response is in flight.
+                    return
 
             def _request_basic_auth(self) -> None:
                 body = "需要 WebGUI 管理凭据".encode("utf-8")

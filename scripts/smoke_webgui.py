@@ -94,6 +94,14 @@ def main() -> int:
         expect(page.locator("#page-title")).to_have_text("分流规则")
         expect(page.locator(".fallback-rule-row")).to_contain_text("强制保底")
         expect(page.locator(".fallback-rule-row")).to_contain_text("始终位于规则末尾")
+        group_view = page.locator('[data-rule-action="view"][data-rule-group="common-overseas"]')
+        if group_view.count():
+            group_view.click()
+            expect(page.locator("#rule-group-values")).to_be_visible()
+            expect(page.locator("#rule-group-values-summary")).to_contain_text("条匹配内容")
+            expect(page.locator("#rule-group-search")).to_be_visible()
+            page.locator("#modal-close").click()
+        expect(page.locator(".rule-value-edit").first).to_be_visible()
         page.locator("#add-rule").click()
         expect(page.locator("#modal-rule-process-picker")).to_be_visible()
         expect(page.locator("#modal-rule-process-manual")).to_be_visible()
@@ -134,9 +142,9 @@ def main() -> int:
                     },
                 ];
                 renderRules();
+                document.querySelector('.rule-edit-link[data-rule-kind="relay"]').click();
             }"""
         )
-        page.locator('.rule-edit-link[data-rule-kind="relay"]').click()
         expect(page.locator("#modal-proxy-server-0")).to_have_value("proxy.example.com")
         expect(page.locator("#modal-proxy-port-0")).to_have_value("4600")
         expect(page.locator("#modal-proxy-relay-0")).to_have_value("Smoke Relay")
@@ -215,8 +223,32 @@ def main() -> int:
         expect(page.locator("#page-title")).to_have_text("设置")
         if headless_web:
             expect(page.locator(".desktop-only-setting").first).to_be_hidden()
+            expect(page.locator(".ssh-deployment-setting")).to_be_hidden()
             expect(page.locator("#portable-config-import")).to_be_visible()
             expect(page.locator("#portable-config-export")).to_be_visible()
+            page.evaluate(
+                "refreshing = true; appState.capabilities.sshDeployment = true; applyCapabilities()"
+            )
+        deployment_port = page.locator("#setting-server-proxy-port")
+        expect(deployment_port).to_be_visible()
+        assert 10000 <= int(deployment_port.input_value()) <= 65535
+        page.locator("#setting-random-server-proxy-port").click()
+        randomized_port = int(deployment_port.input_value())
+        assert 10000 <= randomized_port <= 65535
+        page.locator('#settings-form button[type="submit"]').click()
+        page.wait_for_timeout(300)
+        if headless_web:
+            page.evaluate("refreshing = false")
+        page.evaluate("refreshState()")
+        if headless_web:
+            page.evaluate("appState.capabilities.sshDeployment = true; applyCapabilities()")
+        expect(deployment_port).to_have_value(str(randomized_port))
+        if args.output:
+            page.screenshot(
+                path=str(args.output.with_name(args.output.stem + "-settings.png"))
+            )
+        if headless_web:
+            page.evaluate("appState.capabilities.sshDeployment = false; applyCapabilities()")
 
         deadline = time.monotonic() + args.poll_seconds
         while time.monotonic() < deadline:

@@ -426,6 +426,22 @@ td.actions { text-align: right; overflow: visible; }
 .rule-edit-link .icon { flex: 0 0 auto; width: 15px; height: 15px; color: #087ef5; }
 .rule-edit-link:hover strong, .rule-edit-link:focus-visible strong { color: #087ef5; }
 .rule-edit-link:focus-visible { outline: 2px solid #9dccff; outline-offset: 4px; }
+.rule-value-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 5px;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+}
+.rule-value-edit > span { overflow: hidden; min-width: 0; text-overflow: ellipsis; white-space: nowrap; }
+.rule-value-edit .icon { flex: 0 0 auto; width: 14px; height: 14px; color: #7c8793; opacity: 0; }
+.rule-value-edit:hover, .rule-value-edit:focus-visible { color: #0874e9; background: #eef6ff; outline: none; }
+.rule-value-edit:hover .icon, .rule-value-edit:focus-visible .icon { opacity: 1; color: #0874e9; }
 .fallback-label { color: #087ef5; font-weight: 700; }
 .ssh-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .wide-field { grid-column: 1 / -1; }
@@ -460,6 +476,19 @@ td.actions { text-align: right; overflow: visible; }
 .process-manual-field { display: block; margin-top: 10px; }
 .process-manual-field textarea { min-height: 74px; }
 #modal-rule-values { min-height: 170px; }
+.rule-value-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 7px; }
+.rule-value-toolbar > small { margin: 0; color: #7d8792; }
+.rule-value-toolbar > small.has-warning { color: #bb6a00; }
+.rule-value-toolbar > span { display: flex; gap: 12px; }
+.text-button { padding: 2px 0; border: 0; color: #0874e9; background: transparent; font-size: 11px; }
+.text-button:hover, .text-button:focus-visible { color: #005fca; text-decoration: underline; outline: none; }
+.rule-group-editor-head { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 7px; }
+.rule-group-editor-head .field-label { margin: 0; }
+.rule-value-search { display: grid; grid-template-columns: minmax(130px, 190px) 32px; align-items: center; gap: 5px; }
+.rule-value-search input { min-height: 32px; padding: 5px 8px; font-size: 11px; }
+.rule-value-search .mini-button { width: 32px; height: 32px; }
+#rule-group-values { min-height: 250px; font: 12px/1.55 Consolas, "Microsoft YaHei UI", monospace; }
+.sr-only { position: absolute !important; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 .input-action { display: grid; grid-template-columns: minmax(0, 1fr) 38px; gap: 7px; }
 
 input, select, textarea {

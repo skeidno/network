@@ -5,13 +5,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 from network_manager.models import (
-    DEFAULT_PROXY_DOMAINS,
     AppConfig,
     ImportedNode,
     RoutingRule,
     SubscriptionSource,
     apply_automatic_node_dialers,
+    common_overseas_rules_from_values,
     default_routing_rules,
+    is_common_overseas_rule,
     normalize_node_group_name,
     normalize_rule_value,
     validate_config,
@@ -29,17 +30,12 @@ PORTABLE_RULE_TYPES = {
 
 
 def export_portable_config(config: AppConfig) -> dict[str, Any]:
-    common_keys = {("DOMAIN-SUFFIX", domain) for domain, _label in DEFAULT_PROXY_DOMAINS}
-    common_rules = [
-        rule
-        for rule in config.rules
-        if (rule.rule_type, normalize_rule_value(rule.rule_type, rule.value)) in common_keys
-    ]
+    common_rules = [rule for rule in config.rules if is_common_overseas_rule(rule)]
     custom_rules = [
         _export_rule(rule)
         for rule in config.rules
         if rule.rule_type != "PROCESS-NAME"
-        and (rule.rule_type, normalize_rule_value(rule.rule_type, rule.value)) not in common_keys
+        and not is_common_overseas_rule(rule)
         and rule.rule_type in PORTABLE_RULE_TYPES.values()
     ]
     mode = "rule"
@@ -63,6 +59,9 @@ def export_portable_config(config: AppConfig) -> dict[str, Any]:
             "commonOverseas": {
                 "enabled": bool(common_rules) and all(rule.enabled for rule in common_rules),
                 "target": _portable_target(common_rules[0].target if common_rules else "BUILTIN"),
+                "domains": [
+                    normalize_rule_value(rule.rule_type, rule.value) for rule in common_rules
+                ],
             },
         },
         "selectedNodeId": selected_id,
@@ -172,14 +171,18 @@ def import_portable_config(current: AppConfig, payload: dict[str, Any]) -> AppCo
         common_settings = {}
     common_enabled = bool(common_settings.get("enabled", True))
     common_target = _windows_target(common_settings.get("target"), bool(nodes))
-    common_rules = [
-        rule
-        for rule in default_routing_rules()
-        if rule.rule_type == "DOMAIN-SUFFIX"
-    ]
-    for rule in common_rules:
-        rule.enabled = common_enabled
-        rule.target = common_target
+    common_domains = common_settings.get("domains")
+    if common_domains is None:
+        common_domains = [
+            rule.value
+            for rule in default_routing_rules()
+            if rule.rule_type == "DOMAIN-SUFFIX"
+        ]
+    common_rules = common_overseas_rules_from_values(
+        common_domains,
+        common_target,
+        enabled=common_enabled,
+    )
 
     portable_rules: list[RoutingRule] = []
     for item in rules_data:

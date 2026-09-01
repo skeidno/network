@@ -22,6 +22,19 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+
+private fun InputStream.readAtMost(limit: Int): ByteArray {
+    val output = ByteArrayOutputStream(minOf(limit, 8 * 1024))
+    val buffer = ByteArray(8 * 1024)
+    while (output.size() < limit) {
+        val count = read(buffer, 0, minOf(buffer.size, limit - output.size()))
+        if (count < 0) break
+        output.write(buffer, 0, count)
+    }
+    return output.toByteArray()
+}
 
 class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = AppRepository.get(application)
@@ -53,6 +66,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         repository.setRuleGroupEnabled(enabled)
         applyConfigurationIfRunning()
     }
+
+    fun setRuleGroupDomains(values: List<String>): Boolean = runCatching {
+        repository.setRuleGroupDomains(values)
+    }.fold(
+        onSuccess = { count ->
+            mutableMessages.tryEmit("已保存 $count 条常用站点规则")
+            applyConfigurationIfRunning()
+            true
+        },
+        onFailure = {
+            mutableMessages.tryEmit(it.message ?: "匹配内容保存失败")
+            false
+        },
+    )
 
     fun setCommonRuleTarget(target: FallbackTarget) {
         repository.setCommonRuleTarget(target)
@@ -194,7 +221,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 withContext(Dispatchers.IO) {
                     val resolver = getApplication<Application>().contentResolver
                     val bytes = resolver.openInputStream(uri)?.buffered()?.use { input ->
-                        input.readNBytes(10 * 1024 * 1024 + 1)
+                        input.readAtMost(10 * 1024 * 1024 + 1)
                     } ?: error("无法读取所选文件")
                     require(bytes.size <= 10 * 1024 * 1024) { "配置文件不能超过 10 MB" }
                     repository.importPortableConfig(bytes.toString(Charsets.UTF_8))

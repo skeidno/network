@@ -45,7 +45,7 @@ powershell -ExecutionPolicy Bypass -File scripts/run_windows_admin.ps1
 
 ## 服务器代理部署
 
-在“服务器部署”页面填写 Linux 服务器 IP/域名、SSH 端口、用户名、远端代理端口和认证方式，然后点击“部署代理”。当前自动部署要求服务器使用 systemd 且 SSH 用户为 `root`。
+在“服务器部署”页面填写 Linux 服务器 IP/域名、SSH 端口、用户名、远端代理端口和认证方式，然后点击“部署代理”。新配置会生成一个 `10000` 以上的随机默认部署端口，可在“设置”中手动修改或重新随机。已部署服务的端口与当前默认值不一致时，会在“检查服务”时迁移到当前默认端口。当前自动部署要求服务器使用 systemd 且 SSH 用户为 `root`。
 
 程序会安装经过固定 SHA-256 校验的 sing-box，使用独立的 `/etc/network-manager-proxy` 配置和 `network-manager-proxy.service`，不会覆盖服务器已有的 sing-box 配置。部署完成后 SSH 会断开，代理服务由 systemd 独立运行；生成的节点会自动加入“内置节点”，也可复制 `ss://` 链接到 Windows、macOS 或 Android 的兼容客户端。
 

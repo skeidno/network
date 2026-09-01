@@ -23,7 +23,10 @@ from network_manager import __version__
 from network_manager.local_web_server import LocalWebServer
 from network_manager.credential_store import CredentialStore, CredentialStoreError
 from network_manager.models import (
+    COMMON_OVERSEAS_GROUP,
+    DEFAULT_PROXY_DOMAINS,
     DEFAULT_SERVER_PROXY_PORT,
+    MIN_RANDOM_SERVER_PROXY_PORT,
     NODE_DIALER_POLICY_KEY,
     NODE_DIALER_PROXY_KEY,
     ImportedNode,
@@ -32,7 +35,8 @@ from network_manager.models import (
     Upstream,
     apply_automatic_node_dialers,
     clear_node_dialer_references,
-    default_routing_rules,
+    common_overseas_rules_from_values,
+    is_common_overseas_rule,
     normalize_node_group_name,
     normalize_proxy_endpoint_host,
     normalize_rule_value,
@@ -61,9 +65,6 @@ from network_manager.ui.dialogs import RULE_LABELS, TARGET_LABELS
 from network_manager.ui.main_window import MODE_LABELS, MainWindow as NativeMainWindow
 from network_manager.windows_startup import is_admin
 
-COMMON_OVERSEAS_GROUP = "common-overseas"
-
-
 class WebBridge(QObject):
     server_deploy_completed = Signal(str, bool, str, str, str)
 
@@ -88,11 +89,6 @@ class WebBridge(QObject):
         self._toasts: deque[dict[str, str]] = deque(maxlen=40)
         self._running_process_cache: list[str] = []
         self._running_process_cache_at = 0.0
-        self.common_rule_keys = {
-            (rule.rule_type, normalize_rule_value(rule.rule_type, rule.value))
-            for rule in default_routing_rules()
-            if rule.rule_type != "PROCESS-NAME"
-        }
         self.server_deploy_completed.connect(self._server_deploy_finished)
 
     @Slot(result=str)
@@ -244,8 +240,12 @@ class WebBridge(QObject):
                     "port": profile.port,
                     "username": profile.username,
                     "proxyPort": profile.proxy_port,
-                    "proxyPortWarning": server_proxy_port_error(
-                        profile.proxy_port, profile.port
+                    "proxyPortWarning": (
+                        f"当前端口 {profile.proxy_port} 与默认部署端口不一致；"
+                        f"点击检查服务将迁移到 {config.server_proxy_port}"
+                        if profile.deployed_node_id
+                        and profile.proxy_port != config.server_proxy_port
+                        else server_proxy_port_error(profile.proxy_port, profile.port)
                     ),
                     "proxyReachable": profile.proxy_reachable,
                     "authMethod": profile.auth_method,
@@ -280,6 +280,7 @@ class WebBridge(QObject):
                 "mixedPort": config.mixed_port,
                 "controllerPort": config.controller_port,
                 "dnsPort": config.dns_port,
+                "serverProxyPort": config.server_proxy_port,
                 "strictRoute": config.strict_route,
                 "startOnLaunch": config.start_on_launch,
                 "closeToTray": True,
@@ -342,14 +343,14 @@ class WebBridge(QObject):
         return [
             (index, rule)
             for index, rule in enumerate(self.window.config.rules)
-            if self._rule_key(rule) in self.common_rule_keys
+            if is_common_overseas_rule(rule)
         ]
 
     def _rule_states(self, rules: list[RoutingRule]) -> list[dict[str, object]]:
         common = [
             (index, rule)
             for index, rule in enumerate(rules)
-            if self._rule_key(rule) in self.common_rule_keys
+            if is_common_overseas_rule(rule)
         ]
         common_indexes = {index for index, _rule in common}
         common_added = False
@@ -380,6 +381,7 @@ class WebBridge(QObject):
                             }
                             for _item_index, item in common
                         ],
+                        "defaultEntries": [domain for domain, _label in DEFAULT_PROXY_DOMAINS],
                         "target": target,
                         "targetLabel": (
                             TARGET_LABELS.get(target, target)
@@ -640,6 +642,7 @@ class WebBridge(QObject):
             target = str(payload["target"])
             if group_id != COMMON_OVERSEAS_GROUP or target not in TARGET_LABELS:
                 raise ValueError("规则组去向无效")
+            values = payload.get("values")
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self._notify("error", str(exc) or "规则组内容无效")
             return
@@ -647,11 +650,45 @@ class WebBridge(QObject):
         if not members:
             self._notify("error", "规则组已经不存在")
             return
-        for _index, rule in members:
-            rule.target = target
-        if self.window._save_and_apply("常用海外站点去向已更新"):
+        previous_rules = list(self.window.config.rules)
+        if values is None:
+            member_indexes = {index for index, _rule in members}
+            self.window.config.rules = [
+                replace(rule, target=target) if index in member_indexes else rule
+                for index, rule in enumerate(self.window.config.rules)
+            ]
+            message = "常用海外站点去向已更新"
+        else:
+            labels = {
+                normalize_rule_value(rule.rule_type, rule.value): rule.note
+                for _index, rule in members
+                if rule.note
+            }
+            try:
+                replacements = common_overseas_rules_from_values(
+                    values,
+                    target,
+                    enabled=all(rule.enabled for _index, rule in members),
+                    existing_labels=labels,
+                )
+            except ValueError as exc:
+                self._notify("error", str(exc))
+                return
+            first_index = min(index for index, _rule in members)
+            member_indexes = {index for index, _rule in members}
+            remaining = [
+                rule
+                for index, rule in enumerate(self.window.config.rules)
+                if index not in member_indexes
+            ]
+            remaining[first_index:first_index] = replacements
+            self.window.config.rules = remaining
+            message = f"常用海外站点已更新，共 {len(replacements)} 条"
+        if self.window._save_and_apply(message):
             self.window._refresh_rules_table()
-            self._notify("success", "规则组已统一切换")
+            self._notify("success", message)
+        else:
+            self.window.config.rules = previous_rules
 
     @Slot(str)
     def setDefaultTarget(self, target: str) -> None:
@@ -750,6 +787,12 @@ class WebBridge(QObject):
             self.window.mixed_port_spin.setValue(int(payload["mixedPort"]))
             self.window.controller_port_spin.setValue(int(payload["controllerPort"]))
             self.window.dns_port_spin.setValue(int(payload["dnsPort"]))
+            server_proxy_port = int(payload["serverProxyPort"])
+            if not MIN_RANDOM_SERVER_PROXY_PORT <= server_proxy_port <= 65535:
+                raise ValueError(
+                    f"默认服务器部署端口必须在 {MIN_RANDOM_SERVER_PROXY_PORT} 到 65535 之间"
+                )
+            self.window.server_proxy_port_spin.setValue(server_proxy_port)
             self.window.strict_route_check.setChecked(bool(payload["strictRoute"]))
             self.window.start_on_launch_check.setChecked(bool(payload["startOnLaunch"]))
             self.window.close_to_tray_check.setChecked(True)
@@ -1336,13 +1379,31 @@ class WebBridge(QObject):
 
         existing_node = self._deployed_node(profile)
         existing_config = dict(existing_node.config) if existing_node else None
+        deployment_profile, repair_from_port = self._server_deployment_candidate(
+            profile,
+            self.window.config.server_proxy_port,
+        )
+        if deployment_profile.proxy_port == deployment_profile.port:
+            self._notify(
+                "error",
+                f"默认部署端口 {deployment_profile.proxy_port} 与 SSH 端口冲突，请先在设置中更换",
+            )
+            with self._deployment_lock:
+                self._deployment_states.pop(profile_id, None)
+            return
         self._notify(
             "info",
-            f"正在检查 {profile.name}" if existing_config else f"正在通过 SSH 部署 {profile.name}",
+            (
+                f"检测到旧端口 {repair_from_port}，正在迁移到 {deployment_profile.proxy_port}"
+                if repair_from_port
+                else f"正在检查 {profile.name}"
+                if existing_config
+                else f"正在通过 SSH 部署 {profile.name}"
+            ),
         )
         future = self._ssh_executor.submit(
             self._deploy_server_if_needed,
-            profile,
+            deployment_profile,
             password,
             existing_config,
             profile.deployed_at,
@@ -1353,8 +1414,21 @@ class WebBridge(QObject):
                 profile.profile_id,
                 completed,
                 password if remember_credential else "",
+                repair_from_port,
             )
         )
+
+    @staticmethod
+    def _server_deployment_candidate(
+        profile: SshServerProfile,
+        default_proxy_port: int,
+    ) -> tuple[SshServerProfile, int]:
+        if (
+            profile.deployed_node_id
+            and profile.proxy_port != default_proxy_port
+        ):
+            return replace(profile, proxy_port=default_proxy_port), profile.proxy_port
+        return profile, 0
 
     def _deploy_server_if_needed(
         self,
@@ -1371,11 +1445,11 @@ class WebBridge(QObject):
         inspection = self.window.server_deployer.inspect(profile, credential)
         if inspection.get("status") == "active":
             inspected_node = inspection.get("nodeConfig")
-            node = (
-                dict(inspected_node)
-                if isinstance(inspected_node, dict)
-                else dict(existing_node_config or {})
-            )
+            node = dict(inspected_node) if isinstance(inspected_node, dict) else {}
+            if not node and WebBridge._node_matches_profile_endpoint(
+                existing_node_config, profile
+            ):
+                node = dict(existing_node_config or {})
             if node:
                 timestamp = deployed_at or datetime.now().astimezone().isoformat(
                     timespec="seconds"
@@ -1397,6 +1471,21 @@ class WebBridge(QObject):
             progress("远端服务未运行，正在修复部署")
         result = self.window.server_deployer.deploy(profile, credential, progress)
         return WebBridge._with_public_access_check(profile, result, progress)
+
+    @staticmethod
+    def _node_matches_profile_endpoint(
+        node_config: dict[str, object] | None,
+        profile: SshServerProfile,
+    ) -> bool:
+        if not node_config:
+            return False
+        try:
+            port = int(node_config.get("port", 0))
+        except (TypeError, ValueError):
+            return False
+        return str(node_config.get("server", "")).strip() == profile.host and (
+            port == profile.proxy_port
+        )
 
     @staticmethod
     def _with_public_access_check(
@@ -1501,17 +1590,22 @@ class WebBridge(QObject):
         profile_id: str,
         future: Future[DeploymentResult],
         credential: str = "",
+        repair_from_port: int = 0,
     ) -> None:
         if self._bridge_closed:
             return
         try:
             result = future.result()
             success = True
-            message = (
-                "远端代理已存在并正常运行，无需重复部署"
-                if result.reused
-                else "服务器代理部署完成"
-            )
+            if repair_from_port:
+                repaired_port = int(result.node_config.get("port", 0))
+                message = f"旧端口 {repair_from_port} 已自动调整为 {repaired_port}"
+            else:
+                message = (
+                    "远端代理已存在并正常运行，无需重复部署"
+                    if result.reused
+                    else "服务器代理部署完成"
+                )
             result_json = json.dumps(
                 {
                     "node": result.node_config,
@@ -1528,6 +1622,8 @@ class WebBridge(QObject):
         except (ServerDeploymentError, OSError, ValueError) as exc:
             success = False
             message = str(exc) or "服务器代理部署失败"
+            if repair_from_port:
+                message = f"旧端口 {repair_from_port} 自动调整失败：{message}"
             result_json = ""
         self.server_deploy_completed.emit(
             profile_id,
@@ -1560,6 +1656,20 @@ class WebBridge(QObject):
             return
         payload = json.loads(result_json)
         node_config = dict(payload["node"])
+        try:
+            deployed_proxy_port = int(node_config["port"])
+        except (KeyError, TypeError, ValueError):
+            deployed_proxy_port = 0
+        port_error = server_proxy_port_error(deployed_proxy_port, profile.port)
+        if port_error:
+            with self._deployment_lock:
+                self._deployment_states[profile_id] = {
+                    "status": "error",
+                    "stage": "部署结果无效",
+                    "error": port_error,
+                }
+            self._notify("error", port_error)
+            return
         source_id = deployment_source_id(profile_id)
         current = self._deployed_node(profile)
         other_names = {
@@ -1592,6 +1702,7 @@ class WebBridge(QObject):
         self.window.config.selected_node = node.name
         self.window.config.selected_ssh_server = profile_id
         profile.deployed_node_id = node.node_id
+        profile.proxy_port = deployed_proxy_port
         profile.deployed_at = str(payload.get("deployedAt", ""))
         profile.deployed_version = str(payload.get("version", ""))
         public_reachable = payload.get("publicReachable")

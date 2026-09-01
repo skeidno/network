@@ -254,7 +254,7 @@ class MainWindow(QMainWindow):
         core_layout.addWidget(self.sidebar_core_status)
         sidebar_layout.addWidget(core_panel)
         sidebar_layout.addSpacing(12)
-        version = QLabel("Network Manager  ·  v0.5.0")
+        version = QLabel("Network Manager  ·  v0.6.0")
         version.setObjectName("sidebarVersion")
         sidebar_layout.addWidget(version)
 
@@ -774,11 +774,14 @@ class MainWindow(QMainWindow):
         self.mixed_port_spin = QSpinBox()
         self.controller_port_spin = QSpinBox()
         self.dns_port_spin = QSpinBox()
+        self.server_proxy_port_spin = QSpinBox()
         for spin in (self.mixed_port_spin, self.controller_port_spin, self.dns_port_spin):
             spin.setRange(1024, 65535)
+        self.server_proxy_port_spin.setRange(10000, 65535)
         network_form.addRow("HTTP / SOCKS 入口端口", self.mixed_port_spin)
         network_form.addRow("核心控制端口", self.controller_port_spin)
         network_form.addRow("内部 DNS 端口", self.dns_port_spin)
+        network_form.addRow("默认服务器部署端口", self.server_proxy_port_spin)
 
         behavior_group = QGroupBox("运行行为")
         behavior_layout = QVBoxLayout(behavior_group)
@@ -879,6 +882,7 @@ class MainWindow(QMainWindow):
         self.mixed_port_spin.setValue(self.config.mixed_port)
         self.controller_port_spin.setValue(self.config.controller_port)
         self.dns_port_spin.setValue(self.config.dns_port)
+        self.server_proxy_port_spin.setValue(self.config.server_proxy_port)
         self.strict_route_check.setChecked(self.config.strict_route)
         self.start_on_launch_check.setChecked(self.config.start_on_launch)
         self.close_to_tray_check.setChecked(self.config.close_to_tray)
@@ -1299,6 +1303,7 @@ class MainWindow(QMainWindow):
         self.config.mixed_port = self.mixed_port_spin.value()
         self.config.controller_port = self.controller_port_spin.value()
         self.config.dns_port = self.dns_port_spin.value()
+        self.config.server_proxy_port = self.server_proxy_port_spin.value()
         self.config.strict_route = self.strict_route_check.isChecked()
         self.config.start_on_launch = self.start_on_launch_check.isChecked()
         self.config.close_to_tray = True

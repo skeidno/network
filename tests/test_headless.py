@@ -144,6 +144,33 @@ def test_headless_rule_editor_saves_multiple_values_atomically(monkeypatch, tmp_
         controller.close()
 
 
+def test_headless_common_rule_group_edits_values_atomically(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("NETWORK_MANAGER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("NETWORK_MANAGER_CORE", str(tmp_path / "missing-mihomo"))
+    controller = HeadlessController(start_core=False)
+    try:
+        controller.saveRuleGroup(
+            json.dumps(
+                {
+                    "groupId": "common-overseas",
+                    "target": "DIRECT",
+                    "values": ["Example.com", "custom.example", "example.com"],
+                }
+            )
+        )
+
+        state = json.loads(controller.getState())
+        group = next(rule for rule in state["rules"] if rule["kind"] == "group")
+        assert [entry["domain"] for entry in group["entries"]] == [
+            "example.com",
+            "custom.example",
+        ]
+        assert group["target"] == "DIRECT"
+        assert controller.store.load().rules[1].group == "common-overseas"
+    finally:
+        controller.close()
+
+
 def test_headless_state_detects_running_process_names(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("NETWORK_MANAGER_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("NETWORK_MANAGER_CORE", str(tmp_path / "missing-mihomo"))

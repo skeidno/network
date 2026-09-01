@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import os
@@ -29,6 +30,7 @@ from network_manager.importers import (
 from network_manager.local_web_server import LocalWebServer
 from network_manager.mihomo_config import write_mihomo_config
 from network_manager.models import (
+    COMMON_OVERSEAS_GROUP,
     DEFAULT_PROXY_DOMAINS,
     NODE_DIALER_POLICY_KEY,
     NODE_DIALER_PROXY_KEY,
@@ -38,6 +40,8 @@ from network_manager.models import (
     Upstream,
     apply_automatic_node_dialers,
     clear_node_dialer_references,
+    common_overseas_rules_from_values,
+    is_common_overseas_rule,
     normalize_node_group_name,
     normalize_proxy_endpoint_host,
     normalize_rule_value,
@@ -82,8 +86,6 @@ TARGET_LABELS = {
     "BUILTIN": "内置节点组",
     "DIRECT": "直连",
 }
-COMMON_OVERSEAS_GROUP = "common-overseas"
-
 HEADLESS_METHODS = {
     "getState",
     "getLogs",
@@ -159,10 +161,6 @@ class HeadlessController:
         self._node_pending: set[str] = set()
         self._running_process_cache: list[str] = []
         self._running_process_cache_at = 0.0
-        self._common_rule_keys = {
-            ("DOMAIN-SUFFIX", normalize_rule_value("DOMAIN-SUFFIX", domain))
-            for domain, _label in DEFAULT_PROXY_DOMAINS
-        }
         write_mihomo_config(self.config, generated_config_path())
         self._monitor = threading.Thread(
             target=self._monitor_loop, name="headless-monitor", daemon=True
@@ -281,6 +279,7 @@ class HeadlessController:
                     "mixedPort": config.mixed_port,
                     "controllerPort": config.controller_port,
                     "dnsPort": config.dns_port,
+                    "serverProxyPort": config.server_proxy_port,
                     "strictRoute": config.strict_route,
                     "startOnLaunch": config.start_on_launch,
                     "closeToTray": False,
@@ -390,13 +389,51 @@ class HeadlessController:
             target = str(payload["target"])
             if target not in TARGET_LABELS:
                 raise ValueError("规则组去向无效")
+            values = payload.get("values")
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self._notify("error", str(exc) or "规则组内容无效")
             return
         with self._config_lock:
-            for _index, rule in self._common_rules():
-                rule.target = target
-            self._save_and_apply("常用海外站点去向已更新")
+            members = self._common_rules()
+            if not members:
+                self._notify("error", "规则组已经不存在")
+                return
+            previous_rules = list(self.config.rules)
+            if values is None:
+                member_indexes = {index for index, _rule in members}
+                self.config.rules = [
+                    replace(rule, target=target) if index in member_indexes else rule
+                    for index, rule in enumerate(self.config.rules)
+                ]
+                message = "常用海外站点去向已更新"
+            else:
+                labels = {
+                    normalize_rule_value(rule.rule_type, rule.value): rule.note
+                    for _index, rule in members
+                    if rule.note
+                }
+                try:
+                    replacements = common_overseas_rules_from_values(
+                        values,
+                        target,
+                        enabled=all(rule.enabled for _index, rule in members),
+                        existing_labels=labels,
+                    )
+                except ValueError as exc:
+                    self._notify("error", str(exc))
+                    return
+                first_index = min(index for index, _rule in members)
+                member_indexes = {index for index, _rule in members}
+                remaining = [
+                    rule
+                    for index, rule in enumerate(self.config.rules)
+                    if index not in member_indexes
+                ]
+                remaining[first_index:first_index] = replacements
+                self.config.rules = remaining
+                message = f"常用海外站点已更新，共 {len(replacements)} 条"
+            if not self._save_and_apply(message):
+                self.config.rules = previous_rules
 
     def ruleGroupAction(self, group_id: str, action: str) -> None:
         if group_id != COMMON_OVERSEAS_GROUP:
@@ -458,6 +495,9 @@ class HeadlessController:
             candidate.mixed_port = int(payload["mixedPort"])
             candidate.controller_port = int(payload["controllerPort"])
             candidate.dns_port = int(payload["dnsPort"])
+            candidate.server_proxy_port = int(
+                payload.get("serverProxyPort", candidate.server_proxy_port)
+            )
             candidate.strict_route = bool(payload["strictRoute"])
             candidate.start_on_launch = bool(payload["startOnLaunch"])
             errors = validate_config(candidate)
@@ -978,14 +1018,14 @@ class HeadlessController:
         return [
             (index, rule)
             for index, rule in enumerate(self.config.rules)
-            if self._rule_key(rule) in self._common_rule_keys
+            if is_common_overseas_rule(rule)
         ]
 
     def _rule_states(self, rules: list[RoutingRule]) -> list[dict[str, object]]:
         common = [
             (index, rule)
             for index, rule in enumerate(rules)
-            if self._rule_key(rule) in self._common_rule_keys
+            if is_common_overseas_rule(rule)
         ]
         common_indexes = {index for index, _rule in common}
         states: list[dict[str, object]] = []
@@ -1016,6 +1056,7 @@ class HeadlessController:
                             }
                             for _item_index, item in common
                         ],
+                        "defaultEntries": [domain for domain, _label in DEFAULT_PROXY_DOMAINS],
                         "target": target,
                         "targetLabel": TARGET_LABELS.get(target, "多个去向"),
                         "note": "常用海外站点",

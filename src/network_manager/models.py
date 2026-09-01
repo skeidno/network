@@ -19,8 +19,10 @@ MODES = (
     "SMART",
     "DIRECT",
 )
-CONFIG_VERSION = 8
+CONFIG_VERSION = 9
 DEFAULT_SERVER_PROXY_PORT = 24443
+MIN_RANDOM_SERVER_PROXY_PORT = 10000
+COMMON_OVERSEAS_GROUP = "common-overseas"
 
 DEFAULT_PROXY_DOMAINS = (
     ("discord.com", "Discord"),
@@ -93,6 +95,13 @@ DEFAULT_PROXY_DOMAINS = (
 )
 
 
+def random_server_proxy_port() -> int:
+    """Return a high, non-privileged port suitable for a new remote deployment."""
+    return MIN_RANDOM_SERVER_PROXY_PORT + secrets.randbelow(
+        65536 - MIN_RANDOM_SERVER_PROXY_PORT
+    )
+
+
 @dataclass(slots=True)
 class Upstream:
     name: str
@@ -119,6 +128,7 @@ class RoutingRule:
     target: str
     enabled: bool = True
     note: str = ""
+    group: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RoutingRule":
@@ -128,6 +138,7 @@ class RoutingRule:
             target=str(data.get("target", "DIRECT")).upper(),
             enabled=bool(data.get("enabled", True)),
             note=str(data.get("note", "")).strip(),
+            group=str(data.get("group", "")).strip(),
         )
 
 
@@ -399,6 +410,7 @@ class AppConfig:
     mixed_port: int = 17897
     controller_port: int = 19090
     dns_port: int = 11053
+    server_proxy_port: int = field(default_factory=random_server_proxy_port)
     controller_secret: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     strict_route: bool = True
     start_on_launch: bool = False
@@ -452,6 +464,9 @@ class AppConfig:
             mixed_port=int(data.get("mixed_port", defaults.mixed_port)),
             controller_port=int(data.get("controller_port", defaults.controller_port)),
             dns_port=int(data.get("dns_port", defaults.dns_port)),
+            server_proxy_port=int(
+                data.get("server_proxy_port", defaults.server_proxy_port)
+            ),
             controller_secret=str(data.get("controller_secret", defaults.controller_secret)),
             strict_route=bool(data.get("strict_route", defaults.strict_route)),
             start_on_launch=bool(data.get("start_on_launch", defaults.start_on_launch)),
@@ -488,6 +503,7 @@ def default_routing_rules() -> list[RoutingRule]:
             value=domain,
             target="CLASH",
             note=label,
+            group=COMMON_OVERSEAS_GROUP,
         )
         for domain, label in DEFAULT_PROXY_DOMAINS
     )
@@ -602,6 +618,40 @@ def routing_rules_from_values(
     return rules
 
 
+def is_common_overseas_rule(rule: RoutingRule) -> bool:
+    if rule.group == COMMON_OVERSEAS_GROUP:
+        return True
+    if rule.rule_type != "DOMAIN-SUFFIX":
+        return False
+    value = normalize_rule_value(rule.rule_type, rule.value)
+    return value in {domain for domain, _label in DEFAULT_PROXY_DOMAINS}
+
+
+def common_overseas_rules_from_values(
+    values: object,
+    target: object,
+    *,
+    enabled: bool = True,
+    existing_labels: dict[str, str] | None = None,
+) -> list[RoutingRule]:
+    labels = {
+        normalize_rule_value("DOMAIN-SUFFIX", domain): label
+        for domain, label in DEFAULT_PROXY_DOMAINS
+    }
+    labels.update(existing_labels or {})
+    rules = routing_rules_from_values(
+        "DOMAIN-SUFFIX",
+        values,
+        target,
+        enabled=enabled,
+        limit=500,
+    )
+    for rule in rules:
+        rule.note = labels.get(rule.value, "自定义")
+        rule.group = COMMON_OVERSEAS_GROUP
+    return rules
+
+
 def validate_config(config: AppConfig) -> list[str]:
     errors: list[str] = []
     if config.mode not in MODES:
@@ -613,6 +663,10 @@ def validate_config(config: AppConfig) -> list[str]:
         errors.append("本地端口必须在 1 到 65535 之间")
     if len(set(ports)) != len(ports):
         errors.append("入口、控制器和 DNS 端口不能相同")
+    if not MIN_RANDOM_SERVER_PROXY_PORT <= config.server_proxy_port <= 65535:
+        errors.append(
+            f"默认服务器部署端口必须在 {MIN_RANDOM_SERVER_PROXY_PORT} 到 65535 之间"
+        )
     for upstream in (config.clash, config.v2ray):
         if not upstream.host.strip():
             errors.append(f"{upstream.name} 地址不能为空")
