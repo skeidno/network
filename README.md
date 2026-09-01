@@ -1,6 +1,6 @@
 # Network Manager
 
-一个 Windows 优先的 TUN 分流管理器。它使用 Mihomo 接管流量，提供独立 WebGUI、订阅与节点管理、实时流量监控、规则组和远端代理自动部署。
+一个跨平台 TUN 分流管理器。Windows 使用一体化桌面窗口，Linux 以 systemd 无界面服务运行并通过 WebGUI 配置；Android 使用原生 `VpnService`。三端共用订阅、节点与分流配置格式。
 
 ## 当前能力
 
@@ -19,11 +19,21 @@
 - Windows 与 Android 通用配置文件快速导入导出；SSH 凭据、桌面进程规则和本地端口不会跨设备导出
 - 系统托盘、登录启动、桌面快捷方式和配置自动校验
 
-WebGUI 由仅监听 `127.0.0.1` 的会话令牌 API 提供，并通过 Qt WebEngine 直接嵌入 Network Manager 主窗口。界面、托盘和后台管理属于同一个应用实例，不会再打开 Edge 窗口；Mihomo 仍作为受控子进程独立运行。
+Windows WebGUI 由仅监听 `127.0.0.1` 的会话令牌 API 提供，并通过 Qt WebEngine 直接嵌入 Network Manager 主窗口。界面、托盘和后台管理属于同一个应用实例，不会再打开 Edge 窗口。Linux 复用同一套页面，以无 Qt 的 HTTP 服务提供；远程监听额外强制 HTTP Basic 管理密码。Mihomo 在两端都作为受控子进程独立运行。
+
+## Linux 无界面服务
+
+Linux 版不安装桌面窗口，支持 amd64 与 arm64。它复用 Windows 的 WebGUI、Mihomo TUN、订阅与节点管理、规则组、智能节点、测速、流量监控和跨设备配置，但不包含 SSH 服务器部署功能。
+
+```bash
+sudo bash apps/linux/install.sh
+```
+
+安装后由 `network-manager.service` 常驻。首次安装只启动 WebGUI，导入节点并确认测速后再启动 TUN；启用“打开后自动接管”后，服务重启会自动恢复。WebGUI 安全默认只监听 `127.0.0.1:9091`，安装程序会生成随机管理密码；远程访问可使用 SSH 端口转发，或自行配置带 HTTPS 的反向代理。安装位置、服务命令和直接监听方法见 `apps/linux/README.md`。
 
 ## Windows 开发运行
 
-需要 Python 3.11+。TUN 启动需要管理员权限。
+需要 Python 3.10+。TUN 启动需要管理员权限。
 
 ```powershell
 python -m pip install -e ".[dev]"
@@ -93,10 +103,12 @@ python scripts/smoke_webgui.py http://127.0.0.1:<port>/ --poll-seconds 10
 - SSH 主机密钥：`%LOCALAPPDATA%\NetWorkManger\ssh-known-hosts`
 - 加密 SSH 凭据：`%LOCALAPPDATA%\NetWorkManger\ssh-credentials.json`
 
+Linux 用户配置位于 `/var/lib/network-manager`，WebGUI 凭据位于 `/etc/network-manager/network-manager.env`，运行日志通过 `journalctl -u network-manager` 查看。
+
 仓库不包含本地配置、订阅地址、节点凭据、构建产物或 Mihomo 二进制。`scripts/download_mihomo.py` 会下载并校验固定版本的官方 Mihomo 包。
 
 ## 平台范围
 
-Windows 11 是当前完整支持的平台。Android 原生客户端已实现并通过 API 36 模拟器的 VPN 接管与设备测试；macOS 与 iOS 目录已建立，但系统扩展、TUN 权限、签名和打包仍待实现。平台边界见 `PLATFORMS.md`。
+Windows 11 是当前稳定平台。Linux 无界面版已经实现 systemd 服务、WebGUI 与 amd64/arm64 安装流程，进入测试阶段；Android 原生客户端已通过 API 36 模拟器的 VPN 接管与设备测试。macOS 与 iOS 目录已建立，但系统扩展、TUN 权限、签名和打包仍待实现。平台边界见 `PLATFORMS.md`。
 
 项目界面和核心管理思路参考了 [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev)，代理核心使用 [Mihomo](https://github.com/MetaCubeX/mihomo)。第三方许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

@@ -3,6 +3,8 @@ package com.skeidno.networkmanager
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.skeidno.networkmanager.data.AppState
 import com.skeidno.networkmanager.data.ProxyNode
+import com.skeidno.networkmanager.data.PortableRule
+import com.skeidno.networkmanager.data.FallbackTarget
 import com.skeidno.networkmanager.data.RoutingMode
 import com.skeidno.networkmanager.vpn.SingBoxConfigBuilder
 import io.nekohasekai.libbox.Libbox
@@ -32,6 +34,20 @@ class LibboxConfigInstrumentedTest {
         )
         val config = SingBoxConfigBuilder.build(
             AppState(mode = RoutingMode.Smart, selectedNodeId = node.id, nodes = listOf(node)),
+        )
+
+        Libbox.checkConfig(config)
+    }
+
+    @Test
+    fun generatedApplicationRuleIsAcceptedByNativeCore() {
+        val config = SingBoxConfigBuilder.build(
+            AppState(
+                mode = RoutingMode.Direct,
+                portableRules = listOf(
+                    PortableRule("package_name", "com.android.chrome", FallbackTarget.Direct),
+                ),
+            ),
         )
 
         Libbox.checkConfig(config)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import re
 from datetime import datetime, timezone
@@ -19,6 +20,9 @@ from network_manager.models import ImportedNode, SubscriptionSource
 SUPPORTED_SCHEMES = ("vmess", "vless", "trojan", "ss", "hysteria2", "hy2")
 LINK_PATTERN = re.compile(
     r"(?:(?:vmess|vless|trojan|ss|hysteria2|hy2)://)[^\s]+", re.IGNORECASE
+)
+PROXY_ENDPOINT_PATTERN = re.compile(
+    r"^(?:\[([^\]]+)\]|([^:\s]+)):(\d+):([^:\s]+):(.+)$"
 )
 MAX_IMPORT_BYTES = 10 * 1024 * 1024
 MAX_PROVIDER_SOURCES = 8
@@ -336,6 +340,68 @@ def parse_share_link(link: str) -> dict[str, Any]:
     return parser(link.strip())
 
 
+def _valid_proxy_host(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if len(host) > 253:
+        return False
+    labels = host.rstrip(".").split(".")
+    return bool(labels) and all(
+        label
+        and len(label) <= 63
+        and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label)
+        for label in labels
+    )
+
+
+def parse_authenticated_proxy_line(line: str) -> dict[str, Any]:
+    """Parse host:port:username:password as an authenticated HTTP proxy."""
+    match = PROXY_ENDPOINT_PATTERN.fullmatch(line.strip())
+    if match is None:
+        raise ImportContentError("代理 IP 格式应为 主机:端口:用户名:密码")
+    host = match.group(1) or match.group(2) or ""
+    if not _valid_proxy_host(host):
+        raise ImportContentError("代理 IP 的主机名或 IP 地址无效")
+    port = int(match.group(3))
+    if port not in range(1, 65536):
+        raise ImportContentError("代理 IP 的端口必须在 1 到 65535 之间")
+    username = match.group(4)
+    password = match.group(5)
+    if not password or any(character.isspace() for character in password):
+        raise ImportContentError("代理 IP 的密码不能为空或包含空白字符")
+    return {
+        "name": f"HTTP Proxy {host}:{port}",
+        "type": "http",
+        "server": host,
+        "port": port,
+        "username": username,
+        "password": password,
+    }
+
+
+def _unstructured_nodes(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    nodes: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for index, link in enumerate(LINK_PATTERN.findall(text), start=1):
+        try:
+            nodes.append(parse_share_link(link))
+        except (ImportContentError, ValueError) as exc:
+            errors.append(f"第 {index} 个链接：{exc}")
+
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "://" in line or line.count(":") < 3:
+            continue
+        try:
+            nodes.append(parse_authenticated_proxy_line(line))
+        except (ImportContentError, ValueError) as exc:
+            errors.append(f"第 {line_number} 行代理 IP：{exc}")
+    return nodes, errors
+
+
 def _yaml_nodes(text: str) -> list[dict[str, Any]]:
     try:
         data = yaml.safe_load(text)
@@ -356,29 +422,23 @@ def parse_import_content(text: str) -> tuple[list[dict[str, Any]], list[str]]:
     if yaml_nodes:
         return yaml_nodes, []
 
-    links = LINK_PATTERN.findall(normalized)
-    if not links and "://" not in normalized:
+    nodes, errors = _unstructured_nodes(normalized)
+    if not nodes and not errors and "://" not in normalized:
         try:
             decoded = _decode_base64(normalized).decode("utf-8-sig")
         except (ImportContentError, UnicodeDecodeError):
             decoded = ""
-        links = LINK_PATTERN.findall(decoded)
-        if not links:
+        nodes, errors = _unstructured_nodes(decoded)
+        if not nodes and not errors:
             yaml_nodes = _yaml_nodes(decoded)
             if yaml_nodes:
                 return yaml_nodes, []
-    if not links:
-        raise ImportContentError("未找到 Clash proxies 或支持的分享链接")
-
-    nodes: list[dict[str, Any]] = []
-    errors: list[str] = []
-    for index, link in enumerate(links, start=1):
-        try:
-            nodes.append(parse_share_link(link))
-        except (ImportContentError, ValueError) as exc:
-            errors.append(f"第 {index} 个链接：{exc}")
     if not nodes:
-        raise ImportContentError(errors[0] if errors else "没有成功解析任何节点")
+        raise ImportContentError(
+            errors[0]
+            if errors
+            else "未找到 Clash proxies、支持的分享链接或代理 IP"
+        )
     return nodes, errors
 
 
@@ -532,11 +592,12 @@ def fetch_subscription(url: str, proxy_url: str | None = None) -> str:
     return _fetch_subscription(url.strip(), proxies, session, provider_depth=0)
 
 
-def subscription_from_url(name: str, url: str) -> SubscriptionSource:
+def subscription_from_url(name: str, url: str, group: str = "") -> SubscriptionSource:
     source_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
     return SubscriptionSource(
         source_id=source_id,
         name=name.strip() or "订阅",
         url=url.strip(),
         last_updated=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        group=group,
     )

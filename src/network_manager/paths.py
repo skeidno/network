@@ -18,13 +18,25 @@ def bundle_root() -> Path:
 
 
 def core_path() -> Path:
-    return bundle_root() / "vendor" / "mihomo.exe"
+    override = os.environ.get("NETWORK_MANAGER_CORE")
+    if override:
+        return Path(override).expanduser().resolve()
+    executable = "mihomo.exe" if os.name == "nt" else "mihomo"
+    return bundle_root() / "vendor" / executable
 
 
 def app_data_dir() -> Path:
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
-    path = base / APP_NAME
+    override = os.environ.get("NETWORK_MANAGER_DATA_DIR")
+    if override:
+        path = Path(override).expanduser()
+    elif os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+        path = base / APP_NAME
+    else:
+        data_home = os.environ.get("XDG_DATA_HOME")
+        base = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
+        path = base / "network-manager"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

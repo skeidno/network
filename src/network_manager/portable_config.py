@@ -10,7 +10,9 @@ from network_manager.models import (
     ImportedNode,
     RoutingRule,
     SubscriptionSource,
+    apply_automatic_node_dialers,
     default_routing_rules,
+    normalize_node_group_name,
     normalize_rule_value,
     validate_config,
     validate_rule,
@@ -64,11 +66,13 @@ def export_portable_config(config: AppConfig) -> dict[str, Any]:
             },
         },
         "selectedNodeId": selected_id,
+        "nodeGroups": list(config.node_groups),
         "nodes": [
             {
                 "id": node.node_id,
                 "sourceId": node.source_id,
                 "sourceName": node.source,
+                "group": node.group,
                 "config": deepcopy(node.config),
             }
             for node in config.imported_nodes
@@ -79,6 +83,7 @@ def export_portable_config(config: AppConfig) -> dict[str, Any]:
                 "name": source.name,
                 "url": source.url,
                 "updatedAt": source.last_updated,
+                "group": source.group,
             }
             for source in config.subscriptions
         ],
@@ -92,6 +97,14 @@ def import_portable_config(current: AppConfig, payload: dict[str, Any]) -> AppCo
     nodes_data = _object_list(payload.get("nodes", []), "nodes", 5_000)
     subscriptions_data = _object_list(payload.get("subscriptions", []), "subscriptions", 500)
     rules_data = _object_list(payload.get("rules", []), "rules", 5_000)
+    raw_groups = payload.get("nodeGroups", [])
+    if not isinstance(raw_groups, list):
+        raise ValueError("nodeGroups 必须是数组")
+    node_groups: list[str] = []
+    for value in raw_groups:
+        group = normalize_node_group_name(value)
+        if group and group not in node_groups:
+            node_groups.append(group)
 
     nodes: list[ImportedNode] = []
     used_names: set[str] = set()
@@ -108,25 +121,34 @@ def import_portable_config(current: AppConfig, payload: dict[str, Any]) -> AppCo
             suffix += 1
         used_names.add(name)
         config["name"] = name
+        group = normalize_node_group_name(item.get("group", ""))
+        if group and group not in node_groups:
+            node_groups.append(group)
         nodes.append(
             ImportedNode(
                 node_id=str(item.get("id", "")).strip() or __import__("secrets").token_hex(8),
                 source=str(item.get("sourceName", "跨设备导入")).strip() or "跨设备导入",
                 source_id=str(item.get("sourceId", "")).strip(),
                 config=config,
+                group=group,
             )
         )
     imported.imported_nodes = nodes
+    imported.node_groups = node_groups
     imported.subscriptions = [
         SubscriptionSource(
             source_id=str(item.get("id", "")).strip() or __import__("secrets").token_hex(8),
             name=str(item.get("name", "订阅")).strip() or "订阅",
             url=str(item.get("url", "")).strip(),
             last_updated=str(item.get("updatedAt", "")).strip(),
+            group=normalize_node_group_name(item.get("group", "")),
         )
         for item in subscriptions_data
         if str(item.get("url", "")).strip()
     ]
+    for source in imported.subscriptions:
+        if source.group and source.group not in imported.node_groups:
+            imported.node_groups.append(source.group)
 
     selected_id = str(payload.get("selectedNodeId", ""))
     imported.selected_node = next(
@@ -177,6 +199,7 @@ def import_portable_config(current: AppConfig, payload: dict[str, Any]) -> AppCo
         portable_rules.append(rule)
     imported.rules = process_rules + common_rules + portable_rules
 
+    apply_automatic_node_dialers(imported.imported_nodes)
     errors = validate_config(imported)
     if errors:
         raise ValueError(errors[0])

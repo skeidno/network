@@ -9,6 +9,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.skeidno.networkmanager.MainActivity
 import com.skeidno.networkmanager.R
@@ -77,6 +78,7 @@ class NetworkVpnService : VpnService(), CommandServerHandler {
                 notification("接管中"),
             )
         } catch (error: Exception) {
+            Log.e(LOG_TAG, "Unable to start VPN core", error)
             commandServer?.close()
             commandServer = null
             closeTun()
@@ -238,5 +240,6 @@ class NetworkVpnService : VpnService(), CommandServerHandler {
         const val ACTION_RELOAD = "com.skeidno.networkmanager.RELOAD"
         private const val CHANNEL_ID = "network-manager-vpn"
         private const val NOTIFICATION_ID = 1101
+        private const val LOG_TAG = "NetworkVpnService"
     }
 }

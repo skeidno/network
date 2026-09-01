@@ -1,3 +1,5 @@
+import json
+
 from network_manager.importers import parse_share_link
 from network_manager.models import SshServerProfile
 from network_manager.server_deployer import (
@@ -32,6 +34,25 @@ def test_server_config_uses_encrypted_shadowsocks_on_tcp_and_udp() -> None:
     assert inbound["method"] == SHADOWSOCKS_METHOD
     assert "network" not in inbound
     assert inbound["multiplex"] == {"enabled": True}
+
+
+def test_existing_remote_config_can_restore_a_node() -> None:
+    profile = SshServerProfile("server-1", "Private server", "192.0.2.1", proxy_port=443)
+    raw_config = json.dumps(ServerProxyDeployer._server_config(443, "existing-password"))
+
+    node = ServerProxyDeployer._node_from_remote_config(profile, raw_config)
+
+    assert node is not None
+    assert node["server"] == profile.host
+    assert node["port"] == 443
+    assert node["password"] == "existing-password"
+
+
+def test_remote_config_on_another_port_is_not_reused() -> None:
+    profile = SshServerProfile("server-1", "Private server", "192.0.2.1", proxy_port=443)
+    raw_config = json.dumps(ServerProxyDeployer._server_config(24443, "existing-password"))
+
+    assert ServerProxyDeployer._node_from_remote_config(profile, raw_config) is None
 
 
 def test_install_script_restarts_existing_service_and_keeps_rollback() -> None:

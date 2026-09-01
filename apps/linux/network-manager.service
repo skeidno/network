@@ -1,0 +1,34 @@
+[Unit]
+Description=Network Manager headless TUN routing service
+Documentation=https://github.com/skeidno/network
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/network-manager/network-manager.env
+Environment=NETWORK_MANAGER_DATA_DIR=/var/lib/network-manager
+Environment=NETWORK_MANAGER_CORE=/opt/network-manager/bin/mihomo
+ExecStart=/opt/network-manager/venv/bin/network-manager-headless
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=20s
+KillMode=mixed
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/network-manager
+DeviceAllow=/dev/net/tun rw
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

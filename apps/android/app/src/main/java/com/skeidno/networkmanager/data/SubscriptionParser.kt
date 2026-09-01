@@ -13,6 +13,8 @@ import java.util.UUID
 
 object SubscriptionParser {
     private val supportedSchemes = setOf("ss", "vmess", "vless", "trojan", "hysteria2", "hy2")
+    private val proxyEndpointPattern =
+        """^(?:\[([^\]]+)]|([^:\s]+)):(\d+):([^:\s]+):(.+)$""".toRegex()
     private val userAgents = listOf(
         "ClashMetaForAndroid/2.11",
         "clash-verge/v2.4",
@@ -50,8 +52,14 @@ object SubscriptionParser {
         val decoded = decodeSubscriptionBody(text)
         return decoded.lineSequence()
             .map(String::trim)
-            .filter { line -> supportedSchemes.any { line.startsWith("$it://", ignoreCase = true) } }
-            .mapNotNull { parseUri(it, sourceId, sourceName) }
+            .filter(String::isNotBlank)
+            .mapNotNull { line ->
+                if (supportedSchemes.any { line.startsWith("$it://", ignoreCase = true) }) {
+                    parseUri(line, sourceId, sourceName)
+                } else {
+                    parseAuthenticatedProxyLine(line, sourceId, sourceName)
+                }
+            }
             .toList()
     }
 
@@ -112,6 +120,33 @@ object SubscriptionParser {
                 rawJson = raw.toString(),
             )
         }.getOrNull()
+    }
+
+    private fun parseAuthenticatedProxyLine(
+        text: String,
+        sourceId: String,
+        sourceName: String,
+    ): ProxyNode? {
+        val match = proxyEndpointPattern.matchEntire(text) ?: return null
+        val host = match.groupValues[1].ifBlank { match.groupValues[2] }
+        val port = match.groupValues[3].toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
+        val username = match.groupValues[4]
+        val password = match.groupValues[5]
+        if (host.isBlank() || host.any(Char::isWhitespace) || password.any(Char::isWhitespace)) return null
+        val raw = JSONObject()
+            .put("name", "HTTP Proxy $host:$port")
+            .put("type", "http")
+            .put("server", host)
+            .put("port", port)
+            .put("username", username)
+            .put("password", password)
+        return ProxyNode(
+            id = UUID.randomUUID().toString(),
+            name = raw.getString("name"),
+            sourceId = sourceId,
+            sourceName = sourceName,
+            rawJson = raw.toString(),
+        )
     }
 
     private fun parseVmess(text: String): JSONObject {

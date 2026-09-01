@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
-from network_manager.models import AppConfig, default_config, migrate_config
+from network_manager.models import (
+    AppConfig,
+    apply_automatic_node_dialers,
+    default_config,
+    migrate_config,
+)
 
 
 class ConfigStore:
@@ -20,7 +26,9 @@ class ConfigStore:
             if not isinstance(data, dict):
                 raise ValueError("settings root must be an object")
             config = AppConfig.from_dict(data)
-            if migrate_config(config):
+            migrated = migrate_config(config)
+            relays_changed = apply_automatic_node_dialers(config.imported_nodes)
+            if migrated or relays_changed:
                 self.save(config)
             return config
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -41,3 +49,5 @@ class ConfigStore:
             encoding="utf-8",
         )
         temporary.replace(self.path)
+        if os.name != "nt":
+            self.path.chmod(0o600)

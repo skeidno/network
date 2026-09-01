@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from network_manager.importers import prepare_imported_nodes
 from network_manager.models import (
+    NODE_DIALER_PROXY_KEY,
     ImportedNode,
     RoutingRule,
     SshServerProfile,
@@ -82,6 +83,48 @@ def test_smart_mode_round_trips_between_devices() -> None:
 
     assert payload["routing"]["mode"] == "smart"
     assert imported.mode == "SMART"
+
+
+def test_custom_node_groups_round_trip_between_devices() -> None:
+    source = default_config()
+    node = _node()
+    node.group = "巴西住宅代理"
+    source.imported_nodes = [node]
+    source.node_groups = ["巴西住宅代理", "备用节点"]
+    source.subscriptions = [
+        SubscriptionSource(
+            "sub-1",
+            "我的订阅",
+            "https://example.com/sub",
+            group="巴西住宅代理",
+        )
+    ]
+
+    payload = export_portable_config(source)
+    imported = import_portable_config(default_config(), payload)
+
+    assert payload["nodeGroups"] == ["巴西住宅代理", "备用节点"]
+    assert payload["nodes"][0]["group"] == "巴西住宅代理"
+    assert payload["subscriptions"][0]["group"] == "巴西住宅代理"
+    assert imported.node_groups == ["巴西住宅代理", "备用节点"]
+    assert imported.imported_nodes[0].group == "巴西住宅代理"
+    assert imported.subscriptions[0].group == "巴西住宅代理"
+
+
+def test_node_dialer_round_trips_between_devices() -> None:
+    source = default_config()
+    target = _node()
+    relay = ImportedNode(
+        "node-2",
+        "Server deployment",
+        {"name": "Relay", "type": "socks5", "server": "127.0.0.1", "port": 1080},
+    )
+    target.config[NODE_DIALER_PROXY_KEY] = relay.name
+    source.imported_nodes = [target, relay]
+
+    imported = import_portable_config(default_config(), export_portable_config(source))
+
+    assert imported.imported_nodes[0].dialer_proxy == "Relay"
 
 
 def test_android_shaped_payload_imports_on_windows() -> None:

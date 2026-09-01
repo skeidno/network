@@ -18,6 +18,9 @@ import java.net.Socket
 import java.time.OffsetDateTime
 import java.util.UUID
 
+private fun normalizeNodeGroup(value: String): String =
+    value.trim().replace(Regex("\\s+"), " ").take(40)
+
 class AppRepository private constructor(private val context: Context) {
     private val preferences = context.getSharedPreferences("network-manager", Context.MODE_PRIVATE)
     private val mutableState = MutableStateFlow(load())
@@ -35,6 +38,40 @@ class AppRepository private constructor(private val context: Context) {
     fun setCommonRuleTarget(target: FallbackTarget) =
         update(mutableState.value.copy(commonRuleTarget = target))
 
+    fun savePortableRules(
+        index: Int?,
+        type: String,
+        values: List<String>,
+        target: FallbackTarget,
+    ): Int {
+        val current = mutableState.value
+        if (index != null) require(index in current.portableRules.indices) { "规则不存在或已被删除" }
+        val existing = index?.let(current.portableRules::get)
+        val replacements = portableRulesFromValues(
+            type = type,
+            values = values,
+            target = target,
+            enabled = existing?.enabled ?: true,
+            note = existing?.note.orEmpty(),
+        )
+        val rules = current.portableRules.toMutableList().apply {
+            if (index == null) {
+                addAll(replacements)
+            } else {
+                removeAt(index)
+                addAll(index, replacements)
+            }
+        }
+        update(current.copy(portableRules = rules))
+        return replacements.size
+    }
+
+    fun deletePortableRule(index: Int) {
+        val current = mutableState.value
+        if (index !in current.portableRules.indices) return
+        update(current.copy(portableRules = current.portableRules.filterIndexed { itemIndex, _ -> itemIndex != index }))
+    }
+
     fun selectNode(id: String) {
         if (mutableState.value.nodes.none { it.id == id }) return
         update(mutableState.value.copy(selectedNodeId = id))
@@ -50,6 +87,37 @@ class AppRepository private constructor(private val context: Context) {
             current.mode
         }
         update(current.copy(nodes = nodes, selectedNodeId = selected, mode = mode))
+    }
+
+    fun createNodeGroup(name: String) {
+        val group = normalizeNodeGroup(name)
+        require(group.isNotBlank()) { "分组名称不能为空" }
+        val current = mutableState.value
+        if (group in current.nodeGroups) return
+        update(current.copy(nodeGroups = current.nodeGroups + group))
+    }
+
+    fun assignNodeGroup(id: String, name: String) {
+        val group = normalizeNodeGroup(name)
+        val current = mutableState.value
+        require(group.isBlank() || group in current.nodeGroups) { "分组不存在" }
+        if (current.nodes.none { it.id == id }) return
+        update(current.copy(nodes = current.nodes.map { if (it.id == id) it.copy(group = group) else it }))
+    }
+
+    fun deleteNodeGroup(name: String) {
+        val group = normalizeNodeGroup(name)
+        val current = mutableState.value
+        if (group !in current.nodeGroups) return
+        update(
+            current.copy(
+                nodeGroups = current.nodeGroups.filterNot { it == group },
+                nodes = current.nodes.map { if (it.group == group) it.copy(group = "") else it },
+                subscriptions = current.subscriptions.map {
+                    if (it.group == group) it.copy(group = "") else it
+                },
+            ),
+        )
     }
 
     fun deleteErrorNodes(): Int {
@@ -70,30 +138,54 @@ class AppRepository private constructor(private val context: Context) {
         return failedIds.size
     }
 
-    fun importText(content: String, sourceName: String = "粘贴导入"): Int {
+    fun importText(
+        content: String,
+        sourceName: String = "粘贴导入",
+        group: String = "",
+    ): Int {
+        val normalizedGroup = normalizeNodeGroup(group)
+        require(normalizedGroup.isBlank() || normalizedGroup in mutableState.value.nodeGroups) {
+            "导入分组不存在"
+        }
         val sourceId = "manual-${UUID.randomUUID()}"
         val imported = SubscriptionParser.parse(content, sourceId, sourceName)
+            .map { it.copy(group = normalizedGroup) }
         if (imported.isEmpty()) error("没有识别到可用节点")
         mergeNodes(imported)
         return imported.size
     }
 
-    suspend fun addSubscription(name: String, url: String): Int = withContext(Dispatchers.IO) {
+    suspend fun addSubscription(
+        name: String,
+        url: String,
+        group: String = "",
+    ): Int = withContext(Dispatchers.IO) {
         val current = mutableState.value
         val existing = current.subscriptions.firstOrNull { it.url == url }
+        val selectedGroup = normalizeNodeGroup(group).ifBlank { existing?.group.orEmpty() }
+        require(selectedGroup.isBlank() || selectedGroup in current.nodeGroups) {
+            "订阅分组不存在"
+        }
         val sourceId = existing?.id ?: UUID.randomUUID().toString()
         val content = SubscriptionParser.fetch(url)
         val displayName = name.trim().ifBlank { URLName.from(url) }
         val imported = SubscriptionParser.parse(content, sourceId, displayName)
         if (imported.isEmpty()) error("订阅中没有识别到可用节点")
+        val previousGroups = current.nodes
+            .filter { it.sourceId == sourceId && it.group.isNotBlank() }
+            .associate { it.name to it.group }
+        val groupedImported = imported.map {
+            it.copy(group = previousGroups[it.name] ?: selectedGroup)
+        }
         val retained = current.nodes.filterNot { it.sourceId == sourceId }
-        val nodes = uniqueNames(retained + imported)
+        val nodes = uniqueNames(retained + groupedImported)
         val subscription = Subscription(
             id = sourceId,
             name = displayName,
             url = url,
             updatedAt = OffsetDateTime.now().toString(),
             nodeCount = imported.size,
+            group = selectedGroup,
         )
         val subscriptions = current.subscriptions.filterNot { it.id == sourceId } + subscription
         val selected = current.selectedNodeId.takeIf { id -> nodes.any { it.id == id } } ?: nodes.first().id
@@ -104,7 +196,7 @@ class AppRepository private constructor(private val context: Context) {
     suspend fun refreshSubscription(id: String): Int {
         val subscription = mutableState.value.subscriptions.firstOrNull { it.id == id }
             ?: error("订阅不存在")
-        return addSubscription(subscription.name, subscription.url)
+        return addSubscription(subscription.name, subscription.url, subscription.group)
     }
 
     fun deleteSubscription(id: String) {
@@ -178,6 +270,7 @@ class AppRepository private constructor(private val context: Context) {
                     .put("id", node.id)
                     .put("sourceId", node.sourceId)
                     .put("sourceName", node.sourceName)
+                    .put("group", node.group)
                     .put("config", node.raw),
             )
         }
@@ -188,7 +281,8 @@ class AppRepository private constructor(private val context: Context) {
                     .put("id", item.id)
                     .put("name", item.name)
                     .put("url", item.url)
-                    .put("updatedAt", item.updatedAt),
+                    .put("updatedAt", item.updatedAt)
+                    .put("group", item.group),
             )
         }
         val rules = JSONArray()
@@ -219,6 +313,7 @@ class AppRepository private constructor(private val context: Context) {
                     ),
             )
             .put("selectedNodeId", state.selectedNodeId)
+            .put("nodeGroups", JSONArray(state.nodeGroups))
             .put("nodes", nodes)
             .put("subscriptions", subscriptions)
             .put("rules", rules)
@@ -231,6 +326,14 @@ class AppRepository private constructor(private val context: Context) {
             "不是 Network Manager 跨设备配置"
         }
         require(root.optInt("version") == 1) { "暂不支持这个配置版本" }
+        val groupsArray = root.optJSONArray("nodeGroups") ?: JSONArray()
+        val nodeGroups = buildList {
+            repeat(groupsArray.length()) { index ->
+                normalizeNodeGroup(groupsArray.optString(index)).takeIf(String::isNotBlank)?.let {
+                    if (it !in this) add(it)
+                }
+            }
+        }.toMutableList()
         val nodesArray = root.optJSONArray("nodes") ?: JSONArray()
         require(nodesArray.length() <= 5_000) { "节点数量超过限制" }
         val nodes = List(nodesArray.length()) { index ->
@@ -241,41 +344,45 @@ class AppRepository private constructor(private val context: Context) {
             require(config.optString("type").isNotBlank()) { "节点 $name 缺少协议类型" }
             require(config.optString("server").isNotBlank()) { "节点 $name 缺少服务器" }
             require(config.optInt("port") in 1..65535) { "节点 $name 端口无效" }
+            val group = normalizeNodeGroup(item.optString("group"))
+            if (group.isNotBlank() && group !in nodeGroups) nodeGroups.add(group)
             ProxyNode(
                 id = item.optString("id").ifBlank { UUID.randomUUID().toString() },
                 name = name,
                 sourceId = item.optString("sourceId"),
                 sourceName = item.optString("sourceName").ifBlank { "跨设备导入" },
                 rawJson = config.toString(),
+                group = group,
             )
         }.let(::uniqueNames)
         val subscriptionsArray = root.optJSONArray("subscriptions") ?: JSONArray()
         require(subscriptionsArray.length() <= 500) { "订阅数量超过限制" }
         val subscriptions = List(subscriptionsArray.length()) { index ->
             val item = subscriptionsArray.getJSONObject(index)
+            val group = normalizeNodeGroup(item.optString("group"))
+            if (group.isNotBlank() && group !in nodeGroups) nodeGroups.add(group)
             Subscription(
                 id = item.optString("id").ifBlank { UUID.randomUUID().toString() },
                 name = item.optString("name").ifBlank { "订阅" },
                 url = item.optString("url"),
                 updatedAt = item.optString("updatedAt"),
                 nodeCount = nodes.count { node -> node.sourceId == item.optString("id") },
+                group = group,
             )
         }.filter { it.url.isNotBlank() }
         val rulesArray = root.optJSONArray("rules") ?: JSONArray()
         require(rulesArray.length() <= 5_000) { "规则数量超过限制" }
-        val supportedTypes = setOf("domain", "domain_suffix", "domain_keyword", "ip_cidr")
         val rules = List(rulesArray.length()) { index ->
             val item = rulesArray.getJSONObject(index)
             val type = item.optString("type").lowercase()
             val value = item.optString("value").trim()
-            require(type in supportedTypes && value.isNotBlank()) { "第 ${index + 1} 条规则无效" }
-            PortableRule(
+            portableRulesFromValues(
                 type = type,
-                value = value,
+                values = listOf(value),
                 target = item.optString("target").toFallbackTarget(),
                 enabled = item.optBoolean("enabled", true),
                 note = item.optString("note"),
-            )
+            ).singleOrNull() ?: error("第 ${index + 1} 条规则无效")
         }
         val routing = root.optJSONObject("routing") ?: JSONObject()
         val common = routing.optJSONObject("commonOverseas") ?: JSONObject()
@@ -292,6 +399,7 @@ class AppRepository private constructor(private val context: Context) {
                 fallbackTarget = routing.optString("fallback").toFallbackTarget(),
                 selectedNodeId = selected,
                 nodes = nodes,
+                nodeGroups = nodeGroups,
                 subscriptions = subscriptions,
                 ruleGroup = defaultOverseasRuleGroup().copy(enabled = common.optBoolean("enabled", true)),
                 commonRuleTarget = common.optString("target", "proxy").toFallbackTarget(),
@@ -372,6 +480,7 @@ class AppRepository private constructor(private val context: Context) {
                     .put("sourceId", node.sourceId)
                     .put("sourceName", node.sourceName)
                     .put("rawJson", node.rawJson)
+                    .put("group", node.group)
                     .put("latencyMs", node.latencyMs ?: JSONObject.NULL)
                     .put("latencyStatus", node.latencyStatus.name),
             )
@@ -384,13 +493,15 @@ class AppRepository private constructor(private val context: Context) {
                     .put("name", item.name)
                     .put("url", item.url)
                     .put("updatedAt", item.updatedAt)
-                    .put("nodeCount", item.nodeCount),
+                    .put("nodeCount", item.nodeCount)
+                    .put("group", item.group),
             )
         }
         preferences.edit()
             .putString("nodes", nodes.toString())
             .putString("subscriptions", subscriptions.toString())
             .putString("selectedNodeId", state.selectedNodeId)
+            .putString("nodeGroups", JSONArray(state.nodeGroups).toString())
             .putString("mode", state.mode.name)
             .putString("fallback", state.fallbackTarget.name)
             .putBoolean("ruleGroupEnabled", state.ruleGroup.enabled)
@@ -424,6 +535,7 @@ class AppRepository private constructor(private val context: Context) {
                     sourceId = item.getString("sourceId"),
                     sourceName = item.getString("sourceName"),
                     rawJson = item.getString("rawJson"),
+                    group = normalizeNodeGroup(item.optString("group")),
                     latencyMs = item.optInt("latencyMs").takeIf { !item.isNull("latencyMs") },
                     latencyStatus = runCatching { LatencyStatus.valueOf(item.optString("latencyStatus")) }
                         .getOrDefault(LatencyStatus.Idle),
@@ -440,11 +552,18 @@ class AppRepository private constructor(private val context: Context) {
                     url = item.getString("url"),
                     updatedAt = item.optString("updatedAt"),
                     nodeCount = item.optInt("nodeCount"),
+                    group = normalizeNodeGroup(item.optString("group")),
                 )
             }
         }.getOrDefault(emptyList())
         val selected = preferences.getString("selectedNodeId", "").orEmpty()
             .takeIf { id -> nodes.any { it.id == id } } ?: nodes.firstOrNull()?.id.orEmpty()
+        val nodeGroups = runCatching {
+            val array = JSONArray(preferences.getString("nodeGroups", "[]"))
+            List(array.length()) { index -> normalizeNodeGroup(array.optString(index)) }
+                .filter(String::isNotBlank)
+                .distinct()
+        }.getOrDefault(emptyList())
         val portableRules = runCatching {
             val array = JSONArray(preferences.getString("portableRules", "[]"))
             List(array.length()) { index ->
@@ -464,6 +583,11 @@ class AppRepository private constructor(private val context: Context) {
             fallbackTarget = enumPreference("fallback", FallbackTarget.Direct),
             selectedNodeId = selected,
             nodes = nodes,
+            nodeGroups = (
+                nodeGroups +
+                    nodes.mapNotNull { it.group.takeIf(String::isNotBlank) } +
+                    subscriptions.mapNotNull { it.group.takeIf(String::isNotBlank) }
+            ).distinct(),
             subscriptions = subscriptions,
             ruleGroup = defaultOverseasRuleGroup().copy(
                 enabled = preferences.getBoolean("ruleGroupEnabled", true),

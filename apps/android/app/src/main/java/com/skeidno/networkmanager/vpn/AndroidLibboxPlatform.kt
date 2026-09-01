@@ -1,11 +1,14 @@
 package com.skeidno.networkmanager.vpn
 
 import android.net.ConnectivityManager
+import android.net.DnsResolver
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Build
+import android.os.CancellationSignal
 import android.os.Process
+import android.system.ErrnoException
 import android.system.OsConstants
 import android.util.Base64
 import io.nekohasekai.libbox.ConnectionOwner
@@ -18,16 +21,24 @@ import io.nekohasekai.libbox.PlatformInterface
 import io.nekohasekai.libbox.StringIterator
 import io.nekohasekai.libbox.TunOptions
 import io.nekohasekai.libbox.WIFIState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asExecutor
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.suspendCancellableCoroutine
 import java.net.Inet6Address
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.security.KeyStore
 import java.security.cert.X509Certificate
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import io.nekohasekai.libbox.NetworkInterface as BoxNetworkInterface
 
 class AndroidLibboxPlatform(private val service: NetworkVpnService) : PlatformInterface {
     private val connectivity = service.getSystemService(ConnectivityManager::class.java)
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var underlyingNetwork: Network? = null
+    private val localResolver = AndroidLocalResolver(::currentUnderlyingNetwork)
 
     override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
 
@@ -64,27 +75,74 @@ class AndroidLibboxPlatform(private val service: NetworkVpnService) : PlatformIn
     override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
         closeDefaultInterfaceMonitor(listener)
         val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = notifyDefaultNetwork(listener, network)
+            override fun onAvailable(network: Network) {
+                underlyingNetwork = chooseUnderlyingNetwork(network)
+                underlyingNetwork?.let { notifyDefaultNetwork(listener, it) }
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities,
+            ) {
+                if (!isUnderlyingNetwork(networkCapabilities)) return
+                underlyingNetwork = chooseUnderlyingNetwork(network)
+                underlyingNetwork?.let { notifyDefaultNetwork(listener, it) }
+            }
+
             override fun onLinkPropertiesChanged(network: Network, linkProperties: android.net.LinkProperties) =
-                notifyDefaultNetwork(listener, network)
-            override fun onLost(network: Network) = listener.updateDefaultInterface("", -1, false, false)
+                if (network == underlyingNetwork) notifyDefaultNetwork(listener, network) else Unit
+
+            override fun onLost(network: Network) {
+                if (network != underlyingNetwork) return
+                underlyingNetwork = findUnderlyingNetwork()
+                underlyingNetwork?.let { notifyDefaultNetwork(listener, it) }
+                    ?: listener.updateDefaultInterface("", -1, false, false)
+            }
         }
         networkCallback = callback
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            connectivity.registerDefaultNetworkCallback(callback)
-        } else {
-            connectivity.registerNetworkCallback(
-                NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(),
-                callback,
-            )
-        }
-        connectivity.activeNetwork?.let { notifyDefaultNetwork(listener, it) }
+        connectivity.registerNetworkCallback(
+            NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build(),
+            callback,
+        )
+        underlyingNetwork = findUnderlyingNetwork()
+        underlyingNetwork?.let { notifyDefaultNetwork(listener, it) }
     }
 
     override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
         networkCallback?.let { runCatching { connectivity.unregisterNetworkCallback(it) } }
         networkCallback = null
+        underlyingNetwork = null
     }
+
+    private fun currentUnderlyingNetwork(): Network =
+        underlyingNetwork?.takeIf { network ->
+            connectivity.getNetworkCapabilities(network)?.let(::isUnderlyingNetwork) == true
+        } ?: findUnderlyingNetwork()?.also { underlyingNetwork = it }
+        ?: error("没有可用的底层网络")
+
+    private fun chooseUnderlyingNetwork(candidate: Network): Network =
+        findUnderlyingNetwork() ?: candidate
+
+    private fun findUnderlyingNetwork(): Network? = connectivity.allNetworks
+        .filter { network ->
+            connectivity.getNetworkCapabilities(network)?.let(::isUnderlyingNetwork) == true
+        }
+        .maxByOrNull { network ->
+            val capabilities = connectivity.getNetworkCapabilities(network) ?: return@maxByOrNull 0
+            when {
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) -> 2
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) -> 1
+                else -> 0
+            }
+        }
+
+    private fun isUnderlyingNetwork(capabilities: NetworkCapabilities): Boolean =
+        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+            !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
 
     private fun notifyDefaultNetwork(listener: InterfaceUpdateListener, network: Network) {
         val name = connectivity.getLinkProperties(network)?.interfaceName.orEmpty()
@@ -129,7 +187,7 @@ class AndroidLibboxPlatform(private val service: NetworkVpnService) : PlatformIn
     override fun includeAllNetworks(): Boolean = false
     override fun clearDNSCache() = Unit
     override fun readWIFIState(): WIFIState? = null
-    override fun localDNSTransport(): LocalDNSTransport? = null
+    override fun localDNSTransport(): LocalDNSTransport = localResolver
     override fun sendNotification(notification: Notification) = Unit
 
     override fun systemCertificates(): StringIterator {
@@ -151,9 +209,131 @@ class AndroidLibboxPlatform(private val service: NetworkVpnService) : PlatformIn
         override fun next(): BoxNetworkInterface = iterator.next()
     }
 
-    class StringArray(private val iterator: Iterator<String>) : StringIterator {
-        override fun hasNext(): Boolean = iterator.hasNext()
-        override fun len(): Int = 0
-        override fun next(): String = iterator.next()
+    class StringArray(iterator: Iterator<String>) : StringIterator {
+        private val values = iterator.asSequence().toList()
+        private var index = 0
+
+        override fun hasNext(): Boolean = index < values.size
+        override fun len(): Int = values.size
+        override fun next(): String = values[index++]
+    }
+
+    private class AndroidLocalResolver(
+        private val networkProvider: () -> Network,
+    ) : LocalDNSTransport {
+        override fun raw(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+
+        override fun exchange(context: io.nekohasekai.libbox.ExchangeContext, message: ByteArray) {
+            check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+            val network = networkProvider()
+            runBlocking {
+                suspendCancellableCoroutine { continuation ->
+                    val signal = CancellationSignal()
+                    context.onCancel {
+                        signal.cancel()
+                        continuation.cancel()
+                    }
+                    continuation.invokeOnCancellation { signal.cancel() }
+                    DnsResolver.getInstance().rawQuery(
+                        network,
+                        message,
+                        DnsResolver.FLAG_NO_RETRY,
+                        Dispatchers.IO.asExecutor(),
+                        signal,
+                        object : DnsResolver.Callback<ByteArray> {
+                            override fun onAnswer(answer: ByteArray, rcode: Int) {
+                                if (rcode == 0) context.rawSuccess(answer) else context.errorCode(rcode)
+                                if (continuation.isActive) continuation.resume(Unit)
+                            }
+
+                            override fun onError(error: DnsResolver.DnsException) {
+                                val cause = error.cause
+                                if (cause is ErrnoException) {
+                                    context.errnoCode(cause.errno)
+                                    if (continuation.isActive) continuation.resume(Unit)
+                                } else if (continuation.isActive) {
+                                    continuation.resumeWithException(error)
+                                }
+                            }
+                        },
+                    )
+                }
+            }
+        }
+
+        override fun lookup(
+            context: io.nekohasekai.libbox.ExchangeContext,
+            networkName: String,
+            domain: String,
+        ) {
+            val network = networkProvider()
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                runCatching { network.getAllByName(domain) }
+                    .onSuccess { addresses ->
+                        context.success(addresses.mapNotNull { it.hostAddress }.joinToString("\n"))
+                    }
+                    .onFailure { context.errorCode(RCODE_NXDOMAIN) }
+                return
+            }
+            runBlocking {
+                suspendCancellableCoroutine { continuation ->
+                    val signal = CancellationSignal()
+                    context.onCancel {
+                        signal.cancel()
+                        continuation.cancel()
+                    }
+                    continuation.invokeOnCancellation { signal.cancel() }
+                    val callback = object : DnsResolver.Callback<Collection<java.net.InetAddress>> {
+                        override fun onAnswer(answer: Collection<java.net.InetAddress>, rcode: Int) {
+                            if (rcode == 0) {
+                                context.success(answer.mapNotNull { it.hostAddress }.joinToString("\n"))
+                            } else {
+                                context.errorCode(rcode)
+                            }
+                            if (continuation.isActive) continuation.resume(Unit)
+                        }
+
+                        override fun onError(error: DnsResolver.DnsException) {
+                            val cause = error.cause
+                            if (cause is ErrnoException) {
+                                context.errnoCode(cause.errno)
+                                if (continuation.isActive) continuation.resume(Unit)
+                            } else if (continuation.isActive) {
+                                continuation.resumeWithException(error)
+                            }
+                        }
+                    }
+                    val type = when {
+                        networkName.endsWith("4") -> DnsResolver.TYPE_A
+                        networkName.endsWith("6") -> DnsResolver.TYPE_AAAA
+                        else -> null
+                    }
+                    if (type == null) {
+                        DnsResolver.getInstance().query(
+                            network,
+                            domain,
+                            DnsResolver.FLAG_NO_RETRY,
+                            Dispatchers.IO.asExecutor(),
+                            signal,
+                            callback,
+                        )
+                    } else {
+                        DnsResolver.getInstance().query(
+                            network,
+                            domain,
+                            type,
+                            DnsResolver.FLAG_NO_RETRY,
+                            Dispatchers.IO.asExecutor(),
+                            signal,
+                            callback,
+                        )
+                    }
+                }
+            }
+        }
+
+        companion object {
+            private const val RCODE_NXDOMAIN = 3
+        }
     }
 }

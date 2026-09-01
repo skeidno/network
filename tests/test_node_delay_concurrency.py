@@ -36,6 +36,32 @@ def test_individual_node_tests_complete_independently() -> None:
     assert notifications == [("success", "Two：86 ms"), ("success", "One：104 ms")]
 
 
+def test_failed_node_test_surfaces_actionable_diagnostic() -> None:
+    notifications: list[tuple[str, str]] = []
+    bridge = SimpleNamespace(
+        _node_delay_lock=Lock(),
+        _node_delays={"Proxy": {"status": "testing", "delay": None}},
+        _node_test_pending={"Proxy": 7},
+        _node_batch_generation=None,
+        _node_batch_pending=set(),
+        _notify=lambda level, message: notifications.append((level, message)),
+    )
+    result: Future[dict[str, object]] = Future()
+    result.set_result(
+        {
+            "status": "error",
+            "delay": None,
+            "message": "代理供应商拒绝当前公网 IP，请添加白名单",
+        }
+    )
+
+    WebBridge._node_delay_finished(bridge, 7, "Proxy", result)
+
+    assert notifications == [
+        ("error", "Proxy：代理供应商拒绝当前公网 IP，请添加白名单")
+    ]
+
+
 def test_delete_error_nodes_preserves_subscription_and_selects_remaining_node() -> None:
     config = default_config()
     config.imported_nodes = prepare_imported_nodes(

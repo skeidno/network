@@ -4,9 +4,13 @@ __pycache__/
 .ruff_cache/
 .smoke-data/
 .venv/
+.cache/
+.tmp/
 *.egg-info/
 build/
 dist/
+build-*/
+dist-*/
 build-next/
 dist-next/
 build-repair/

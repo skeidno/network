@@ -1,6 +1,7 @@
 import json
 from threading import Lock
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from network_manager.models import ImportedNode, SshServerProfile, default_config
 from network_manager.server_deployer import deployment_source_id
@@ -126,6 +127,50 @@ def test_successful_server_deployment_reloads_running_core() -> None:
     assert bridge.window.applied == 1
 
 
+def test_server_deployment_warns_when_remote_service_has_no_public_port() -> None:
+    profile = SshServerProfile("server-1", "Test server", "192.0.2.1")
+    bridge = FakeBridge(profile)
+    payload = json.loads(deployment_payload(profile))
+    payload["publicReachable"] = False
+    payload["publicError"] = "公网连接超时"
+
+    WebBridge._server_deploy_finished(
+        bridge,
+        profile.profile_id,
+        True,
+        "deployed",
+        json.dumps(payload),
+        "",
+    )
+
+    assert profile.proxy_reachable is False
+    assert profile.proxy_reachability_error == "公网连接超时"
+    assert bridge._deployment_states[profile.profile_id]["status"] == "warning"
+    assert bridge.notifications[-1][0] == "error"
+    assert "云安全组" in bridge.notifications[-1][1]
+
+
+def test_reused_remote_service_restores_missing_local_node() -> None:
+    profile = SshServerProfile("server-1", "Test server", "192.0.2.1", proxy_port=443)
+    bridge = FakeBridge(profile, core_running=True)
+    payload = json.loads(deployment_payload(profile))
+    payload["reused"] = True
+
+    WebBridge._server_deploy_finished(
+        bridge,
+        profile.profile_id,
+        True,
+        "remote service reused",
+        json.dumps(payload),
+        "",
+    )
+
+    assert profile.deployed_node_id
+    assert bridge.window.config.imported_nodes[0].config["port"] == 443
+    assert bridge.window.config.selected_node == profile.name
+    assert bridge.window.applied == 1
+
+
 def test_failed_server_deployment_does_not_persist_credential_or_node() -> None:
     profile = SshServerProfile("server-1", "Test server", "192.0.2.1")
     bridge = FakeBridge(profile)
@@ -141,11 +186,12 @@ def test_failed_server_deployment_does_not_persist_credential_or_node() -> None:
     assert bridge.notifications == [("error", "failed")]
 
 
-def test_editing_deployed_endpoint_removes_old_node_and_reloads_core() -> None:
+def test_changing_deployed_443_port_removes_old_node_before_redeploy() -> None:
     profile = SshServerProfile(
         "server-1",
         "Test server",
         "192.0.2.1",
+        proxy_port=443,
         deployed_node_id="node-1",
         deployed_at="2026-08-30T12:00:00+08:00",
         deployed_version="sing-box version 1.13.20",
@@ -170,7 +216,7 @@ def test_editing_deployed_endpoint_removes_old_node_and_reloads_core() -> None:
         {
             "profileId": profile.profile_id,
             "name": profile.name,
-            "host": "192.0.2.2",
+            "host": "192.0.2.1",
             "port": 22,
             "username": "root",
             "authMethod": "password",
@@ -182,13 +228,38 @@ def test_editing_deployed_endpoint_removes_old_node_and_reloads_core() -> None:
     WebBridge.saveSshServer(bridge, payload, "")
 
     updated = bridge.window.config.ssh_servers[0]
-    assert updated.host == "192.0.2.2"
+    assert updated.host == "192.0.2.1"
     assert updated.proxy_port == 24444
     assert updated.deployed_node_id == ""
     assert bridge.window.config.imported_nodes == []
     assert bridge.window.config.selected_node == ""
     assert bridge.window.applied == 1
     assert bridge.notifications == [("success", "服务器登录配置已保存")]
+
+
+def test_saving_explicit_common_server_proxy_port_is_allowed() -> None:
+    profile = SshServerProfile("server-1", "Test server", "192.0.2.1")
+    bridge = FakeBridge(profile)
+    payload = json.dumps(
+        {
+            "profileId": profile.profile_id,
+            "name": profile.name,
+            "host": profile.host,
+            "port": 22,
+            "username": "root",
+            "authMethod": "password",
+            "rememberPassword": False,
+            "proxyPort": 443,
+        }
+    )
+
+    WebBridge.saveSshServer(bridge, payload, "")
+
+    updated = bridge.window.config.ssh_servers[0]
+    assert updated.proxy_port == 443
+    assert updated.deployed_node_id == ""
+    assert bridge.window.applied == 1
+    assert bridge.notifications[-1] == ("success", "服务器登录配置已保存")
 
 
 def test_fallback_rule_target_is_persisted() -> None:
@@ -216,7 +287,11 @@ def test_existing_active_server_service_is_reused_without_deploying() -> None:
 
     class ExistingServiceDeployer:
         def inspect(self, _profile, _credential):
-            return {"status": "active", "version": "sing-box version 1.13.20"}
+            return {
+                "status": "active",
+                "version": "sing-box version 1.13.20",
+                "nodeConfig": node_config,
+            }
 
         def deploy(self, *_args, **_kwargs):
             raise AssertionError("active remote service must not be redeployed")
@@ -232,16 +307,67 @@ def test_existing_active_server_service_is_reused_without_deploying() -> None:
     }
     stages: list[str] = []
 
-    result = WebBridge._deploy_server_if_needed(
-        bridge,
-        profile,
-        "credential",
-        node_config,
-        profile.deployed_at,
-        stages.append,
-    )
+    with patch(
+        "network_manager.ui.web_window.check_public_tcp_endpoint",
+        return_value=(True, ""),
+    ):
+        result = WebBridge._deploy_server_if_needed(
+            bridge,
+            profile,
+            "credential",
+            node_config,
+            profile.deployed_at,
+            stages.append,
+        )
 
     assert result.reused is True
     assert result.node_config == node_config
     assert result.deployed_at == profile.deployed_at
-    assert stages == ["正在检查远端代理服务"]
+    assert stages == ["正在检查远端代理服务", "正在验证公网代理端口"]
+    assert result.public_reachable is True
+
+
+def test_existing_active_server_is_discovered_without_local_node() -> None:
+    profile = SshServerProfile("server-1", "Test server", "192.0.2.1", proxy_port=443)
+    bridge = FakeBridge(profile)
+    node_config = {
+        "name": profile.name,
+        "type": "ss",
+        "server": profile.host,
+        "port": profile.proxy_port,
+        "cipher": "2022-blake3-aes-128-gcm",
+        "password": "base64-password",
+        "udp": True,
+    }
+
+    class ExistingServiceDeployer:
+        def inspect(self, _profile, _credential):
+            return {
+                "status": "active",
+                "version": "sing-box version 1.13.20",
+                "nodeConfig": node_config,
+            }
+
+        def deploy(self, *_args, **_kwargs):
+            raise AssertionError("discovered active service must not be redeployed")
+
+    bridge.window.server_deployer = ExistingServiceDeployer()
+    stages: list[str] = []
+
+    with patch(
+        "network_manager.ui.web_window.check_public_tcp_endpoint",
+        return_value=(True, ""),
+    ):
+        result = WebBridge._deploy_server_if_needed(
+            bridge,
+            profile,
+            "credential",
+            None,
+            "",
+            stages.append,
+        )
+
+    assert result.reused is True
+    assert result.node_config == node_config
+    assert result.deployed_at
+    assert stages == ["正在查找远端现有代理服务", "正在验证公网代理端口"]

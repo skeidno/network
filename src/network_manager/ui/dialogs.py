@@ -150,7 +150,7 @@ class ImportDialog(QDialog):
         self.paste_name = QLineEdit("手动导入")
         self.paste_content = QPlainTextEdit()
         self.paste_content.setPlaceholderText(
-            "粘贴 Clash YAML，或每行一个 vmess://、vless://、trojan://、ss:// 地址"
+            "粘贴 Clash YAML、分享链接，或每行一个 主机:端口:用户名:密码 代理 IP"
         )
         paste_page = QWidget()
         paste_layout = QVBoxLayout(paste_page)

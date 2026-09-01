@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import queue
+import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -15,6 +17,8 @@ from network_manager.windows_job import WindowsJob
 
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+LINUX_SSH_RULE_PRIORITY_BASE = 8990
+LINUX_SSH_PORTS_ENV = "NETWORK_MANAGER_SSH_PORTS"
 
 
 class CoreStartError(RuntimeError):
@@ -32,6 +36,7 @@ class CoreManager:
         self._job: WindowsJob | None = None
         self._operation_lock = threading.RLock()
         self._tun_ready = threading.Event()
+        self._linux_ssh_route_rules: list[tuple[str, int, int]] = []
 
     @property
     def is_running(self) -> bool:
@@ -79,6 +84,9 @@ class CoreManager:
             if not valid:
                 raise CoreStartError(output or "Mihomo 配置检查未通过")
             self.work_dir.mkdir(parents=True, exist_ok=True)
+            tun_required = _config_uses_tun(config_path)
+            if tun_required:
+                self._linux_ssh_route_rules = _install_linux_ssh_route_guard()
             command = [
                 str(self.executable),
                 "-d",
@@ -87,7 +95,6 @@ class CoreManager:
                 str(config_path),
             ]
             self._tun_ready.clear()
-            tun_required = _config_uses_tun(config_path)
             try:
                 self.process = subprocess.Popen(
                     command,
@@ -101,6 +108,8 @@ class CoreManager:
                 )
             except OSError as exc:
                 self.process = None
+                _remove_linux_ssh_route_guard(self._linux_ssh_route_rules)
+                self._linux_ssh_route_rules = []
                 raise CoreStartError(f"无法启动 Mihomo：{exc}") from exc
 
             self._job = WindowsJob()
@@ -169,6 +178,8 @@ class CoreManager:
             if self._job is not None:
                 self._job.close()
                 self._job = None
+            _remove_linux_ssh_route_guard(self._linux_ssh_route_rules)
+            self._linux_ssh_route_rules = []
             self._tun_ready.clear()
             self._put_log("[Manager] TUN 核心已停止")
 
@@ -226,3 +237,108 @@ def _config_uses_tun(config_path: Path) -> bool:
     if not isinstance(payload, dict):
         return True
     return bool(payload.get("tun", {}).get("enable", False))
+
+
+def _linux_ssh_ports() -> list[int]:
+    raw_ports = os.environ.get(LINUX_SSH_PORTS_ENV, "22")
+    ports: list[int] = []
+    for raw_port in raw_ports.replace(",", " ").split():
+        try:
+            port = int(raw_port)
+        except ValueError:
+            continue
+        if 1 <= port <= 65535 and port not in ports:
+            ports.append(port)
+        if len(ports) >= 8:
+            break
+    return ports
+
+
+def _install_linux_ssh_route_guard() -> list[tuple[str, int, int]]:
+    """Keep established SSH sessions outside Mihomo's auto-route table."""
+    if not sys.platform.startswith("linux"):
+        return []
+    ip_command = shutil.which("ip")
+    if not ip_command:
+        raise CoreStartError("启动 TUN 前无法建立 SSH 路由保护：缺少 iproute2")
+
+    rules: list[tuple[str, int, int]] = []
+    families = ["-4"]
+    if _run_ip_rule([ip_command, "-6", "rule", "show"]).returncode == 0:
+        families.append("-6")
+    try:
+        for family in families:
+            for index, port in enumerate(_linux_ssh_ports()):
+                priority = LINUX_SSH_RULE_PRIORITY_BASE + index
+                spec = (family, priority, port)
+                _remove_linux_ssh_rule(ip_command, spec)
+                result = _run_ip_rule(
+                    [
+                        ip_command,
+                        family,
+                        "rule",
+                        "add",
+                        "priority",
+                        str(priority),
+                        "ipproto",
+                        "tcp",
+                        "sport",
+                        str(port),
+                        "lookup",
+                        "main",
+                    ]
+                )
+                if result.returncode != 0:
+                    detail = result.stderr.strip() or result.stdout.strip()
+                    raise CoreStartError(
+                        f"无法保护 SSH 端口 {port} 的现有连接：{detail or 'ip rule 执行失败'}"
+                    )
+                rules.append(spec)
+    except Exception:
+        _remove_linux_ssh_route_guard(rules, ip_command=ip_command)
+        raise
+    return rules
+
+
+def _remove_linux_ssh_route_guard(
+    rules: list[tuple[str, int, int]], *, ip_command: str | None = None
+) -> None:
+    if not rules or not sys.platform.startswith("linux"):
+        return
+    command = ip_command or shutil.which("ip")
+    if not command:
+        return
+    for rule in reversed(rules):
+        _remove_linux_ssh_rule(command, rule)
+
+
+def _remove_linux_ssh_rule(ip_command: str, rule: tuple[str, int, int]) -> None:
+    family, priority, port = rule
+    _run_ip_rule(
+        [
+            ip_command,
+            family,
+            "rule",
+            "del",
+            "priority",
+            str(priority),
+            "ipproto",
+            "tcp",
+            "sport",
+            str(port),
+            "lookup",
+            "main",
+        ]
+    )
+
+
+def _run_ip_rule(command: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=5,
+        check=False,
+    )

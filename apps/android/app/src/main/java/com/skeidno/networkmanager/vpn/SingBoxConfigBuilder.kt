@@ -8,6 +8,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 object SingBoxConfigBuilder {
+    private const val nodeDialerProxyKey = "_network-manager-dialer-proxy"
     private val lanDomainSuffixes = listOf("lan", "local", "home.arpa")
     private val lanCidrs = listOf(
         "0.0.0.0/8",
@@ -30,8 +31,9 @@ object SingBoxConfigBuilder {
         val selected = state.nodes.firstOrNull { it.id == state.selectedNodeId }
             ?: state.nodes.firstOrNull()
         val orderedNodes = state.nodes.sortedByDescending { it.id == selected?.id }
+        val nodeIdsByName = state.nodes.associate { it.name to it.id }
         val outbounds = JSONArray()
-        orderedNodes.forEach { outbounds.put(toOutbound(it)) }
+        orderedNodes.forEach { outbounds.put(toOutbound(it, nodeIdsByName)) }
         if (orderedNodes.isNotEmpty()) {
             outbounds.put(
                 JSONObject()
@@ -40,16 +42,18 @@ object SingBoxConfigBuilder {
                     .put("outbounds", JSONArray(orderedNodes.map { it.id }))
                     .put("default", selected?.id ?: orderedNodes.first().id),
             )
-            outbounds.put(
-                JSONObject()
-                    .put("type", "urltest")
-                    .put("tag", "smart")
-                    .put("outbounds", JSONArray(orderedNodes.map { it.id }))
-                    .put("url", "https://www.gstatic.com/generate_204")
-                    .put("interval", "1m")
-                    .put("tolerance", 120)
-                    .put("interrupt_exist_connections", false),
-            )
+            if (state.mode == RoutingMode.Smart) {
+                outbounds.put(
+                    JSONObject()
+                        .put("type", "urltest")
+                        .put("tag", "smart")
+                        .put("outbounds", JSONArray(orderedNodes.map { it.id }))
+                        .put("url", "https://www.gstatic.com/generate_204")
+                        .put("interval", "1m")
+                        .put("tolerance", 120)
+                        .put("interrupt_exist_connections", false),
+                )
+            }
         }
         outbounds.put(JSONObject().put("type", "direct").put("tag", "direct"))
 
@@ -66,6 +70,8 @@ object SingBoxConfigBuilder {
                     .put("ip_cidr", JSONArray(lanCidrs))
                     .put("outbound", "direct"),
             )
+        orderedNodes.mapNotNull { proxyEndpointRelayRule(it, nodeIdsByName) }
+            .forEach(rules::put)
         if (state.ruleGroup.enabled) {
             val commonOutbound = if (
                 state.commonRuleTarget == FallbackTarget.Proxy && orderedNodes.isNotEmpty()
@@ -78,6 +84,7 @@ object SingBoxConfigBuilder {
         }
         state.portableRules.filter { it.enabled }.forEach { rule ->
             val field = when (rule.type) {
+                "package_name" -> "package_name"
                 "domain" -> "domain"
                 "domain_suffix" -> "domain_suffix"
                 "domain_keyword" -> "domain_keyword"
@@ -139,7 +146,10 @@ object SingBoxConfigBuilder {
             .toString(2)
     }
 
-    internal fun toOutbound(node: ProxyNode): JSONObject {
+    internal fun toOutbound(
+        node: ProxyNode,
+        nodeIdsByName: Map<String, String> = emptyMap(),
+    ): JSONObject {
         val raw = node.raw
         val type = raw.optString("type").lowercase()
         val outbound = JSONObject()
@@ -177,7 +187,33 @@ object SingBoxConfigBuilder {
                 )
             }
         }
+        raw.optString(nodeDialerProxyKey)
+            .takeIf { it.isNotBlank() && it != node.name }
+            ?.let(nodeIdsByName::get)
+            ?.let { outbound.put("detour", it) }
         return outbound
+    }
+
+    private fun proxyEndpointRelayRule(
+        node: ProxyNode,
+        nodeIdsByName: Map<String, String>,
+    ): JSONObject? {
+        val raw = node.raw
+        val relayId = raw.optString(nodeDialerProxyKey)
+            .takeIf { it.isNotBlank() && it != node.name }
+            ?.let(nodeIdsByName::get)
+            ?: return null
+        val host = raw.optString("server").trim().removePrefix("[").removeSuffix("]")
+        if (host.isBlank()) return null
+        val rule = JSONObject().put("outbound", relayId)
+        return when {
+            host.split('.').size == 4 && host.split('.').all {
+                it.toIntOrNull()?.let { value -> value in 0..255 } == true
+            } -> rule.put("ip_cidr", JSONArray().put("$host/32"))
+            ':' in host && host.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' || it == ':' } ->
+                rule.put("ip_cidr", JSONArray().put("$host/128"))
+            else -> rule.put("domain", JSONArray().put(host.lowercase()))
+        }
     }
 
     private fun addTls(outbound: JSONObject, raw: JSONObject, type: String) {
@@ -194,6 +230,15 @@ object SingBoxConfigBuilder {
                     .put("enabled", true)
                     .put("public_key", reality.optString("public-key"))
                     .put("short_id", reality.optString("short-id")),
+            )
+            tls.put(
+                "utls",
+                JSONObject()
+                    .put("enabled", true)
+                    .put(
+                        "fingerprint",
+                        raw.optString("client-fingerprint").ifBlank { "chrome" },
+                    ),
             )
         }
         outbound.put("tls", tls)

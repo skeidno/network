@@ -38,6 +38,10 @@ class SingBoxConfigBuilderTest {
         assertEquals("proxy", domainRule.getString("outbound"))
         assertEquals(67, domainRule.getJSONArray("domain_suffix").length())
         assertTrue(config.toString().contains("arcteryx.com"))
+        val outbounds = config.getJSONArray("outbounds")
+        assertTrue((0 until outbounds.length()).none {
+            outbounds.getJSONObject(it).optString("type") == "urltest"
+        })
     }
 
     @Test
@@ -88,6 +92,26 @@ class SingBoxConfigBuilderTest {
     }
 
     @Test
+    fun androidApplicationRuleUsesPackageName() {
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(
+                AppState(
+                    selectedNodeId = node.id,
+                    nodes = listOf(node),
+                    portableRules = listOf(
+                        PortableRule("package_name", "com.discord", FallbackTarget.Proxy),
+                    ),
+                ),
+            ),
+        )
+
+        val rules = config.getJSONObject("route").getJSONArray("rules")
+        val appRule = rules.getJSONObject(5)
+        assertEquals("com.discord", appRule.getJSONArray("package_name").getString(0))
+        assertEquals("proxy", appRule.getString("outbound"))
+    }
+
+    @Test
     fun lanTrafficBypassesProxyModeAndTunRoute() {
         val config = JSONObject(
             SingBoxConfigBuilder.build(
@@ -101,5 +125,72 @@ class SingBoxConfigBuilderTest {
         assertTrue(routeRules.getJSONObject(3).getJSONArray("ip_cidr").toString().contains("192.168.0.0/16"))
         val tun = config.getJSONArray("inbounds").getJSONObject(0)
         assertTrue(tun.getJSONArray("route_exclude_address").toString().contains("fc00::/7"))
+    }
+
+    @Test
+    fun authenticatedHttpProxyMapsToSingBoxOutbound() {
+        val httpNode = ProxyNode(
+            id = "http-node",
+            name = "HTTP Proxy proxy.example.com:4600",
+            sourceId = "manual",
+            sourceName = "Manual",
+            rawJson = """{"type":"http","server":"proxy.example.com","port":4600,"username":"user","password":"secret"}""",
+        )
+
+        val outbound = SingBoxConfigBuilder.toOutbound(httpNode)
+
+        assertEquals("http", outbound.getString("type"))
+        assertEquals("proxy.example.com", outbound.getString("server"))
+        assertEquals(4600, outbound.getInt("server_port"))
+        assertEquals("user", outbound.getString("username"))
+        assertEquals("secret", outbound.getString("password"))
+    }
+
+    @Test
+    fun authenticatedHttpProxyCanDetourThroughAnotherNode() {
+        val relay = ProxyNode(
+            id = "relay-node",
+            name = "Overseas server",
+            sourceId = "server",
+            sourceName = "Server deployment",
+            rawJson = """{"type":"socks","server":"198.51.100.20","port":24443}""",
+        )
+        val target = ProxyNode(
+            id = "http-node",
+            name = "Residential HTTP",
+            sourceId = "manual",
+            sourceName = "Manual",
+            rawJson = """{"type":"http","server":"proxy.example.com","port":4600,"username":"user","password":"secret","_network-manager-dialer-proxy":"Overseas server"}""",
+        )
+
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(AppState(nodes = listOf(target, relay))),
+        )
+        val targetOutbound = config.getJSONArray("outbounds").getJSONObject(0)
+
+        assertEquals("relay-node", targetOutbound.getString("detour"))
+        val endpointRule = config.getJSONObject("route").getJSONArray("rules").let { rules ->
+            (0 until rules.length())
+                .map { rules.getJSONObject(it) }
+                .first { it.optJSONArray("domain")?.optString(0) == "proxy.example.com" }
+        }
+        assertEquals("relay-node", endpointRule.getString("outbound"))
+    }
+
+    @Test
+    fun realityOutboundEnablesUtlsWithACompatibleFingerprint() {
+        val realityNode = ProxyNode(
+            id = "reality-node",
+            name = "Reality",
+            sourceId = "test",
+            sourceName = "Test",
+            rawJson = """{"type":"vless","server":"example.com","port":443,"uuid":"id","reality-opts":{"public-key":"key","short-id":"short"}}""",
+        )
+
+        val tls = SingBoxConfigBuilder.toOutbound(realityNode).getJSONObject("tls")
+
+        assertTrue(tls.getJSONObject("reality").getBoolean("enabled"))
+        assertTrue(tls.getJSONObject("utls").getBoolean("enabled"))
+        assertEquals("chrome", tls.getJSONObject("utls").getString("fingerprint"))
     }
 }

@@ -9,6 +9,10 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+  <div id="bootstrap-status" class="bootstrap-status" role="status" aria-live="polite">
+    <span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span>
+    <strong>正在连接后台…</strong>
+  </div>
   <header id="window-titlebar" class="window-titlebar" aria-label="Window controls">
     <div id="window-drag-region" class="window-drag-region">
       <span class="window-app-icon icon" style="--icon:url('./icons/network.svg')"></span>
@@ -46,7 +50,7 @@
         <button class="nav-item" data-page="nodes">
           <span class="icon" style="--icon:url('./icons/server.svg')"></span><span>代理与节点</span>
         </button>
-        <button class="nav-item" data-page="servers">
+        <button id="server-deployment-nav" class="nav-item" data-page="servers">
           <span class="icon" style="--icon:url('./icons/database.svg')"></span><span>服务器部署</span>
         </button>
         <button class="nav-item" data-page="settings">
@@ -75,7 +79,7 @@
           <small>MB</small>
         </div>
       </div>
-      <div class="sidebar-version">v0.4.0 · WebGUI</div>
+      <div id="sidebar-version" class="sidebar-version">v0.5.0 · WebGUI</div>
     </aside>
 
     <main class="main-area">
@@ -132,7 +136,7 @@
                   <div><strong>v2ray</strong><span id="overview-v2ray-endpoint">127.0.0.1:10808</span></div>
                   <span id="overview-v2ray-status" class="source-status">检测中</span>
                 </div>
-                <div class="source-row">
+                <div id="overview-ssh-row" class="source-row">
                   <div><strong>服务器节点</strong><span id="overview-ssh-endpoint">尚未部署</span></div>
                   <span id="overview-ssh-status" class="source-status">未部署</span>
                 </div>
@@ -214,8 +218,9 @@
               <button id="import-file" class="button secondary"><span class="icon" style="--icon:url('./icons/folder-open.svg')"></span><span>配置文件</span></button>
               <button id="test-all-nodes" class="button secondary"><span class="icon" style="--icon:url('./icons/activity.svg')"></span><span>批量测速</span></button>
               <button id="delete-error-nodes" class="button danger" disabled><span class="icon" style="--icon:url('./icons/trash-2.svg')"></span><span>删除 Error</span></button>
+              <button id="manage-node-groups" class="button secondary"><span class="icon" style="--icon:url('./icons/folder-open.svg')"></span><span>分组管理</span></button>
             </div>
-            <div id="node-grid" class="node-grid"></div>
+            <div id="node-grid" class="node-group-list"></div>
             <div id="nodes-empty" class="empty-state is-hidden">暂无已导入节点</div>
           </div>
 
@@ -223,6 +228,7 @@
             <div class="subscription-import">
               <input id="subscription-name" type="text" value="我的订阅" aria-label="订阅名称">
               <input id="subscription-url" type="url" placeholder="粘贴订阅地址" aria-label="订阅地址">
+              <select id="subscription-group" aria-label="订阅分组"><option value="">按订阅来源归类</option></select>
               <button id="add-subscription" class="button primary"><span class="icon" style="--icon:url('./icons/circle-plus.svg')"></span><span>添加</span></button>
               <button id="refresh-subscriptions" class="icon-button" aria-label="刷新全部订阅" title="刷新全部订阅"><span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span></button>
             </div>
@@ -261,12 +267,12 @@
               <div class="switch-list">
                 <label class="switch-row"><span><strong>严格路由</strong><small>减少 DNS 和流量泄漏</small></span><input id="setting-strict-route" type="checkbox"><i></i></label>
                 <label class="switch-row"><span><strong>打开后自动接管</strong><small>软件启动后自动运行核心</small></span><input id="setting-start-on-launch" type="checkbox"><i></i></label>
-                <label class="switch-row"><span><strong>关闭到系统托盘</strong><small>关闭窗口时保持后台运行</small></span><input id="setting-close-to-tray" type="checkbox"><i></i></label>
-                <label class="switch-row"><span><strong>随 Windows 登录启动</strong><small>登录后自动打开网络管理器</small></span><input id="setting-start-with-windows" type="checkbox"><i></i></label>
+                <label class="switch-row desktop-only-setting"><span><strong>关闭后驻留系统托盘</strong><small>仅通过托盘菜单退出程序</small></span><input id="setting-close-to-tray" type="checkbox" checked disabled><i></i></label>
+                <label class="switch-row desktop-only-setting"><span><strong>随 Windows 登录启动</strong><small>登录后自动打开网络管理器</small></span><input id="setting-start-with-windows" type="checkbox"><i></i></label>
               </div>
             </section>
             <section class="panel settings-section">
-              <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/link.svg')"></span></div><div><h2>跨设备配置</h2><p>Windows、Android、macOS 与 iOS 共用同一格式</p></div></div>
+              <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/link.svg')"></span></div><div><h2>跨设备配置</h2><p>Windows、Linux、Android、macOS 与 iOS 共用同一格式</p></div></div>
               <div class="portable-config-row">
                 <div><strong>节点、订阅与分流规则</strong><small>SSH、本机端口和启动行为不会写入导出文件；文件内可能包含节点密码。</small></div>
                 <div class="portable-config-actions">

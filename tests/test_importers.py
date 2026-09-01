@@ -4,10 +4,12 @@ import base64
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
 import requests
 
 from network_manager.importers import (
     fetch_subscription,
+    parse_authenticated_proxy_line,
     parse_import_content,
     parse_share_link,
     prepare_imported_nodes,
@@ -84,6 +86,43 @@ proxies:
     nodes, errors = parse_import_content(encoded)
     assert len(nodes) == 2
     assert errors == []
+
+
+def test_parse_authenticated_http_proxy_line_without_exposing_credentials() -> None:
+    node = parse_authenticated_proxy_line(
+        "proxy.example.com:4600:user-region-br-session-demo:secret-password"
+    )
+
+    assert node == {
+        "name": "HTTP Proxy proxy.example.com:4600",
+        "type": "http",
+        "server": "proxy.example.com",
+        "port": 4600,
+        "username": "user-region-br-session-demo",
+        "password": "secret-password",
+    }
+    assert node["username"] not in node["name"]
+    assert node["password"] not in node["name"]
+
+
+def test_parse_multiple_proxy_lines_and_share_links() -> None:
+    content = """
+proxy-one.example.com:8080:user-one:password-one
+trojan://secret@example.com:443#Trojan
+[2001:db8::1]:1080:user-two:password:with:colons
+"""
+
+    nodes, errors = parse_import_content(content)
+
+    assert errors == []
+    assert [node["type"] for node in nodes] == ["trojan", "http", "http"]
+    assert nodes[-1]["server"] == "2001:db8::1"
+    assert nodes[-1]["password"] == "password:with:colons"
+
+
+def test_invalid_authenticated_proxy_port_is_rejected() -> None:
+    with pytest.raises(ValueError, match="端口"):
+        parse_import_content("proxy.example.com:70000:user:password")
 
 
 def test_prepare_nodes_renames_collisions() -> None:

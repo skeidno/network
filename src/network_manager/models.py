@@ -19,7 +19,8 @@ MODES = (
     "SMART",
     "DIRECT",
 )
-CONFIG_VERSION = 6
+CONFIG_VERSION = 8
+DEFAULT_SERVER_PROXY_PORT = 24443
 
 DEFAULT_PROXY_DOMAINS = (
     ("discord.com", "Discord"),
@@ -130,12 +131,45 @@ class RoutingRule:
         )
 
 
+def normalize_node_group_name(value: object) -> str:
+    return " ".join(str(value or "").split())[:40]
+
+
+NODE_DIALER_PROXY_KEY = "_network-manager-dialer-proxy"
+NODE_DIALER_POLICY_KEY = "_network-manager-dialer-policy"
+
+
+def normalize_proxy_endpoint_host(value: object) -> str:
+    """Validate and normalize a proxy endpoint host without accepting a URL."""
+    raw = str(value or "").strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1].strip()
+    if not raw:
+        raise ValueError("代理入口域名 / IP 不能为空")
+    if len(raw) > 253 or any(character.isspace() for character in raw):
+        raise ValueError("代理入口域名 / IP 无效")
+    if any(character in raw for character in "/?#@") or "://" in raw:
+        raise ValueError("请只填写代理域名或 IP，不要包含协议和路径")
+    try:
+        return str(ipaddress.ip_address(raw))
+    except ValueError:
+        hostname = raw.rstrip(".")
+        labels = hostname.split(".")
+        if not labels or any(
+            not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+            for label in labels
+        ):
+            raise ValueError("代理入口域名 / IP 无效") from None
+        return hostname.lower()
+
+
 @dataclass(slots=True)
 class ImportedNode:
     node_id: str
     source: str
     config: dict[str, Any]
     source_id: str = ""
+    group: str = ""
 
     @property
     def name(self) -> str:
@@ -145,6 +179,14 @@ class ImportedNode:
     def protocol(self) -> str:
         return str(self.config.get("type", "unknown"))
 
+    @property
+    def dialer_proxy(self) -> str:
+        return str(self.config.get(NODE_DIALER_PROXY_KEY, "")).strip()
+
+    @property
+    def dialer_policy(self) -> str:
+        return str(self.config.get(NODE_DIALER_POLICY_KEY, "")).strip()
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ImportedNode":
         raw_config = data.get("config", {})
@@ -153,7 +195,126 @@ class ImportedNode:
             source=str(data.get("source", "手动导入")),
             config=dict(raw_config) if isinstance(raw_config, dict) else {},
             source_id=str(data.get("source_id", "")),
+            group=normalize_node_group_name(data.get("group", "")),
         )
+
+
+def clear_node_dialer_references(
+    nodes: list[ImportedNode], removed_names: set[str]
+) -> bool:
+    changed = False
+    for node in nodes:
+        if node.dialer_proxy in removed_names:
+            node.config.pop(NODE_DIALER_PROXY_KEY, None)
+            if node.dialer_policy == "auto":
+                node.config.pop(NODE_DIALER_POLICY_KEY, None)
+            else:
+                node.config[NODE_DIALER_POLICY_KEY] = "direct"
+            changed = True
+    return changed
+
+
+def _relay_preference(node: ImportedNode, index: int) -> tuple[int, int]:
+    label = f"{node.name} {node.source} {node.group}".lower()
+    priorities = (
+        ("香港", "hong kong", "hongkong", " hk "),
+        ("海外", "overseas"),
+        ("新加坡", "singapore", "日本", "japan", "东京", "tokyo"),
+        ("美国", "usa", "united states"),
+    )
+    for priority, keywords in enumerate(priorities):
+        if any(keyword in f" {label} " for keyword in keywords):
+            return priority, index
+    return len(priorities), index
+
+
+def apply_automatic_node_dialers(nodes: list[ImportedNode]) -> bool:
+    """Bind authenticated HTTP proxies to the preferred deployed relay by default."""
+    deployed = [
+        (index, node)
+        for index, node in enumerate(nodes)
+        if node.source_id.startswith("server-deployment:")
+    ]
+    relay = min(
+        deployed,
+        key=lambda item: _relay_preference(item[1], item[0]),
+        default=None,
+    )
+    relay_name = relay[1].name if relay else ""
+    changed = False
+    for node in nodes:
+        eligible = (
+            node.protocol.lower() == "http"
+            and bool(str(node.config.get("username", "")).strip())
+            and bool(str(node.config.get("password", "")).strip())
+            and not node.source_id.startswith("server-deployment:")
+        )
+        if not eligible or node.dialer_policy in {"manual", "direct"}:
+            continue
+        if node.dialer_proxy and node.dialer_policy != "auto":
+            continue
+        if relay_name:
+            if node.dialer_proxy != relay_name or node.dialer_policy != "auto":
+                node.config[NODE_DIALER_PROXY_KEY] = relay_name
+                node.config[NODE_DIALER_POLICY_KEY] = "auto"
+                changed = True
+        elif node.dialer_policy == "auto":
+            node.config.pop(NODE_DIALER_PROXY_KEY, None)
+            node.config.pop(NODE_DIALER_POLICY_KEY, None)
+            changed = True
+    return changed
+
+
+def validate_node_dialers(nodes: list[ImportedNode]) -> list[str]:
+    names = {node.name for node in nodes}
+    graph = {node.name: node.dialer_proxy for node in nodes if node.dialer_proxy}
+    errors: list[str] = []
+    for name, dialer in graph.items():
+        if dialer == name:
+            errors.append(f"节点 {name} 不能使用自身作为中转")
+        elif dialer not in names:
+            errors.append(f"节点 {name} 的中转节点不存在：{dialer}")
+
+    colors: dict[str, int] = {}
+
+    def visit(name: str, path: list[str]) -> None:
+        state = colors.get(name, 0)
+        if state == 2:
+            return
+        if state == 1:
+            start = path.index(name)
+            cycle = path[start:]
+            errors.append(f"节点中转不能形成循环：{' -> '.join(cycle)}")
+            return
+        colors[name] = 1
+        dialer = graph.get(name, "")
+        if dialer in names and dialer != name:
+            visit(dialer, [*path, dialer])
+        colors[name] = 2
+
+    for name in graph:
+        if colors.get(name, 0) == 0:
+            visit(name, [name])
+    return errors
+
+
+def _normalized_node_groups(
+    value: object,
+    nodes: list[ImportedNode],
+    subscriptions: list[SubscriptionSource] | None = None,
+) -> list[str]:
+    candidates = value if isinstance(value, list) else []
+    candidates = [
+        *candidates,
+        *(node.group for node in nodes if node.group),
+        *(source.group for source in subscriptions or [] if source.group),
+    ]
+    result: list[str] = []
+    for candidate in candidates:
+        name = normalize_node_group_name(candidate)
+        if name and name not in result:
+            result.append(name)
+    return result
 
 
 @dataclass(slots=True)
@@ -162,6 +323,7 @@ class SubscriptionSource:
     name: str
     url: str
     last_updated: str = ""
+    group: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SubscriptionSource":
@@ -170,6 +332,7 @@ class SubscriptionSource:
             name=str(data.get("name", "订阅")),
             url=str(data.get("url", "")),
             last_updated=str(data.get("last_updated", "")),
+            group=normalize_node_group_name(data.get("group", "")),
         )
 
 
@@ -185,10 +348,13 @@ class SshServerProfile:
     key_path: str = ""
     remember_password: bool = False
     auto_connect: bool = False
-    proxy_port: int = 24443
+    proxy_port: int = DEFAULT_SERVER_PROXY_PORT
     deployed_node_id: str = ""
     deployed_at: str = ""
     deployed_version: str = ""
+    region: str = ""
+    proxy_reachable: bool | None = None
+    proxy_reachability_error: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SshServerProfile":
@@ -196,6 +362,7 @@ class SshServerProfile:
             profile_id=str(data.get("profile_id") or secrets.token_hex(8)),
             name=str(data.get("name", "SSH 服务器")).strip() or "SSH 服务器",
             host=str(data.get("host", "")).strip(),
+            region=normalize_node_group_name(data.get("region", "")),
             port=int(data.get("port", 22)),
             username=str(data.get("username", "root")).strip(),
             local_port=int(data.get("local_port", 10888)),
@@ -203,11 +370,25 @@ class SshServerProfile:
             key_path=str(data.get("key_path", "")).strip(),
             remember_password=bool(data.get("remember_password", False)),
             auto_connect=bool(data.get("auto_connect", False)),
-            proxy_port=int(data.get("proxy_port", 24443)),
+            proxy_port=int(data.get("proxy_port", DEFAULT_SERVER_PROXY_PORT)),
             deployed_node_id=str(data.get("deployed_node_id", "")),
             deployed_at=str(data.get("deployed_at", "")),
             deployed_version=str(data.get("deployed_version", "")),
+            proxy_reachable=(
+                data.get("proxy_reachable")
+                if isinstance(data.get("proxy_reachable"), bool)
+                else None
+            ),
+            proxy_reachability_error=str(data.get("proxy_reachability_error", "")),
         )
+
+
+def server_proxy_port_error(port: int, ssh_port: int = 22) -> str:
+    if not 1 <= port <= 65535:
+        return "远端代理端口必须在 1 到 65535 之间"
+    if port == ssh_port:
+        return f"远端代理端口不能与 SSH 端口 {ssh_port} 相同"
+    return ""
 
 
 @dataclass(slots=True)
@@ -231,6 +412,7 @@ class AppConfig:
     )
     selected_node: str = ""
     imported_nodes: list[ImportedNode] = field(default_factory=list)
+    node_groups: list[str] = field(default_factory=list)
     subscriptions: list[SubscriptionSource] = field(default_factory=list)
     ssh_servers: list[SshServerProfile] = field(default_factory=list)
     selected_ssh_server: str = ""
@@ -281,6 +463,9 @@ class AppConfig:
             v2ray=Upstream.from_dict(data.get("v2ray", {}), defaults.v2ray),
             selected_node=str(data.get("selected_node", "")),
             imported_nodes=imported_nodes,
+            node_groups=_normalized_node_groups(
+                data.get("node_groups", []), imported_nodes, subscriptions
+            ),
             subscriptions=subscriptions,
             ssh_servers=ssh_servers,
             selected_ssh_server=str(data.get("selected_ssh_server", "")),
@@ -349,6 +534,8 @@ def migrate_config(config: AppConfig) -> bool:
         for rule in config.rules:
             if rule.target == "SSH":
                 rule.target = replacement
+    if config.version < 8:
+        apply_automatic_node_dialers(config.imported_nodes)
     config.version = CONFIG_VERSION
     return True
 
@@ -376,6 +563,43 @@ def validate_rule(rule: RoutingRule) -> list[str]:
         except ValueError:
             errors.append("请输入有效 IP 或 CIDR，例如 1.2.3.0/24")
     return errors
+
+
+def routing_rules_from_values(
+    rule_type: object,
+    values: object,
+    target: object,
+    *,
+    enabled: bool = True,
+    note: object = "",
+    limit: int = 500,
+) -> list[RoutingRule]:
+    normalized_type = str(rule_type).upper()
+    normalized_target = str(target).upper()
+    if not isinstance(values, list) or not values or len(values) > limit:
+        raise ValueError(f"每次必须填写 1 到 {limit} 条匹配内容")
+    rules: list[RoutingRule] = []
+    seen: set[str] = set()
+    for line_number, raw_value in enumerate(values, start=1):
+        value = normalize_rule_value(normalized_type, str(raw_value))
+        duplicate_key = value.casefold()
+        if duplicate_key in seen:
+            continue
+        rule = RoutingRule(
+            rule_type=normalized_type,
+            value=value,
+            target=normalized_target,
+            enabled=enabled,
+            note=str(note).strip(),
+        )
+        errors = validate_rule(rule)
+        if errors:
+            raise ValueError(f"第 {line_number} 行：{'；'.join(errors)}")
+        seen.add(duplicate_key)
+        rules.append(rule)
+    if not rules:
+        raise ValueError("匹配内容不能为空")
+    return rules
 
 
 def validate_config(config: AppConfig) -> list[str]:
@@ -434,6 +658,7 @@ def validate_config(config: AppConfig) -> list[str]:
         names.add(node_name)
         if not node.config.get("type"):
             errors.append(f"内置节点 {node_name or index} 缺少协议类型")
+    errors.extend(validate_node_dialers(config.imported_nodes))
     if config.selected_node and config.selected_node not in names:
         errors.append("当前选择的内置节点不存在")
     profile_ids: set[str] = set()
@@ -446,8 +671,8 @@ def validate_config(config: AppConfig) -> list[str]:
             errors.append(f"第 {index} 个 SSH 服务器端口无效")
         if not 1024 <= profile.local_port <= 65535:
             errors.append(f"第 {index} 个 SSH 本地端口必须在 1024 到 65535 之间")
-        if not 1024 <= profile.proxy_port <= 65535:
-            errors.append(f"第 {index} 个服务器代理端口必须在 1024 到 65535 之间")
+        if not 1 <= profile.proxy_port <= 65535:
+            errors.append(f"第 {index} 个服务器代理端口必须在 1 到 65535 之间")
         if profile.auth_method not in {"password", "key", "agent"}:
             errors.append(f"第 {index} 个 SSH 认证方式无效")
         if profile.auth_method == "key" and not profile.key_path:

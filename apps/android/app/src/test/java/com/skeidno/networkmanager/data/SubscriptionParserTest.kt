@@ -42,6 +42,25 @@ class SubscriptionParserTest {
     }
 
     @Test
+    fun parsesAuthenticatedHttpProxyWithoutPuttingCredentialsInName() {
+        val nodes = SubscriptionParser.parse(
+            "proxy.example.com:4600:user-region-br-session-demo:secret-password",
+            sourceId = "manual",
+            sourceName = "Manual",
+        )
+
+        assertEquals(1, nodes.size)
+        val node = nodes.single()
+        assertEquals("HTTP", node.protocol)
+        assertEquals("proxy.example.com", node.server)
+        assertEquals(4600, node.port)
+        assertEquals("user-region-br-session-demo", node.raw.getString("username"))
+        assertEquals("secret-password", node.raw.getString("password"))
+        assertTrue(!node.name.contains("user-region"))
+        assertTrue(!node.name.contains("secret-password"))
+    }
+
+    @Test
     fun defaultOverseasGroupContainsExpectedDomains() {
         assertEquals(67, DEFAULT_PROXY_DOMAINS.size)
         assertTrue("arcteryx.com" in DEFAULT_PROXY_DOMAINS)

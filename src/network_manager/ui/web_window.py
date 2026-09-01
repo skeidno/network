@@ -2,31 +2,47 @@ from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 from threading import Lock
+import time
 from typing import Callable
 from urllib.parse import quote, urlsplit
 
 import psutil
 import requests
-from PySide6.QtCore import QObject, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QFileDialog
 
+from network_manager import __version__
 from network_manager.local_web_server import LocalWebServer
 from network_manager.credential_store import CredentialStore, CredentialStoreError
 from network_manager.models import (
+    DEFAULT_SERVER_PROXY_PORT,
+    NODE_DIALER_POLICY_KEY,
+    NODE_DIALER_PROXY_KEY,
     ImportedNode,
     RoutingRule,
     SshServerProfile,
     Upstream,
+    apply_automatic_node_dialers,
+    clear_node_dialer_references,
     default_routing_rules,
+    normalize_node_group_name,
+    normalize_proxy_endpoint_host,
     normalize_rule_value,
+    routing_rules_from_values,
+    server_proxy_port_error,
     validate_config,
-    validate_rule,
+)
+from network_manager.network_probe import (
+    check_public_tcp_endpoint,
+    diagnose_authenticated_proxy,
 )
 from network_manager.server_deployer import (
     DeploymentResult,
@@ -62,14 +78,16 @@ class WebBridge(QObject):
         self._node_batch_generation: int | None = None
         self._node_batch_pending: set[str] = set()
         self._node_executor = ThreadPoolExecutor(
-            max_workers=8, thread_name_prefix="node-delay"
+            max_workers=4, thread_name_prefix="node-delay"
         )
         self._ssh_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="server-deploy")
         self._deployment_lock = Lock()
-        self._deployment_states: dict[str, dict[str, str]] = {}
+        self._deployment_states: dict[str, dict[str, object]] = {}
         self._bridge_closed = False
         self._toast_lock = Lock()
         self._toasts: deque[dict[str, str]] = deque(maxlen=40)
+        self._running_process_cache: list[str] = []
+        self._running_process_cache_at = 0.0
         self.common_rule_keys = {
             (rule.rule_type, normalize_rule_value(rule.rule_type, rule.value))
             for rule in default_routing_rules()
@@ -105,10 +123,15 @@ class WebBridge(QObject):
         with self._node_delay_lock:
             node_delays = {name: dict(result) for name, result in self._node_delays.items()}
         nodes = []
+        server_regions = {
+            deployment_source_id(profile.profile_id): profile.region
+            for profile in config.ssh_servers
+        }
         for index, node in enumerate(config.imported_nodes):
             server = str(node.config.get("server", ""))
             port = node.config.get("port")
             delay = node_delays.get(node.name, {"status": "idle", "delay": None})
+            is_server_deployment = node.source_id.startswith("server-deployment:")
             nodes.append(
                 {
                     "index": index,
@@ -116,9 +139,17 @@ class WebBridge(QObject):
                     "protocol": node.protocol,
                     "server": f"{server}:{port}" if port else server,
                     "source": node.source,
+                    "group": node.group
+                    or ("服务器部署" if is_server_deployment else node.source)
+                    or "手动导入",
+                    "customGroup": node.group,
+                    "region": server_regions.get(node.source_id, ""),
                     "selected": node.name == config.selected_node,
                     "latencyStatus": delay.get("status", "idle"),
                     "latency": delay.get("delay"),
+                    "latencyMessage": delay.get("message", ""),
+                    "dialerProxy": node.dialer_proxy,
+                    "dialerPolicy": node.dialer_policy,
                 }
             )
         subscriptions = []
@@ -130,11 +161,13 @@ class WebBridge(QObject):
                     "name": source.name,
                     "host": urlsplit(source.url).netloc or "订阅地址",
                     "nodeCount": count,
+                    "group": source.group,
                     "lastUpdated": source.last_updated or "未更新",
                 }
             )
 
         state = {
+            "version": __version__,
             "core": {
                 "running": running,
                 "busy": self.window._operation_active,
@@ -200,15 +233,21 @@ class WebBridge(QObject):
                 ),
             },
             "nodes": nodes,
+            "nodeGroups": list(config.node_groups),
             "subscriptions": subscriptions,
             "sshServers": [
                 {
                     "profileId": profile.profile_id,
                     "name": profile.name,
+                    "region": profile.region,
                     "host": profile.host,
                     "port": profile.port,
                     "username": profile.username,
                     "proxyPort": profile.proxy_port,
+                    "proxyPortWarning": server_proxy_port_error(
+                        profile.proxy_port, profile.port
+                    ),
+                    "proxyReachable": profile.proxy_reachable,
                     "authMethod": profile.auth_method,
                     "keyPath": profile.key_path,
                     "rememberPassword": profile.remember_password,
@@ -221,14 +260,21 @@ class WebBridge(QObject):
                         self._deployed_node(profile).name if self._deployed_node(profile) else ""
                     ),
                     "shareLink": self._deployed_share_link(profile),
-                    "deployment": deployment_states.get(
-                        profile.profile_id,
-                        {"status": "idle", "stage": "", "error": ""},
+                    "deployment": deployment_states.get(profile.profile_id)
+                    or (
+                        {
+                            "status": "warning",
+                            "stage": "远端服务运行，但外端口不可达",
+                            "error": profile.proxy_reachability_error,
+                        }
+                        if profile.proxy_reachable is False
+                        else {"status": "idle", "stage": "", "error": ""}
                     ),
                 }
                 for profile in config.ssh_servers
             ],
             "selectedNode": config.selected_node,
+            "runningProcesses": self._running_process_names(),
             "importing": not self.window.import_button.isEnabled(),
             "settings": {
                 "mixedPort": config.mixed_port,
@@ -236,7 +282,7 @@ class WebBridge(QObject):
                 "dnsPort": config.dns_port,
                 "strictRoute": config.strict_route,
                 "startOnLaunch": config.start_on_launch,
-                "closeToTray": config.close_to_tray,
+                "closeToTray": True,
                 "startWithWindows": config.start_with_windows,
             },
             "toasts": self._drain_toasts(),
@@ -248,6 +294,22 @@ class WebBridge(QObject):
             return round(self.process.memory_info().rss / (1024 * 1024))
         except psutil.Error:
             return 0
+
+    def _running_process_names(self) -> list[str]:
+        now = time.monotonic()
+        if now - self._running_process_cache_at < 5:
+            return list(self._running_process_cache)
+        names: dict[str, str] = {}
+        for process in psutil.process_iter(["name"]):
+            try:
+                name = str(process.info.get("name") or "").strip()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            if name:
+                names.setdefault(name.casefold(), name)
+        self._running_process_cache = sorted(names.values(), key=str.casefold)[:600]
+        self._running_process_cache_at = now
+        return list(self._running_process_cache)
 
     def _has_credential(self, profile: SshServerProfile) -> bool:
         if not profile.remember_password:
@@ -343,6 +405,55 @@ class WebBridge(QObject):
                     "note": rule.note,
                 }
             )
+        relay_entries = [
+            {
+                "node": node.name,
+                "endpoint": str(node.config.get("server", "")),
+                "port": node.config.get("port", 0),
+                "relay": node.dialer_proxy,
+                "policy": node.dialer_policy
+                or ("manual" if node.dialer_proxy else "direct"),
+            }
+            for node in self.window.config.imported_nodes
+            if node.protocol.lower() == "http"
+            and not node.source_id.startswith("server-deployment:")
+            and str(node.config.get("server", "")).strip()
+        ]
+        if relay_entries:
+            relays = list(
+                dict.fromkeys(
+                    str(entry["relay"]) for entry in relay_entries if entry["relay"]
+                )
+            )
+            configured_count = len([entry for entry in relay_entries if entry["relay"]])
+            automatic_count = len(
+                [entry for entry in relay_entries if entry["policy"] == "auto"]
+            )
+            states.append(
+                {
+                    "kind": "relay",
+                    "enabled": configured_count == len(relay_entries),
+                    "partiallyEnabled": 0 < configured_count < len(relay_entries),
+                    "automatic": automatic_count == len(relay_entries),
+                    "ruleType": "PROXY-ENDPOINT",
+                    "ruleTypeLabel": "代理域名前置",
+                    "value": f"{len(relay_entries)} 个代理入口",
+                    "detail": "、".join(str(entry["endpoint"]) for entry in relay_entries),
+                    "entries": relay_entries,
+                    "target": (
+                        relays[0]
+                        if len(relays) == 1
+                        else "MULTIPLE" if relays else "DIRECT"
+                    ),
+                    "targetLabel": (
+                        f"经 {relays[0]}"
+                        if len(relays) == 1
+                        else f"经 {len(relays)} 个前置节点" if relays else "直连"
+                    ),
+                    "note": "第 2 阶段；可编辑，代码直接使用代理域名时同样生效",
+                    "count": len(relay_entries),
+                }
+            )
         return states
 
     def _source_state(self, key: str, upstream: Upstream) -> dict[str, object]:
@@ -367,16 +478,35 @@ class WebBridge(QObject):
             response = requests.get(
                 endpoint,
                 headers=headers,
-                params={"timeout": 8000, "url": "http://www.gstatic.com/generate_204"},
-                timeout=(3, 11),
+                params={"timeout": 6000, "url": "https://www.gstatic.com/generate_204"},
+                timeout=(3, 9),
             )
             response.raise_for_status()
             delay = int(response.json().get("delay", 0))
             if delay <= 0:
                 raise ValueError("测速没有返回有效延迟")
             return {"status": "ok", "delay": delay}
-        except (requests.RequestException, TypeError, ValueError) as exc:
-            return {"status": "error", "delay": None, "message": str(exc)}
+        except (requests.RequestException, TypeError, ValueError):
+            node = next(
+                (
+                    item
+                    for item in self.window.config.imported_nodes
+                    if item.name == node_name
+                ),
+                None,
+            )
+            diagnostic = ""
+            if node and node.dialer_proxy:
+                diagnostic = (
+                    f"经 {node.dialer_proxy} 中转连接失败，请先单独测试中转节点"
+                )
+            elif node:
+                diagnostic = diagnose_authenticated_proxy(node.config)
+            return {
+                "status": "error",
+                "delay": None,
+                "message": diagnostic or "节点连接或测速端点不可用",
+            }
 
     def _node_delay_finished(
         self,
@@ -416,7 +546,8 @@ class WebBridge(QObject):
         elif result.get("status") == "ok":
             self._notify("success", f"{node_name}：{result['delay']} ms")
         else:
-            self._notify("error", f"{node_name} 测速失败")
+            detail = str(result.get("message", "")).strip() or "测速失败"
+            self._notify("error", f"{node_name}：{detail}")
 
     def close(self) -> None:
         if self._bridge_closed:
@@ -451,29 +582,32 @@ class WebBridge(QObject):
         try:
             payload = json.loads(payload_json)
             rule_type = str(payload["ruleType"])
-            rule = RoutingRule(
-                rule_type=rule_type,
-                value=normalize_rule_value(rule_type, str(payload["value"])),
-                target=str(payload["target"]),
+            raw_values = payload.get("values")
+            if raw_values is None:
+                raw_values = str(payload["value"]).splitlines()
+            rules = routing_rules_from_values(
+                rule_type,
+                raw_values,
+                payload["target"],
                 enabled=bool(payload.get("enabled", True)),
                 note=str(payload.get("note", "")).strip(),
             )
-            errors = validate_rule(rule)
-            if errors:
-                raise ValueError("；".join(errors))
             index = int(payload.get("index", -1))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self._notify("error", str(exc) or "规则内容无效")
             return
+        previous_rules = list(self.window.config.rules)
         if 0 <= index < len(self.window.config.rules):
-            self.window.config.rules[index] = rule
-            message = "规则已更新"
+            self.window.config.rules[index : index + 1] = rules
+            message = f"规则已更新，共 {len(rules)} 条"
         else:
-            self.window.config.rules.append(rule)
-            message = "规则已添加"
+            self.window.config.rules.extend(rules)
+            message = f"规则已添加，共 {len(rules)} 条"
         if self.window._save_and_apply(message):
             self.window._refresh_rules_table()
             self._notify("success", message)
+        else:
+            self.window.config.rules = previous_rules
 
     @Slot(int, str)
     def ruleAction(self, index: int, action: str) -> None:
@@ -618,7 +752,7 @@ class WebBridge(QObject):
             self.window.dns_port_spin.setValue(int(payload["dnsPort"]))
             self.window.strict_route_check.setChecked(bool(payload["strictRoute"]))
             self.window.start_on_launch_check.setChecked(bool(payload["startOnLaunch"]))
-            self.window.close_to_tray_check.setChecked(bool(payload["closeToTray"]))
+            self.window.close_to_tray_check.setChecked(True)
             self.window.start_with_windows_check.setChecked(bool(payload["startWithWindows"]))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self._notify("error", str(exc) or "设置内容无效")
@@ -626,23 +760,41 @@ class WebBridge(QObject):
         self.window._save_settings()
         self._notify("success", "设置已保存")
 
-    @Slot(str, str)
-    def addSubscription(self, name: str, url: str) -> None:
+    @Slot(str, str, str)
+    def addSubscription(self, name: str, url: str, group_name: str = "") -> None:
         if not url.strip().lower().startswith(("http://", "https://")):
             self._notify("error", "订阅地址必须以 http:// 或 https:// 开头")
             return
+        group = normalize_node_group_name(group_name)
+        if group and group not in self.window.config.node_groups:
+            self._notify("error", "订阅分组不存在")
+            return
         self.window._execute_import(
-            {"kind": "subscription", "name": name.strip() or "我的订阅", "url": url.strip()}
+            {
+                "kind": "subscription",
+                "name": name.strip() or "我的订阅",
+                "url": url.strip(),
+                "group": group,
+            }
         )
         self._notify("info", "正在下载并解析订阅")
 
-    @Slot(str, str)
-    def importPaste(self, name: str, content: str) -> None:
+    @Slot(str, str, str)
+    def importPaste(self, name: str, content: str, group_name: str = "") -> None:
         if not content.strip():
             self._notify("error", "请先粘贴订阅或节点内容")
             return
+        group = normalize_node_group_name(group_name)
+        if group and group not in self.window.config.node_groups:
+            self._notify("error", "导入分组不存在")
+            return
         self.window._execute_import(
-            {"kind": "paste", "name": name.strip() or "手动导入", "content": content}
+            {
+                "kind": "paste",
+                "name": name.strip() or "手动导入",
+                "content": content,
+                "group": group,
+            }
         )
         self._notify("info", "正在解析导入内容")
 
@@ -738,6 +890,7 @@ class WebBridge(QObject):
             for node in self.window.config.imported_nodes
             if node.source_id != source.source_id
         ]
+        clear_node_dialer_references(self.window.config.imported_nodes, removed_names)
         if self.window.config.selected_node in removed_names:
             self.window.config.selected_node = (
                 self.window.config.imported_nodes[0].name
@@ -754,6 +907,9 @@ class WebBridge(QObject):
         if not 0 <= index < len(self.window.config.imported_nodes):
             return
         removed = self.window.config.imported_nodes.pop(index)
+        clear_node_dialer_references(
+            self.window.config.imported_nodes, {removed.name}
+        )
         if self.window.config.selected_node == removed.name:
             self.window.config.selected_node = (
                 self.window.config.imported_nodes[0].name
@@ -787,6 +943,9 @@ class WebBridge(QObject):
             for node in self.window.config.imported_nodes
             if node.name not in failed_names
         ]
+        clear_node_dialer_references(
+            self.window.config.imported_nodes, failed_names
+        )
         removed_count = before - len(self.window.config.imported_nodes)
         if not removed_count:
             self._notify("info", "Error 节点已不存在")
@@ -820,6 +979,144 @@ class WebBridge(QObject):
             self.window._save_and_apply("内置节点已切换")
             self.window._refresh_nodes_table()
             self._notify("success", "当前节点已切换")
+
+    @Slot(str)
+    def createNodeGroup(self, name: str) -> None:
+        group = normalize_node_group_name(name)
+        if not group:
+            self._notify("error", "分组名称不能为空")
+            return
+        if group in self.window.config.node_groups:
+            self._notify("info", "分组已经存在")
+            return
+        self.window.config.node_groups.append(group)
+        self.window.store.save(self.window.config)
+        self._notify("success", f"已创建分组：{group}")
+
+    @Slot(str, str)
+    def assignNodeGroup(self, name: str, group_name: str) -> None:
+        group = normalize_node_group_name(group_name)
+        if group and group not in self.window.config.node_groups:
+            self._notify("error", "分组不存在")
+            return
+        node = next(
+            (item for item in self.window.config.imported_nodes if item.name == name), None
+        )
+        if node is None:
+            self._notify("error", "节点不存在")
+            return
+        node.group = group
+        self.window.store.save(self.window.config)
+        self._notify("success", "节点分组已更新")
+
+    @Slot(str, str)
+    def setNodeDialerProxy(self, name: str, dialer_name: str) -> None:
+        node = next(
+            (item for item in self.window.config.imported_nodes if item.name == name), None
+        )
+        dialer = dialer_name.strip()
+        if node is None:
+            self._notify("error", "节点不存在")
+            return
+        if dialer and not any(
+            item.name == dialer for item in self.window.config.imported_nodes
+        ):
+            self._notify("error", "中转节点不存在")
+            return
+        previous = node.config.get(NODE_DIALER_PROXY_KEY)
+        previous_policy = node.config.get(NODE_DIALER_POLICY_KEY)
+        if dialer:
+            node.config[NODE_DIALER_PROXY_KEY] = dialer
+            node.config[NODE_DIALER_POLICY_KEY] = "manual"
+        else:
+            node.config.pop(NODE_DIALER_PROXY_KEY, None)
+            node.config[NODE_DIALER_POLICY_KEY] = "direct"
+        if not self.window._save_and_apply(
+            f"节点中转已设置为 {dialer}" if dialer else "节点已改为直接连接"
+        ):
+            if previous is None:
+                node.config.pop(NODE_DIALER_PROXY_KEY, None)
+            else:
+                node.config[NODE_DIALER_PROXY_KEY] = previous
+            if previous_policy is None:
+                node.config.pop(NODE_DIALER_POLICY_KEY, None)
+            else:
+                node.config[NODE_DIALER_POLICY_KEY] = previous_policy
+            return
+        self.window._refresh_nodes_table()
+
+    @Slot(str)
+    def saveProxyRelayRules(self, payload_json: str) -> None:
+        previous_configs = {
+            node.node_id: dict(node.config) for node in self.window.config.imported_nodes
+        }
+        try:
+            payload = json.loads(payload_json)
+            assignments = payload.get("assignments", [])
+            if not isinstance(assignments, list) or len(assignments) > 500:
+                raise ValueError("代理域名前置配置无效")
+            names = {node.name for node in self.window.config.imported_nodes}
+            nodes_by_name = {
+                node.name: node for node in self.window.config.imported_nodes
+            }
+            for item in assignments:
+                if not isinstance(item, dict):
+                    raise ValueError("代理域名前置配置无效")
+                node = nodes_by_name.get(str(item.get("node", "")))
+                mode = str(item.get("mode", "")).lower()
+                dialer = str(item.get("dialer", "")).strip()
+                if node is None or node.protocol.lower() != "http":
+                    raise ValueError("代理入口节点不存在")
+                server = normalize_proxy_endpoint_host(
+                    item.get("server", node.config.get("server", ""))
+                )
+                try:
+                    port = int(item.get("port", node.config.get("port", 0)))
+                except (TypeError, ValueError):
+                    raise ValueError("代理入口端口必须是 1 到 65535 之间的整数") from None
+                if not 1 <= port <= 65535:
+                    raise ValueError("代理入口端口必须是 1 到 65535 之间的整数")
+                node.config["server"] = server
+                node.config["port"] = port
+                if mode == "auto":
+                    node.config.pop(NODE_DIALER_PROXY_KEY, None)
+                    node.config.pop(NODE_DIALER_POLICY_KEY, None)
+                elif mode == "direct":
+                    node.config.pop(NODE_DIALER_PROXY_KEY, None)
+                    node.config[NODE_DIALER_POLICY_KEY] = "direct"
+                elif mode == "manual" and dialer in names and dialer != node.name:
+                    node.config[NODE_DIALER_PROXY_KEY] = dialer
+                    node.config[NODE_DIALER_POLICY_KEY] = "manual"
+                else:
+                    raise ValueError("请选择有效的前置节点")
+            apply_automatic_node_dialers(self.window.config.imported_nodes)
+            errors = validate_config(self.window.config)
+            if errors:
+                raise ValueError(errors[0])
+            if not self.window._save_and_apply("代理域名前置规则已更新"):
+                raise ValueError("代理域名前置规则未能应用")
+            self.window._refresh_nodes_table()
+            self._notify("success", "代理域名前置规则已更新")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            for node in self.window.config.imported_nodes:
+                if node.node_id in previous_configs:
+                    node.config = previous_configs[node.node_id]
+            self._notify("error", str(exc) or "代理域名前置规则无效")
+
+    @Slot(str)
+    def deleteNodeGroup(self, name: str) -> None:
+        group = normalize_node_group_name(name)
+        if group not in self.window.config.node_groups:
+            return
+        self.window.config.node_groups.remove(group)
+        for source in self.window.config.subscriptions:
+            if source.group == group:
+                source.group = ""
+        for node in self.window.config.imported_nodes:
+            if node.group == group:
+                node.group = ""
+        self.window.store.save(self.window.config)
+        self._notify("success", "分组已删除，节点恢复按来源归类")
 
     @Slot()
     def testExit(self) -> None:
@@ -913,16 +1210,24 @@ class WebBridge(QObject):
                 profile_id=profile_id or __import__("secrets").token_hex(8),
                 name=str(payload.get("name", "SSH 服务器")).strip() or "SSH 服务器",
                 host=str(payload["host"]).strip(),
+                region=normalize_node_group_name(payload.get("region", "")),
                 port=int(payload.get("port", 22)),
                 username=str(payload.get("username", "root")).strip(),
                 auth_method=str(payload.get("authMethod", "password")).lower(),
                 key_path=str(payload.get("keyPath", "")).strip(),
                 remember_password=bool(payload.get("rememberPassword", False)),
-                proxy_port=int(payload.get("proxyPort", 24443)),
+                proxy_port=int(payload.get("proxyPort", DEFAULT_SERVER_PROXY_PORT)),
                 deployed_node_id=existing.deployed_node_id if existing else "",
                 deployed_at=existing.deployed_at if existing else "",
                 deployed_version=existing.deployed_version if existing else "",
+                proxy_reachable=existing.proxy_reachable if existing else None,
+                proxy_reachability_error=(
+                    existing.proxy_reachability_error if existing else ""
+                ),
             )
+            port_error = server_proxy_port_error(profile.proxy_port, profile.port)
+            if port_error:
+                raise ValueError(port_error)
             if profile.auth_method == "key" and not Path(profile.key_path).is_file():
                 raise ValueError("SSH 私钥文件不存在")
             endpoint_changed = bool(
@@ -933,6 +1238,8 @@ class WebBridge(QObject):
                 profile.deployed_node_id = ""
                 profile.deployed_at = ""
                 profile.deployed_version = ""
+                profile.proxy_reachable = None
+                profile.proxy_reachability_error = ""
             candidate_profiles = list(self.window.config.ssh_servers)
             if existing is None:
                 candidate_profiles.append(profile)
@@ -992,6 +1299,10 @@ class WebBridge(QObject):
         profile = self._ssh_profile(profile_id)
         if profile is None:
             self._notify("error", "SSH 服务器不存在")
+            return
+        port_error = server_proxy_port_error(profile.proxy_port, profile.port)
+        if port_error:
+            self._notify("error", port_error)
             return
         with self._deployment_lock:
             if any(
@@ -1055,19 +1366,53 @@ class WebBridge(QObject):
     ) -> DeploymentResult:
         if existing_node_config:
             progress("正在检查远端代理服务")
-            inspection = self.window.server_deployer.inspect(profile, credential)
-            if inspection.get("status") == "active":
-                node = dict(existing_node_config)
-                return DeploymentResult(
-                    node_config=node,
-                    share_link=shadowsocks_share_link(node),
-                    version=inspection.get("version") or profile.deployed_version,
-                    deployed_at=deployed_at,
-                    firewall="unchanged",
-                    reused=True,
+        else:
+            progress("正在查找远端现有代理服务")
+        inspection = self.window.server_deployer.inspect(profile, credential)
+        if inspection.get("status") == "active":
+            inspected_node = inspection.get("nodeConfig")
+            node = (
+                dict(inspected_node)
+                if isinstance(inspected_node, dict)
+                else dict(existing_node_config or {})
+            )
+            if node:
+                timestamp = deployed_at or datetime.now().astimezone().isoformat(
+                    timespec="seconds"
                 )
+                return WebBridge._with_public_access_check(
+                    profile,
+                    DeploymentResult(
+                        node_config=node,
+                        share_link=shadowsocks_share_link(node),
+                        version=str(inspection.get("version") or profile.deployed_version),
+                        deployed_at=timestamp,
+                        firewall="unchanged",
+                        reused=True,
+                    ),
+                    progress,
+                )
+            progress("远端服务配置不匹配，正在修复部署")
+        else:
             progress("远端服务未运行，正在修复部署")
-        return self.window.server_deployer.deploy(profile, credential, progress)
+        result = self.window.server_deployer.deploy(profile, credential, progress)
+        return WebBridge._with_public_access_check(profile, result, progress)
+
+    @staticmethod
+    def _with_public_access_check(
+        profile: SshServerProfile,
+        result: DeploymentResult,
+        progress: Callable[[str], None],
+    ) -> DeploymentResult:
+        progress("正在验证公网代理端口")
+        reachable, error = check_public_tcp_endpoint(
+            profile.host, profile.proxy_port, timeout=5.0
+        )
+        return replace(
+            result,
+            public_reachable=reachable,
+            public_error=error,
+        )
 
     @Slot(str)
     def copyServerNode(self, profile_id: str) -> None:
@@ -1108,6 +1453,7 @@ class WebBridge(QObject):
         self.window.config.imported_nodes = [
             node for node in self.window.config.imported_nodes if node.source_id != source_id
         ]
+        clear_node_dialer_references(self.window.config.imported_nodes, removed_names)
         if self.window.config.selected_node in removed_names:
             self.window.config.selected_node = (
                 self.window.config.imported_nodes[0].name
@@ -1174,6 +1520,8 @@ class WebBridge(QObject):
                     "deployedAt": result.deployed_at,
                     "firewall": result.firewall,
                     "reused": result.reused,
+                    "publicReachable": result.public_reachable,
+                    "publicError": result.public_error,
                 },
                 ensure_ascii=False,
             )
@@ -1211,24 +1559,6 @@ class WebBridge(QObject):
             self._notify("error", message)
             return
         payload = json.loads(result_json)
-        if payload.get("reused"):
-            profile.deployed_version = str(payload.get("version", profile.deployed_version))
-            if credential:
-                try:
-                    self.window.credential_store.set(profile_id, credential)
-                    profile.remember_password = True
-                    message += "，SSH 凭据已安全保存"
-                except CredentialStoreError as exc:
-                    message += f"；凭据保存失败：{exc}"
-            self.window.store.save(self.window.config)
-            with self._deployment_lock:
-                self._deployment_states[profile_id] = {
-                    "status": "ready",
-                    "stage": "远端服务已存在并运行中",
-                    "error": "",
-                }
-            self._notify("success", message)
-            return
         node_config = dict(payload["node"])
         source_id = deployment_source_id(profile_id)
         current = self._deployed_node(profile)
@@ -1244,11 +1574,16 @@ class WebBridge(QObject):
             node_name = f"{base_name} ({suffix})"
             suffix += 1
         node_config["name"] = node_name
+        if current and current.dialer_proxy:
+            node_config[NODE_DIALER_PROXY_KEY] = current.dialer_proxy
+        if current and current.dialer_policy:
+            node_config[NODE_DIALER_POLICY_KEY] = current.dialer_policy
         node = ImportedNode(
             node_id=current.node_id if current else __import__("secrets").token_hex(8),
             source=f"服务器部署 · {profile.name}",
             config=node_config,
             source_id=source_id,
+            group=current.group if current else "",
         )
         self.window.config.imported_nodes = [
             item for item in self.window.config.imported_nodes if item.source_id != source_id
@@ -1259,6 +1594,11 @@ class WebBridge(QObject):
         profile.deployed_node_id = node.node_id
         profile.deployed_at = str(payload.get("deployedAt", ""))
         profile.deployed_version = str(payload.get("version", ""))
+        public_reachable = payload.get("publicReachable")
+        profile.proxy_reachable = (
+            public_reachable if isinstance(public_reachable, bool) else None
+        )
+        profile.proxy_reachability_error = str(payload.get("publicError", ""))
         if credential:
             try:
                 self.window.credential_store.set(profile_id, credential)
@@ -1266,15 +1606,40 @@ class WebBridge(QObject):
                 message += "，SSH 凭据已安全保存"
             except CredentialStoreError as exc:
                 message += f"；凭据保存失败：{exc}"
+        apply_automatic_node_dialers(self.window.config.imported_nodes)
         self.window.store.save(self.window.config)
-        if self.window.core.is_running:
-            self.window._save_and_apply("服务器代理节点已加入内置节点")
+        if self.window.core.is_running and not self.window._save_and_apply(
+            "服务器代理节点已加入内置节点"
+        ):
+            with self._deployment_lock:
+                self._deployment_states[profile_id] = {
+                    "status": "error",
+                    "stage": "节点配置无效",
+                    "error": "服务器已部署，但本地节点配置未能应用",
+                }
+            self._notify("error", "服务器已部署，但本地节点配置未能应用")
+            return
         with self._deployment_lock:
-            self._deployment_states[profile_id] = {
-                "status": "ready",
-                "stage": "已部署并加入内置节点",
-                "error": "",
-            }
+            self._deployment_states[profile_id] = (
+                {
+                    "status": "warning",
+                    "stage": "远端服务运行，但外端口不可达",
+                    "error": profile.proxy_reachability_error,
+                }
+                if profile.proxy_reachable is False
+                else {
+                    "status": "ready",
+                    "stage": "已部署并加入内置节点",
+                    "error": "",
+                }
+            )
+        if profile.proxy_reachable is False:
+            message += (
+                f"；远端服务正在运行，但公网端口 {profile.proxy_port} 无法连接，"
+                "请在云安全组和服务器防火墙放行该端口的 TCP/UDP"
+            )
+            self._notify("error", message)
+            return
         if payload.get("firewall") == "unmanaged":
             message += "；请确认云服务器安全组已放行代理 TCP/UDP 端口"
         self._notify("success", message)
@@ -1331,6 +1696,11 @@ class WebMainWindow(NativeMainWindow):
             "deleteSubscription",
             "deleteNode",
             "deleteErrorNodes",
+            "createNodeGroup",
+            "assignNodeGroup",
+            "setNodeDialerProxy",
+            "saveProxyRelayRules",
+            "deleteNodeGroup",
             "selectNode",
             "testExit",
             "testSource",
@@ -1356,7 +1726,37 @@ class WebMainWindow(NativeMainWindow):
         self.web_view.setObjectName("webGui")
         self.web_view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.setCentralWidget(self.web_view)
+        self._web_load_attempts = 0
+        self._web_ready_checks = 0
+        self.web_view.loadFinished.connect(self._web_load_finished)
+        QTimer.singleShot(0, self._load_web_ui)
+
+    def _load_web_ui(self) -> None:
+        self._web_load_attempts += 1
+        self._web_ready_checks = 0
         self.web_view.setUrl(QUrl(f"{self.web_url}?customFrame=1"))
+
+    @Slot(bool)
+    def _web_load_finished(self, succeeded: bool) -> None:
+        if not succeeded:
+            if self._web_load_attempts < 3:
+                QTimer.singleShot(400 * self._web_load_attempts, self._load_web_ui)
+            return
+        QTimer.singleShot(500, self._verify_web_ready)
+
+    def _verify_web_ready(self) -> None:
+        self.web_view.page().runJavaScript(
+            "Boolean(window.networkManagerReady)", self._web_ready_result
+        )
+
+    def _web_ready_result(self, ready: object) -> None:
+        if bool(ready):
+            return
+        self._web_ready_checks += 1
+        if self._web_ready_checks < 10:
+            QTimer.singleShot(750, self._verify_web_ready)
+        elif self._web_load_attempts < 3:
+            self._load_web_ui()
 
     def open_web_ui(self) -> None:
         if os.environ.get("NETWORK_MANAGER_NO_BROWSER") == "1":

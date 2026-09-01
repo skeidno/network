@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,8 +12,6 @@ import threading
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from PySide6.QtCore import QObject, Qt, Signal, Slot
-
 
 @dataclass(slots=True)
 class BridgeCall:
@@ -23,37 +22,53 @@ class BridgeCall:
     error: str = ""
 
 
-class BridgeDispatcher(QObject):
-    """Move HTTP worker requests onto the Qt GUI thread."""
+class DirectBridgeDispatcher:
+    """Dispatch requests for a thread-safe headless controller without Qt."""
 
-    call_requested = Signal(object)
-
-    def __init__(self, bridge: QObject, allowed_methods: set[str]) -> None:
-        super().__init__(bridge)
+    def __init__(self, bridge: Any, allowed_methods: set[str]) -> None:
         self.bridge = bridge
         self.allowed_methods = allowed_methods
-        self.call_requested.connect(self._execute, Qt.ConnectionType.QueuedConnection)
 
     def dispatch(self, method: str, args: list[Any], timeout: float = 30.0) -> Any:
         if method not in self.allowed_methods:
             raise ValueError("不支持的操作")
-        call = BridgeCall(method=method, args=args)
-        self.call_requested.emit(call)
-        if not call.completed.wait(timeout):
-            raise TimeoutError("应用响应超时")
-        if call.error:
-            raise RuntimeError(call.error)
-        return call.result
+        return getattr(self.bridge, method)(*args)
 
-    @Slot(object)
-    def _execute(self, call: BridgeCall) -> None:
-        try:
-            method = getattr(self.bridge, call.method)
-            call.result = method(*call.args)
-        except Exception as exc:  # pragma: no cover - final IPC boundary
-            call.error = str(exc) or exc.__class__.__name__
-        finally:
-            call.completed.set()
+
+def _qt_dispatcher(bridge: Any, allowed_methods: set[str]) -> Any:
+    from PySide6.QtCore import QObject, Qt, Signal, Slot
+
+    class QtBridgeDispatcher(QObject):
+        """Move HTTP worker requests onto the Qt GUI thread."""
+
+        call_requested = Signal(object)
+
+        def __init__(self) -> None:
+            super().__init__(bridge)
+            self.call_requested.connect(self._execute, Qt.ConnectionType.QueuedConnection)
+
+        def dispatch(self, method: str, args: list[Any], timeout: float = 30.0) -> Any:
+            if method not in allowed_methods:
+                raise ValueError("不支持的操作")
+            call = BridgeCall(method=method, args=args)
+            self.call_requested.emit(call)
+            if not call.completed.wait(timeout):
+                raise TimeoutError("应用响应超时")
+            if call.error:
+                raise RuntimeError(call.error)
+            return call.result
+
+        @Slot(object)
+        def _execute(self, call: BridgeCall) -> None:
+            try:
+                method = getattr(bridge, call.method)
+                call.result = method(*call.args)
+            except Exception as exc:  # pragma: no cover - final IPC boundary
+                call.error = str(exc) or exc.__class__.__name__
+            finally:
+                call.completed.set()
+
+    return QtBridgeDispatcher()
 
 
 class LocalWebServer:
@@ -62,12 +77,28 @@ class LocalWebServer:
     def __init__(
         self,
         web_root: Path,
-        bridge: QObject,
+        bridge: Any,
         allowed_methods: set[str],
+        *,
+        direct_dispatch: bool = False,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        access_username: str = "admin",
+        access_password: str = "",
     ) -> None:
         self.web_root = web_root.resolve()
         self.token = secrets.token_urlsafe(32)
-        self.dispatcher = BridgeDispatcher(bridge, allowed_methods)
+        self.host = host.strip() or "127.0.0.1"
+        self.port = int(port)
+        self.access_username = access_username.strip() or "admin"
+        self.access_password = access_password
+        if not _is_loopback_host(self.host) and not self.access_password:
+            raise ValueError("远程监听必须设置 WebGUI 管理密码")
+        self.dispatcher = (
+            DirectBridgeDispatcher(bridge, allowed_methods)
+            if direct_dispatch
+            else _qt_dispatcher(bridge, allowed_methods)
+        )
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -75,7 +106,8 @@ class LocalWebServer:
     def url(self) -> str:
         if self._httpd is None:
             raise RuntimeError("WebGUI 服务尚未启动")
-        return f"http://127.0.0.1:{self._httpd.server_port}/"
+        display_host = "127.0.0.1" if self.host in {"0.0.0.0", "::"} else self.host
+        return f"http://{display_host}:{self._httpd.server_port}/"
 
     def start(self) -> str:
         if self._httpd is not None:
@@ -108,7 +140,7 @@ class LocalWebServer:
                     return
                 try:
                     size = int(self.headers.get("Content-Length", "0"))
-                    if size < 1 or size > 2 * 1024 * 1024:
+                    if size < 1 or size > 12 * 1024 * 1024:
                         raise ValueError("请求大小无效")
                     payload = json.loads(self.rfile.read(size).decode("utf-8"))
                     method = str(payload["method"])
@@ -143,11 +175,14 @@ class LocalWebServer:
                 self._send_bytes(str(result).encode("utf-8"), content_type)
 
             def _authorized(self) -> bool:
-                return secrets.compare_digest(
+                return owner._basic_authorized(self.headers.get("Authorization", "")) and secrets.compare_digest(
                     self.headers.get("X-Network-Session", ""), owner.token
                 )
 
             def _serve_static(self, request_path: str) -> None:
+                if not owner._basic_authorized(self.headers.get("Authorization", "")):
+                    self._request_basic_auth()
+                    return
                 relative = unquote(request_path).lstrip("/") or "index.html"
                 candidate = (owner.web_root / relative).resolve()
                 try:
@@ -193,6 +228,8 @@ class LocalWebServer:
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Referrer-Policy", "no-referrer")
                 self.send_header(
                     "Content-Security-Policy",
                     "default-src 'self'; style-src 'self' 'unsafe-inline'; "
@@ -201,10 +238,20 @@ class LocalWebServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _request_basic_auth(self) -> None:
+                body = "需要 WebGUI 管理凭据".encode("utf-8")
+                self.send_response(HTTPStatus.UNAUTHORIZED)
+                self.send_header("WWW-Authenticate", 'Basic realm="Network Manager"')
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
             def log_message(self, _format: str, *_args: object) -> None:
                 return
 
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), RequestHandler)
+        self._httpd = ThreadingHTTPServer((self.host, self.port), RequestHandler)
         self._httpd.daemon_threads = True
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
@@ -225,3 +272,21 @@ class LocalWebServer:
         self._thread = None
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2)
+
+    def _basic_authorized(self, authorization: str) -> bool:
+        if not self.access_password:
+            return True
+        if not authorization.startswith("Basic "):
+            return False
+        try:
+            decoded = base64.b64decode(authorization[6:], validate=True).decode("utf-8")
+            username, password = decoded.split(":", 1)
+        except (ValueError, UnicodeDecodeError):
+            return False
+        return secrets.compare_digest(username, self.access_username) and secrets.compare_digest(
+            password, self.access_password
+        )
+
+
+def _is_loopback_host(host: str) -> bool:
+    return host.lower() in {"127.0.0.1", "localhost", "::1"}

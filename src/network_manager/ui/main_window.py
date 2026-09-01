@@ -54,7 +54,16 @@ from network_manager.importers import (
     subscription_from_url,
 )
 from network_manager.mihomo_config import write_mihomo_config
-from network_manager.models import SubscriptionSource, Upstream, validate_config
+from network_manager.models import (
+    NODE_DIALER_POLICY_KEY,
+    NODE_DIALER_PROXY_KEY,
+    SubscriptionSource,
+    Upstream,
+    apply_automatic_node_dialers,
+    clear_node_dialer_references,
+    normalize_node_group_name,
+    validate_config,
+)
 from network_manager.network_probe import (
     detect_download_proxy,
     exit_ip_through_proxy,
@@ -126,6 +135,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.store = ConfigStore(settings_path())
         self.config = self.store.load()
+        if not self.config.close_to_tray:
+            self.config.close_to_tray = True
+            self.store.save(self.config)
         self.config.start_with_windows = get_start_with_windows()
         self.core = CoreManager(core_path(), app_data_dir(), self.config.controller_port)
         self.thread_pool = QThreadPool.globalInstance()
@@ -242,7 +254,7 @@ class MainWindow(QMainWindow):
         core_layout.addWidget(self.sidebar_core_status)
         sidebar_layout.addWidget(core_panel)
         sidebar_layout.addSpacing(12)
-        version = QLabel("Network Manager  ·  v0.4.0")
+        version = QLabel("Network Manager  ·  v0.5.0")
         version.setObjectName("sidebarVersion")
         sidebar_layout.addWidget(version)
 
@@ -1031,9 +1043,15 @@ class MainWindow(QMainWindow):
             kind = request["kind"]
             if kind == "paste":
                 raw_nodes, errors = parse_import_content(request["content"])
-                return {"batches": [(request["name"], "", raw_nodes)], "errors": errors}
+                return {
+                    "batches": [(request["name"], "", raw_nodes)],
+                    "defaultGroup": request.get("group", ""),
+                    "errors": errors,
+                }
             if kind == "subscription":
-                source = subscription_from_url(request["name"], request["url"])
+                source = subscription_from_url(
+                    request["name"], request["url"], request.get("group", "")
+                )
                 content = fetch_subscription(source.url, proxy)
                 raw_nodes, errors = parse_import_content(content)
                 return {
@@ -1076,8 +1094,48 @@ class MainWindow(QMainWindow):
 
     def _accept_import_result(self, result: object) -> None:
         payload = dict(result)
+        subscription_groups = {
+            source.source_id: source.group for source in payload.get("subscriptions", [])
+        }
+        default_group = normalize_node_group_name(payload.get("defaultGroup", ""))
         added = 0
         for source_name, source_id, raw_nodes in payload.get("batches", []):
+            previous_groups = (
+                {
+                    node.name: node.group
+                    for node in self.config.imported_nodes
+                    if node.source_id == source_id and node.group
+                }
+                if source_id
+                else {}
+            )
+            previous_dialers = (
+                {
+                    node.name: node.dialer_proxy
+                    for node in self.config.imported_nodes
+                    if node.source_id == source_id and node.dialer_proxy
+                }
+                if source_id
+                else {}
+            )
+            previous_dialer_policies = (
+                {
+                    node.name: node.dialer_policy
+                    for node in self.config.imported_nodes
+                    if node.source_id == source_id and node.dialer_policy
+                }
+                if source_id
+                else {}
+            )
+            previous_names = (
+                {
+                    node.name
+                    for node in self.config.imported_nodes
+                    if node.source_id == source_id
+                }
+                if source_id
+                else set()
+            )
             if source_id:
                 self.config.imported_nodes = [
                     node for node in self.config.imported_nodes if node.source_id != source_id
@@ -1088,7 +1146,21 @@ class MainWindow(QMainWindow):
                 self.config.imported_nodes,
                 source_id=source_id,
             )
+            for node in prepared:
+                node.group = previous_groups.get(
+                    node.name, subscription_groups.get(source_id, default_group)
+                )
+                if node.name in previous_dialers:
+                    node.config[NODE_DIALER_PROXY_KEY] = previous_dialers[node.name]
+                if node.name in previous_dialer_policies:
+                    node.config[NODE_DIALER_POLICY_KEY] = previous_dialer_policies[
+                        node.name
+                    ]
             self.config.imported_nodes.extend(prepared)
+            clear_node_dialer_references(
+                self.config.imported_nodes,
+                previous_names - {node.name for node in prepared},
+            )
             added += len(prepared)
         for source in payload.get("subscriptions", []):
             self.config.subscriptions = [
@@ -1175,6 +1247,7 @@ class MainWindow(QMainWindow):
                         source.name,
                         source.url,
                         datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        source.group,
                     )
                     batches.append((source.name, source.source_id, nodes))
                     updated.append(refreshed)
@@ -1228,7 +1301,8 @@ class MainWindow(QMainWindow):
         self.config.dns_port = self.dns_port_spin.value()
         self.config.strict_route = self.strict_route_check.isChecked()
         self.config.start_on_launch = self.start_on_launch_check.isChecked()
-        self.config.close_to_tray = self.close_to_tray_check.isChecked()
+        self.config.close_to_tray = True
+        self.close_to_tray_check.setChecked(True)
         self.config.start_with_windows = self.start_with_windows_check.isChecked()
         try:
             set_start_with_windows(self.config.start_with_windows)
@@ -1272,6 +1346,7 @@ class MainWindow(QMainWindow):
         self.mode_caption.setText(MODE_DESCRIPTIONS.get(mode, ""))
 
     def _save_and_apply(self, message: str, *, full_restart: bool = False) -> bool:
+        apply_automatic_node_dialers(self.config.imported_nodes)
         errors = validate_config(self.config)
         if errors:
             QMessageBox.warning(self, "配置无效", "\n".join(errors[:12]))
@@ -1675,12 +1750,13 @@ class MainWindow(QMainWindow):
         self.raise_()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._force_close or not self.config.close_to_tray or not self.tray.isVisible():
+        if self._force_close:
             self.core.stop()
             event.accept()
-            QApplication.quit()
             return
         event.ignore()
+        if not self.tray.isVisible():
+            self.tray.show()
         self.hide()
         if not self._tray_notice_shown:
             self.tray.showMessage(

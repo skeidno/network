@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import ipaddress
+import os
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from network_manager.models import AppConfig, RoutingRule, normalize_rule_value
+from network_manager.models import (
+    NODE_DIALER_POLICY_KEY,
+    NODE_DIALER_PROXY_KEY,
+    AppConfig,
+    RoutingRule,
+    normalize_rule_value,
+)
 
 
 TARGET_NAMES = {
@@ -25,8 +33,10 @@ UPSTREAM_PROCESSES = (
     "v2ray.exe",
     "NetworkManager.exe",
     "network-manager.exe",
-    "python.exe",
-    "pythonw.exe",
+    "network-manager-headless",
+    "mihomo",
+    "sshd",
+    "ssh",
 )
 
 LAN_DOMAIN_SUFFIXES = ("lan", "local", "home.arpa")
@@ -48,6 +58,49 @@ def _lan_bypass_rules() -> list[str]:
     rules = [f"DOMAIN-SUFFIX,{suffix},DIRECT" for suffix in LAN_DOMAIN_SUFFIXES]
     rules.extend(f"IP-CIDR,{cidr},DIRECT,no-resolve" for cidr in LAN_IPV4_CIDRS)
     rules.extend(f"IP-CIDR6,{cidr},DIRECT,no-resolve" for cidr in LAN_IPV6_CIDRS)
+    return rules
+
+
+def _proxy_server_route_exclusions(config: AppConfig) -> list[str]:
+    """Keep IP-based proxy transports outside the TUN default route."""
+    hosts: list[object] = [config.clash.host, config.v2ray.host]
+    hosts.extend(
+        node.config.get("server", "")
+        for node in config.imported_nodes
+        if not node.dialer_proxy
+    )
+    exclusions: list[str] = []
+    for raw_host in hosts:
+        host = str(raw_host).strip().strip("[]")
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        cidr = f"{address}/{address.max_prefixlen}"
+        if cidr not in exclusions:
+            exclusions.append(cidr)
+    return exclusions
+
+
+def _proxy_dialer_route_rules(config: AppConfig) -> list[str]:
+    """Route explicit application connections to proxy endpoints through their relay."""
+    names = {node.name for node in config.imported_nodes}
+    rules: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for node in config.imported_nodes:
+        relay = node.dialer_proxy
+        host = str(node.config.get("server", "")).strip().strip("[]").rstrip(".")
+        key = (host.lower(), relay)
+        if not host or relay not in names or relay == node.name or key in seen:
+            continue
+        seen.add(key)
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            rules.append(f"DOMAIN,{host.lower()},{relay}")
+        else:
+            rule_type = "IP-CIDR6" if address.version == 6 else "IP-CIDR"
+            rules.append(f"{rule_type},{address}/{address.max_prefixlen},{relay},no-resolve")
     return rules
 
 
@@ -112,9 +165,18 @@ def build_mihomo_config(config: AppConfig) -> dict[str, Any]:
             )
         )
         proxies[-1]["udp"] = False
-    proxies.extend(dict(node.config) for node in config.imported_nodes)
+    imported_names = {node.name for node in config.imported_nodes}
+    for node in config.imported_nodes:
+        proxy = dict(node.config)
+        dialer_proxy = str(proxy.pop(NODE_DIALER_PROXY_KEY, "")).strip()
+        proxy.pop(NODE_DIALER_POLICY_KEY, None)
+        if dialer_proxy in imported_names and dialer_proxy != node.name:
+            proxy["dialer-proxy"] = dialer_proxy
+        proxies.append(proxy)
 
     rules = [f"PROCESS-NAME,{name},DIRECT" for name in UPSTREAM_PROCESSES]
+    rules.append("DST-PORT,22,DIRECT")
+    rules.extend(_proxy_dialer_route_rules(config))
     rules.extend(_lan_bypass_rules())
     if config.mode == "RULE":
         rules.extend(_rule_line(rule) for rule in config.rules if rule.enabled)
@@ -141,6 +203,10 @@ def build_mihomo_config(config: AppConfig) -> dict[str, Any]:
         "log-level": "info",
         "ipv6": False,
         "unified-delay": True,
+        "tcp-concurrent": True,
+        "keep-alive-interval": 15,
+        "keep-alive-idle": 15,
+        "disable-keep-alive": False,
         "find-process-mode": "strict",
         "external-controller": f"127.0.0.1:{config.controller_port}",
         "secret": config.controller_secret,
@@ -156,6 +222,7 @@ def build_mihomo_config(config: AppConfig) -> dict[str, Any]:
             "route-exclude-address": [
                 *LAN_IPV4_CIDRS,
                 *LAN_IPV6_CIDRS,
+                *_proxy_server_route_exclusions(config),
             ],
         },
         "sniffer": {
@@ -210,7 +277,10 @@ def build_mihomo_config(config: AppConfig) -> dict[str, Any]:
                 "url": "https://www.gstatic.com/generate_204",
                 "interval": 60,
                 "tolerance": 120,
-                "lazy": False,
+                "lazy": config.mode != "SMART",
+                "timeout": 6000,
+                "max-failed-times": 2,
+                "expected-status": 204,
             },
         ]
     return result
@@ -229,4 +299,6 @@ def write_mihomo_config(config: AppConfig, path: Path) -> Path:
         encoding="utf-8",
     )
     temporary.replace(path)
+    if os.name != "nt":
+        path.chmod(0o600)
     return path

@@ -15,6 +15,51 @@ let coreActionPending = false;
 let coreActionObservedBusy = false;
 let requestedPage = currentPage;
 let pageSwitchFrame = 0;
+let initialRetryTimer = 0;
+let initialFailureCount = 0;
+const COLLAPSED_NODE_GROUPS_KEY = "network-manager.collapsed-node-groups";
+const DEFAULT_SERVER_PROXY_PORT = 24443;
+const collapsedNodeGroups = loadCollapsedNodeGroups();
+
+function serverProxyPortError(port, sshPort) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return "远端代理端口必须在 1 到 65535 之间";
+  }
+  if (port === sshPort) return `远端代理端口不能与 SSH 端口 ${sshPort} 相同`;
+  return "";
+}
+
+function loadCollapsedNodeGroups() {
+  try {
+    const stored = JSON.parse(sessionStorage.getItem(COLLAPSED_NODE_GROUPS_KEY) || "[]");
+    return new Set(Array.isArray(stored) ? stored.filter((name) => typeof name === "string") : []);
+  } catch (_error) {
+    return new Set();
+  }
+}
+
+function saveCollapsedNodeGroups() {
+  try {
+    sessionStorage.setItem(COLLAPSED_NODE_GROUPS_KEY, JSON.stringify([...collapsedNodeGroups]));
+  } catch (_error) {
+    // Session storage is optional in embedded browser profiles.
+  }
+}
+
+function toggleNodeGroup(groupName) {
+  if (collapsedNodeGroups.has(groupName)) collapsedNodeGroups.delete(groupName);
+  else collapsedNodeGroups.add(groupName);
+  saveCollapsedNodeGroups();
+  renderNodes();
+}
+
+function setBootstrapStatus(message, isError = false) {
+  const status = byId("bootstrap-status");
+  if (!status) return;
+  status.classList.toggle("is-error", isError);
+  const label = status.querySelector("strong");
+  if (label) label.textContent = message;
+}
 
 const PAGE_TITLES = {
   overview: "运行概览",
@@ -84,7 +129,8 @@ async function invoke(method, ...args) {
     });
     const payload = await response.json();
     if (!payload.ok) throw new Error(payload.error || "操作失败");
-    window.setTimeout(refreshState, 80);
+    await refreshState();
+    window.setTimeout(refreshState, 120);
     return payload.result;
   } catch (error) {
     showToast("error", error.message || "操作失败");
@@ -146,10 +192,30 @@ async function refreshState() {
   try {
     const response = await apiRequest("/api/state");
     appState = await response.json();
+    initialFailureCount = 0;
+    if (initialRetryTimer) window.clearTimeout(initialRetryTimer);
+    initialRetryTimer = 0;
     renderState();
+    document.body.classList.add("app-ready");
+    window.networkManagerReady = true;
     (appState.toasts || []).forEach((item) => showToast(item.kind, item.message));
   } catch (_error) {
-    byId("overview-status-detail").textContent = "后台连接中断，正在重试";
+    if (appState) {
+      byId("overview-status-detail").textContent = "后台连接中断，正在重试";
+    } else {
+      initialFailureCount += 1;
+      setBootstrapStatus(
+        initialFailureCount < 4 ? "后台正在启动，正在重试…" : "暂时无法连接后台，继续重试…",
+        initialFailureCount >= 4,
+      );
+      if (!initialRetryTimer) {
+        const delay = Math.min(2000, 150 * (2 ** Math.min(initialFailureCount, 4)));
+        initialRetryTimer = window.setTimeout(() => {
+          initialRetryTimer = 0;
+          refreshState();
+        }, delay);
+      }
+    }
   } finally {
     refreshing = false;
   }
@@ -157,8 +223,23 @@ async function refreshState() {
 
 function renderState() {
   if (!appState) return;
+  applyCapabilities();
   renderChrome();
   renderActivePage();
+}
+
+function applyCapabilities() {
+  const capabilities = appState.capabilities || {};
+  const sshDeployment = capabilities.sshDeployment !== false;
+  byId("server-deployment-nav").classList.toggle("is-hidden", !sshDeployment);
+  byId("page-servers").classList.toggle("is-hidden", !sshDeployment);
+  byId("overview-ssh-row").classList.toggle("is-hidden", !sshDeployment);
+  document.querySelectorAll(".desktop-only-setting").forEach((row) => {
+    row.classList.toggle("is-hidden", Boolean(capabilities.headless));
+  });
+  byId("open-logs").classList.toggle("is-hidden", Boolean(capabilities.headless));
+  byId("sidebar-version").textContent = `v${appState.version || ""} · ${capabilities.headless ? "Linux WebGUI" : "WebGUI"}`;
+  if (!sshDeployment && currentPage === "servers") setPage("overview");
 }
 
 function renderChrome() {
@@ -170,6 +251,37 @@ function renderChrome() {
   renderSidebarRate("download", traffic.downloadRate);
   byId("sidebar-memory").textContent = traffic.memoryMb;
   renderSidebarTrafficChart(traffic.downloadSamples, traffic.uploadSamples);
+}
+
+function openBrowserTextFile(accept, handler) {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = accept;
+  input.className = "is-hidden";
+  input.addEventListener("change", async () => {
+    const file = input.files?.[0];
+    input.remove();
+    if (!file) return;
+    try {
+      await handler(file, await file.text());
+    } catch (error) {
+      showToast("error", error.message || "读取文件失败");
+    }
+  }, { once: true });
+  document.body.appendChild(input);
+  input.click();
+}
+
+function downloadTextFile(name, content, contentType = "application/json") {
+  const blob = new Blob([content], { type: `${contentType};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function renderSidebarRate(direction, rate) {
@@ -349,13 +461,28 @@ function renderRules() {
         <td><span class="group-label">${escapeHtml(rule.ruleTypeLabel)}</span></td>
         <td title="${escapeHtml(rule.detail)}"><strong>${escapeHtml(rule.note)}</strong><small>${rule.count} 条匹配</small></td>
         <td><span class="chip">${escapeHtml(rule.targetLabel)}</span></td>
-        <td>整组共用一个出口</td>
+        <td>第 1 阶段：站点域名选择代理出口</td>
         <td class="actions">
           <button class="mini-button" data-rule-action="view" data-rule-group="${rule.groupId}" title="查看全部域名">${icon("file-text")}</button>
           <button class="mini-button" data-rule-action="toggle" data-rule-group="${rule.groupId}" title="${rule.enabled ? "停用整组" : "启用整组"}">${icon(rule.enabled ? "square" : "check")}</button>
           <button class="mini-button" data-rule-action="edit" data-rule-group="${rule.groupId}" title="切换整组出口">${icon("square-pen")}</button>
           <button class="mini-button danger" data-rule-action="delete" data-rule-group="${rule.groupId}" title="删除整组">${icon("trash-2")}</button>
         </td>
+      </tr>`;
+    }
+    if (rule.kind === "relay") {
+      const relayStatus = rule.automatic
+        ? "自动启用"
+        : rule.partiallyEnabled
+          ? "部分配置"
+          : rule.enabled ? "启用" : "直连";
+      return `<tr class="system-rule-row">
+        <td><span class="rule-status${statusClass}">${relayStatus}</span></td>
+        <td><span class="fallback-label">${escapeHtml(rule.ruleTypeLabel)}</span></td>
+        <td title="${escapeHtml(rule.detail)}"><button type="button" class="rule-edit-link" data-rule-action="edit" data-rule-kind="relay" aria-label="编辑代理入口域名和前置节点"><span><strong>代理入口域名 / IP</strong><small>${rule.count} 个入口</small></span>${icon("square-pen")}</button></td>
+        <td><span class="chip">${escapeHtml(rule.targetLabel)}</span></td>
+        <td title="${escapeHtml(rule.note)}">${escapeHtml(rule.note)}</td>
+        <td class="actions"><button class="mini-button" data-rule-action="edit" data-rule-kind="relay" title="编辑代理域名前置">${icon("square-pen")}</button></td>
       </tr>`;
     }
     return `<tr>
@@ -432,37 +559,64 @@ function renderNodes() {
   deleteErrorButton.querySelector("span:last-child").textContent = errorCount
     ? `删除 Error (${errorCount})`
     : "删除 Error";
-  byId("nodes-empty").classList.toggle("is-hidden", nodes.length > 0);
-  byId("node-grid").innerHTML = nodes.map((node) => {
-    const latencyText = node.latencyStatus === "testing"
-      ? "测试中"
-      : node.latencyStatus === "error"
-        ? "Error"
-        : node.latencyStatus === "ok"
-          ? `${node.latency} ms`
-          : "--";
-    const latencyLevel = node.latencyStatus !== "ok"
-      ? node.latencyStatus
-      : node.latency < 300
-        ? "fast"
-        : node.latency < 900
-          ? "medium"
-          : "slow";
-    return `<article class="node-card${node.selected ? " is-selected" : ""}" data-node-select="${escapeHtml(node.name)}" tabindex="0" role="button" aria-label="选择节点 ${escapeHtml(node.name)}">
+  byId("nodes-empty").classList.toggle(
+    "is-hidden", nodes.length > 0 || (appState.nodeGroups || []).length > 0,
+  );
+  const grouped = new Map();
+  nodes.forEach((node) => {
+    const groupName = node.group || node.source || "手动导入";
+    if (!grouped.has(groupName)) grouped.set(groupName, []);
+    grouped.get(groupName).push(node);
+  });
+  const groupOrder = [...new Set([...(appState.nodeGroups || []), ...grouped.keys()])];
+  byId("node-grid").innerHTML = groupOrder.map((groupName) => {
+    const groupNodes = grouped.get(groupName) || [];
+    const groupErrors = groupNodes.filter((node) => node.latencyStatus === "error").length;
+    const custom = (appState.nodeGroups || []).includes(groupName);
+    const collapsed = collapsedNodeGroups.has(groupName);
+    const cards = groupNodes.map((node) => {
+      const latencyText = node.latencyStatus === "testing"
+        ? "测试中"
+        : node.latencyStatus === "error"
+          ? "Error"
+          : node.latencyStatus === "ok"
+            ? `${node.latency} ms`
+            : "--";
+      const latencyLevel = node.latencyStatus !== "ok"
+        ? node.latencyStatus
+        : node.latency < 300
+          ? "fast"
+          : node.latency < 900
+            ? "medium"
+            : "slow";
+      return `<article class="node-card${node.selected ? " is-selected" : ""}" data-node-select="${escapeHtml(node.name)}" tabindex="0" role="button" aria-label="选择节点 ${escapeHtml(node.name)}">
         <div class="node-card-head">
           <strong title="${escapeHtml(node.name)}">${escapeHtml(node.name)}</strong>
           <div class="node-card-actions">
-            <span class="node-latency ${latencyLevel}">${latencyText}</span>
+            <span class="node-latency ${latencyLevel}" title="${escapeHtml(node.latencyMessage || latencyText)}">${latencyText}</span>
+            <button class="mini-button${node.dialerProxy ? " active" : ""}" data-node-dialer="${escapeHtml(node.name)}" title="设置前置/中转节点" aria-label="设置前置/中转节点">${icon("link")}</button>
             <button class="mini-button" data-node-test="${escapeHtml(node.name)}" title="测试该节点" aria-label="测试该节点"${!appState.core.running || node.latencyStatus === "testing" ? " disabled" : ""}>${icon("wifi")}</button>
+            <button class="mini-button" data-node-group="${escapeHtml(node.name)}" title="移动到分组" aria-label="移动到分组">${icon("folder-open")}</button>
             <button class="mini-button danger" data-node-delete="${node.index}" title="删除节点" aria-label="删除节点">${icon("trash-2")}</button>
           </div>
         </div>
-        <div class="node-card-meta"><span class="node-badge">${escapeHtml(node.protocol)}</span></div>
+        <div class="node-card-meta"><span class="node-badge">${escapeHtml(node.protocol)}</span>${node.region ? `<span class="node-badge region">${escapeHtml(node.region)}</span>` : ""}${node.dialerProxy ? `<span class="node-badge chain" title="${node.dialerPolicy === "auto" ? "自动选择" : "手动设置"}前置节点：${escapeHtml(node.dialerProxy)}">${icon("link")}${node.dialerPolicy === "auto" ? "自动经" : "经"} ${escapeHtml(node.dialerProxy)}</span>` : ""}</div>
         <div class="node-card-foot">
           <span title="${escapeHtml(node.source)}">${escapeHtml(node.source || "手动导入")}</span>
           <span title="${escapeHtml(node.server)}">${escapeHtml(node.server)}</span>
         </div>
       </article>`;
+    }).join("");
+    return `<section class="node-group-section${collapsed ? " is-collapsed" : ""}">
+      <button type="button" class="node-group-head" data-node-group-toggle="${escapeHtml(groupName)}" aria-expanded="${collapsed ? "false" : "true"}" title="${collapsed ? "展开" : "收起"}${escapeHtml(groupName)}">
+        ${icon("folder-open")}
+        <strong title="${escapeHtml(groupName)}">${escapeHtml(groupName)}</strong>
+        <span>${custom ? "自定义" : "按来源"} · ${groupNodes.length} 个节点</span>
+        ${groupErrors ? `<span class="node-group-error">${groupErrors} 个异常</span>` : ""}
+        <span class="node-group-chevron" aria-hidden="true">${icon(collapsed ? "chevron-right" : "chevron-down")}</span>
+      </button>
+      <div class="node-group-grid"${collapsed ? " hidden" : ""}>${cards}</div>
+    </section>`;
   }).join("");
 }
 
@@ -491,6 +645,7 @@ function saveSourcesFromForm() {
 
 function renderSubscriptions() {
   const sources = appState.subscriptions;
+  syncSubscriptionGroupSelect();
   byId("subscriptions-empty").classList.toggle("is-hidden", sources.length > 0);
   byId("subscription-grid").innerHTML = sources.map((source) => `
     <article class="subscription-card">
@@ -501,8 +656,23 @@ function renderSubscriptions() {
           <button class="mini-button danger" data-subscription-action="delete" data-index="${source.index}" title="删除">${icon("trash-2")}</button>
         </div>
       </div>
-      <div class="subscription-meta"><span>${source.nodeCount} 个节点</span><span>${escapeHtml(formatTime(source.lastUpdated))}</span></div>
+      <div class="subscription-meta"><span>${source.nodeCount} 个节点${source.group ? ` · ${escapeHtml(source.group)}` : ""}</span><span>${escapeHtml(formatTime(source.lastUpdated))}</span></div>
     </article>`).join("");
+}
+
+function syncSubscriptionGroupSelect() {
+  const select = byId("subscription-group");
+  const groups = appState.nodeGroups || [];
+  const signature = JSON.stringify(groups);
+  if (select.dataset.groupSignature === signature) return;
+  const selected = groups.includes(select.value) ? select.value : "";
+  select.innerHTML = [
+    '<option value="">按订阅来源归类</option>',
+    ...groups.map((group) => `<option value="${escapeHtml(group)}">${escapeHtml(group)}</option>`),
+  ].join("");
+  select.value = selected;
+  select.dataset.groupSignature = signature;
+  rebuildSelectEnhancement(select);
 }
 
 function renderSshServers() {
@@ -519,12 +689,14 @@ function renderSshServers() {
     const task = server.deployment || { status: "idle", stage: "", error: "" };
     const isDeploying = task.status === "deploying";
     const hasError = task.status === "error";
-    const statusText = isDeploying ? "部署中" : hasError ? "部署失败" : server.deployed ? "已部署" : "未部署";
-    const statusClass = server.deployed && !hasError ? " is-running" : hasError ? " is-error" : "";
-    const detail = isDeploying ? task.stage : hasError ? task.error : server.deployedVersion || "等待部署";
-    return `<article class="ssh-server-card${server.deployed ? " is-active" : ""}">
+    const portWarning = server.proxyPortWarning || "";
+    const hasWarning = task.status === "warning" || Boolean(portWarning);
+    const statusText = isDeploying ? "部署中" : hasError ? "部署失败" : portWarning ? "端口需调整" : hasWarning ? "外端口未开放" : server.deployed ? "已部署" : "未部署";
+    const statusClass = hasError ? " is-error" : hasWarning ? " is-warning" : server.deployed ? " is-running" : "";
+    const detail = portWarning || (isDeploying ? task.stage : hasError || hasWarning ? task.error || task.stage : server.deployedVersion || "等待部署");
+    return `<article class="ssh-server-card${server.deployed ? " is-active" : ""}${hasWarning ? " is-warning" : ""}">
       <div class="ssh-server-card-head">
-        <div><h3 title="${escapeHtml(server.name)}">${escapeHtml(server.name)}</h3><p>${escapeHtml(server.username)}@${escapeHtml(server.host)}:${server.port}</p></div>
+        <div><h3 title="${escapeHtml(server.name)}">${escapeHtml(server.name)}</h3><p>${server.region ? `${escapeHtml(server.region)} · ` : ""}${escapeHtml(server.username)}@${escapeHtml(server.host)}:${server.port}</p></div>
         <span class="small-status${statusClass}">${statusText}</span>
       </div>
       <div class="ssh-server-meta">
@@ -670,23 +842,81 @@ function enhanceSelects(container) {
   container.querySelectorAll("select").forEach(enhanceSelect);
 }
 
+function rebuildSelectEnhancement(select) {
+  if (select.dataset.enhanced === "true") {
+    const customSelect = select.nextElementSibling;
+    if (customSelect?.classList.contains("custom-select")) customSelect.remove();
+    delete select.dataset.enhanced;
+    select.classList.remove("enhanced-native-select");
+  }
+  enhanceSelect(select);
+}
+
+function splitRuleValues(value) {
+  return String(value || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+}
+
+function updateProcessPickerCount() {
+  const count = document.querySelectorAll('#modal-rule-process-list input[type="checkbox"]:checked').length;
+  const label = byId("modal-rule-process-count");
+  if (label) label.textContent = count ? `已选择 ${count} 个程序` : "选择正在运行的程序";
+}
+
+function syncRuleValueEditor() {
+  const processRule = byId("modal-rule-type")?.value === "PROCESS-NAME";
+  byId("modal-rule-process-field")?.classList.toggle("is-hidden", !processRule);
+  byId("modal-rule-lines-field")?.classList.toggle("is-hidden", processRule);
+}
+
 function openRuleDialog(rule = null) {
   const typeOptions = RULE_TYPES.map(([value, label]) => `<option value="${value}"${rule?.ruleType === value ? " selected" : ""}>${label}</option>`).join("");
   const targetOptions = TARGETS.map(([value, label]) => `<option value="${value}"${rule?.target === value ? " selected" : ""}>${label}</option>`).join("");
+  const selectedProcesses = new Set(rule?.ruleType === "PROCESS-NAME" ? [rule.value] : []);
+  const runningProcesses = [...new Set([
+    ...(appState.runningProcesses || []),
+    ...selectedProcesses,
+  ])].sort((left, right) => left.localeCompare(right, undefined, { sensitivity: "base" }));
+  const processOptions = runningProcesses.map((name, index) => `
+    <label class="process-picker-option" data-process-search="${escapeHtml(name.toLowerCase())}">
+      <input id="modal-process-${index}" type="checkbox" value="${escapeHtml(name)}"${selectedProcesses.has(name) ? " checked" : ""}>
+      <span title="${escapeHtml(name)}">${escapeHtml(name)}</span>
+    </label>`).join("") || '<div class="process-picker-empty">暂未检测到正在运行的程序</div>';
   openModal(rule ? "编辑规则" : "添加规则", `
     <div class="form-grid">
       <label><span>匹配类型</span><select id="modal-rule-type">${typeOptions}</select></label>
-      <label><span>匹配内容</span><input id="modal-rule-value" value="${escapeHtml(rule?.value || "")}" placeholder="例如 example.com"></label>
+      <div id="modal-rule-process-field" class="wide-field">
+        <span class="field-label">匹配内容</span>
+        <details id="modal-rule-process-picker" class="process-picker">
+          <summary><span id="modal-rule-process-count">选择正在运行的程序</span>${icon("chevron-down")}</summary>
+          <div class="process-picker-menu">
+            <input id="modal-rule-process-search" type="search" placeholder="搜索当前进程">
+            <div id="modal-rule-process-list" class="process-picker-list">${processOptions}</div>
+          </div>
+        </details>
+        <label class="process-manual-field"><span>手动补充（可选，一行一个程序）</span><textarea id="modal-rule-process-manual" rows="3" placeholder="例如 MyApp.exe"></textarea></label>
+      </div>
+      <label id="modal-rule-lines-field" class="wide-field"><span>匹配内容（一行一条）</span><textarea id="modal-rule-values" rows="7" placeholder="例如 example.com\nexample.org">${escapeHtml(rule?.ruleType === "PROCESS-NAME" ? "" : rule?.value || "")}</textarea></label>
       <label><span>流量去向</span><select id="modal-rule-target">${targetOptions}</select></label>
       <label><span>备注</span><input id="modal-rule-note" value="${escapeHtml(rule?.note || "")}" placeholder="可选"></label>
       <label class="switch-row"><span><strong>启用规则</strong><small>保存后立即应用</small></span><input id="modal-rule-enabled" type="checkbox"${rule?.enabled === false ? "" : " checked"}><i></i></label>
     </div>`, [
     { label: "取消", kind: "secondary", action: closeModal },
     { label: "保存", kind: "primary", action: () => {
+      const ruleType = byId("modal-rule-type").value;
+      const values = ruleType === "PROCESS-NAME"
+        ? [
+            ...[...document.querySelectorAll('#modal-rule-process-list input[type="checkbox"]:checked')].map((item) => item.value),
+            ...splitRuleValues(byId("modal-rule-process-manual").value),
+          ]
+        : splitRuleValues(byId("modal-rule-values").value);
+      if (!values.length) {
+        showToast("error", "请至少选择或填写一条匹配内容");
+        return;
+      }
       const payload = {
         index: rule?.index ?? -1,
-        ruleType: byId("modal-rule-type").value,
-        value: byId("modal-rule-value").value,
+        ruleType,
+        values,
         target: byId("modal-rule-target").value,
         note: byId("modal-rule-note").value,
         enabled: byId("modal-rule-enabled").checked,
@@ -696,6 +926,17 @@ function openRuleDialog(rule = null) {
       window.setTimeout(refreshState, 250);
     } },
   ]);
+  const ruleType = byId("modal-rule-type");
+  ruleType.addEventListener("change", syncRuleValueEditor);
+  byId("modal-rule-process-list").addEventListener("change", updateProcessPickerCount);
+  byId("modal-rule-process-search").addEventListener("input", (event) => {
+    const query = event.target.value.trim().toLowerCase();
+    document.querySelectorAll(".process-picker-option").forEach((option) => {
+      option.classList.toggle("is-hidden", !option.dataset.processSearch.includes(query));
+    });
+  });
+  syncRuleValueEditor();
+  updateProcessPickerCount();
 }
 
 function openRuleGroupDialog(group) {
@@ -803,15 +1044,158 @@ function openRuleGroupDomains(group) {
   filter.focus();
 }
 
+function openNodeGroupManager() {
+  const groups = appState.nodeGroups || [];
+  const rows = groups.length
+    ? groups.map((group) => {
+      const count = appState.nodes.filter((node) => node.customGroup === group).length;
+      return `<div class="node-group-row"><span title="${escapeHtml(group)}">${escapeHtml(group)} · ${count} 个节点</span><button class="mini-button danger" data-node-group-delete="${escapeHtml(group)}" title="删除分组" aria-label="删除分组">${icon("trash-2")}</button></div>`;
+    }).join("")
+    : '<div class="node-group-row"><span>尚未创建自定义分组</span></div>';
+  openModal("节点分组管理", `
+    <div class="node-group-manager">
+      <div class="node-group-create"><input id="new-node-group-name" maxlength="40" placeholder="例如 巴西住宅代理"><button id="create-node-group" class="button primary">新建分组</button></div>
+      <div class="group-dialog-summary"><strong>自动归类始终保留</strong><span>未指定自定义分组的节点会按订阅、服务器部署或手动导入来源聚集。</span></div>
+      <div class="node-group-rows">${rows}</div>
+    </div>`, [
+    { label: "完成", kind: "secondary", action: closeModal },
+  ]);
+  const create = () => {
+    const input = byId("new-node-group-name");
+    const name = input.value.trim();
+    if (!name) return;
+    invoke("createNodeGroup", name);
+    closeModal();
+  };
+  byId("create-node-group").addEventListener("click", create);
+  byId("new-node-group-name").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") create();
+  });
+  byId("modal-content").onclick = (event) => {
+    const button = event.target.closest("[data-node-group-delete]");
+    if (!button) return;
+    const name = button.dataset.nodeGroupDelete;
+    confirmAction(
+      "删除节点分组",
+      `删除“${name}”后，其中节点会恢复按来源自动归类。`,
+      () => invoke("deleteNodeGroup", name),
+    );
+  };
+  byId("new-node-group-name").focus();
+}
+
+function openNodeGroupDialog(node) {
+  const groups = appState.nodeGroups || [];
+  const options = [
+    `<option value=""${node.customGroup ? "" : " selected"}>按来源自动归类（${escapeHtml(node.source || "手动导入")}）</option>`,
+    ...groups.map((group) => `<option value="${escapeHtml(group)}"${node.customGroup === group ? " selected" : ""}>${escapeHtml(group)}</option>`),
+  ].join("");
+  openModal("移动节点到分组", `
+    <div class="form-grid">
+      <div class="group-dialog-summary"><strong>${escapeHtml(node.name)}</strong><span>${escapeHtml(node.server)}</span></div>
+      <label><span>目标分组</span><select id="modal-node-group">${options}</select></label>
+    </div>`, [
+    { label: "取消", kind: "secondary", action: closeModal },
+    { label: "应用", kind: "primary", action: () => {
+      invoke("assignNodeGroup", node.name, byId("modal-node-group").value);
+      closeModal();
+    } },
+  ]);
+}
+
+function openNodeDialerDialog(node) {
+  const candidates = appState.nodes.filter((item) => item.name !== node.name);
+  const currentExists = candidates.some((item) => item.name === node.dialerProxy);
+  const options = [
+    `<option value=""${node.dialerProxy ? "" : " selected"}>直接连接</option>`,
+    ...(!currentExists && node.dialerProxy
+      ? [`<option value="${escapeHtml(node.dialerProxy)}" selected>${escapeHtml(node.dialerProxy)}（当前不可用）</option>`]
+      : []),
+    ...candidates.map((item) => `<option value="${escapeHtml(item.name)}"${node.dialerProxy === item.name ? " selected" : ""}>${escapeHtml(item.name)} · ${escapeHtml(item.protocol)}</option>`),
+  ].join("");
+  openModal("设置中转节点", `
+    <div class="form-grid">
+      <div class="group-dialog-summary"><strong>${escapeHtml(node.name)}</strong><span>${escapeHtml(node.server)}</span></div>
+      <label><span>前置/中转节点</span><select id="modal-node-dialer">${options}</select></label>
+    </div>`, [
+    { label: "取消", kind: "secondary", action: closeModal },
+    { label: "应用", kind: "primary", action: () => {
+      invoke("setNodeDialerProxy", node.name, byId("modal-node-dialer").value);
+      closeModal();
+    } },
+  ]);
+}
+
+function openProxyRelayRuleDialog(rule) {
+  const entries = Array.isArray(rule?.entries) ? rule.entries : [];
+  if (!entries.length) {
+    showToast("error", "没有可配置的代理入口");
+    return;
+  }
+  const fields = entries.map((entry, index) => {
+    const candidates = (appState.nodes || []).filter((node) => node.name !== entry.node);
+    const currentValue = entry.policy === "auto"
+      ? "__AUTO__"
+      : entry.relay || "__DIRECT__";
+    const options = [
+      `<option value="__AUTO__"${currentValue === "__AUTO__" ? " selected" : ""}>自动选择（香港 / 海外优先）</option>`,
+      `<option value="__DIRECT__"${currentValue === "__DIRECT__" ? " selected" : ""}>直连，不使用前置节点</option>`,
+      ...candidates.map((node) => `<option value="${escapeHtml(node.name)}"${currentValue === node.name ? " selected" : ""}>${escapeHtml(node.name)} · ${escapeHtml(node.protocol)}</option>`),
+    ].join("");
+    return `<section class="proxy-relay-editor wide-field">
+      <strong>${escapeHtml(entry.node)}</strong>
+      <div class="proxy-relay-fields">
+        <label class="proxy-relay-host"><span>入口域名 / IP</span><input id="modal-proxy-server-${index}" value="${escapeHtml(entry.endpoint)}" placeholder="例如 proxy.example.com" required></label>
+        <label><span>端口</span><input id="modal-proxy-port-${index}" type="number" min="1" max="65535" value="${Number(entry.port) || ""}" required></label>
+        <label class="proxy-relay-target"><span>前置节点</span><select id="modal-proxy-relay-${index}" data-proxy-entry="${escapeHtml(entry.node)}">${options}</select></label>
+      </div>
+    </section>`;
+  }).join("");
+  openModal("编辑代理域名前置", `
+    <div class="form-grid">
+      <div class="group-dialog-summary wide-field"><strong>第 2 阶段</strong><span>入口域名和端口会同步更新对应代理节点；代码或应用直接使用该地址时，也按所选前置节点转发。</span></div>
+      ${fields}
+    </div>`, [
+    { label: "取消", kind: "secondary", action: closeModal },
+    { label: "保存前置规则", kind: "primary", action: () => {
+      const assignments = entries.map((entry, index) => {
+        const value = byId(`modal-proxy-relay-${index}`).value;
+        const server = byId(`modal-proxy-server-${index}`).value.trim();
+        const port = Number(byId(`modal-proxy-port-${index}`).value);
+        const endpoint = { node: entry.node, server, port };
+        if (value === "__AUTO__") return { ...endpoint, mode: "auto", dialer: "" };
+        if (value === "__DIRECT__") return { ...endpoint, mode: "direct", dialer: "" };
+        return { ...endpoint, mode: "manual", dialer: value };
+      });
+      const invalid = assignments.find((entry) => !entry.server || !Number.isInteger(entry.port) || entry.port < 1 || entry.port > 65535);
+      if (invalid) {
+        showToast("error", "请填写有效的代理入口域名 / IP 和端口");
+        return;
+      }
+      invoke("saveProxyRelayRules", JSON.stringify({ assignments }));
+      closeModal();
+    } },
+  ]);
+}
+
 function openPasteDialog() {
+  const groupOptions = [
+    '<option value="">按来源自动归类</option>',
+    ...(appState.nodeGroups || []).map((group) => `<option value="${escapeHtml(group)}">${escapeHtml(group)}</option>`),
+  ].join("");
   openModal("粘贴导入", `
     <div class="form-grid">
-      <label><span>来源名称</span><input id="modal-import-name" value="手动导入"></label>
-      <label><span>订阅或节点内容</span><textarea id="modal-import-content" placeholder="支持 Clash YAML、Base64 订阅及常见节点链接"></textarea></label>
+      <label><span>导入分组</span><select id="modal-import-group">${groupOptions}</select></label>
+      <label><span>订阅或节点内容</span><textarea id="modal-import-content" placeholder="支持 Clash YAML、Base64、分享链接及 主机:端口:用户名:密码"></textarea></label>
     </div>`, [
     { label: "取消", kind: "secondary", action: closeModal },
     { label: "开始导入", kind: "primary", action: () => {
-      invoke("importPaste", byId("modal-import-name").value, byId("modal-import-content").value);
+      invoke(
+        "importPaste",
+        "手动导入",
+        byId("modal-import-content").value,
+        byId("modal-import-group").value,
+      );
       closeModal();
     } },
   ]);
@@ -823,10 +1207,11 @@ function openSshServerDialog(server = null) {
   openModal(server ? "编辑服务器部署" : "添加服务器部署", `
     <div class="form-grid ssh-form-grid">
       <label class="wide-field"><span>名称</span><input id="modal-ssh-name" value="${escapeHtml(server?.name || "我的服务器")}" required></label>
+      <label class="wide-field"><span>地区标签</span><input id="modal-ssh-region" value="${escapeHtml(server?.region || "")}" placeholder="例如 美国、日本、新加坡"></label>
       <label><span>服务器 IP / 域名</span><input id="modal-ssh-host" value="${escapeHtml(server?.host || "")}" placeholder="例如 203.0.113.10" required></label>
       <label><span>SSH 端口</span><input id="modal-ssh-port" type="number" min="1" max="65535" value="${server?.port || 22}" required></label>
       <label><span>用户名</span><input id="modal-ssh-username" value="${escapeHtml(server?.username || "root")}" required></label>
-      <label><span>远端代理端口</span><input id="modal-ssh-proxy-port" type="number" min="1024" max="65535" value="${server?.proxyPort || 24443}" required></label>
+      <label><span>远端代理端口</span><input id="modal-ssh-proxy-port" type="number" min="1" max="65535" value="${server?.proxyPort || DEFAULT_SERVER_PROXY_PORT}" required><small>${server?.deployed ? `当前服务使用 ${server.proxyPort}；可达时无需调整` : `新部署默认建议独立端口 ${DEFAULT_SERVER_PROXY_PORT}`}</small></label>
       <label><span>认证方式</span><select id="modal-ssh-auth"><option value="password"${authMethod === "password" ? " selected" : ""}>账号密码</option><option value="key"${authMethod === "key" ? " selected" : ""}>私钥文件</option><option value="agent"${authMethod === "agent" ? " selected" : ""}>SSH Agent</option></select></label>
       <label id="modal-ssh-secret-field"><span>密码 / 私钥口令</span><input id="modal-ssh-password" type="password" autocomplete="new-password" placeholder="${server?.hasCredential ? "已安全保存，留空保持不变" : "连接凭据"}"></label>
       <label id="modal-ssh-key-field" class="wide-field"><span>私钥路径</span><div class="input-action"><input id="modal-ssh-key-path" value="${escapeHtml(server?.keyPath || "")}" placeholder="选择 OpenSSH 私钥"><button id="modal-pick-ssh-key" type="button" class="icon-button" title="选择私钥" aria-label="选择私钥">${icon("folder-open")}</button></div></label>
@@ -835,13 +1220,22 @@ function openSshServerDialog(server = null) {
     </div>`, [
     { label: "取消", kind: "secondary", action: closeModal },
     { label: "保存", kind: "primary", action: () => {
+      const sshPort = Number(byId("modal-ssh-port").value);
+      const proxyPort = Number(byId("modal-ssh-proxy-port").value);
+      const portError = serverProxyPortError(proxyPort, sshPort);
+      if (portError) {
+        showToast("error", portError);
+        byId("modal-ssh-proxy-port").focus();
+        return;
+      }
       const payload = {
         profileId: server?.profileId || "",
         name: byId("modal-ssh-name").value,
+        region: byId("modal-ssh-region").value,
         host: byId("modal-ssh-host").value,
-        port: Number(byId("modal-ssh-port").value),
+        port: sshPort,
         username: byId("modal-ssh-username").value,
-        proxyPort: Number(byId("modal-ssh-proxy-port").value),
+        proxyPort,
         authMethod: byId("modal-ssh-auth").value,
         keyPath: byId("modal-ssh-key-path").value,
         rememberPassword: byId("modal-ssh-remember").checked,
@@ -965,6 +1359,11 @@ function bindEvents() {
     const button = event.target.closest("[data-rule-action]");
     if (!button) return;
     const action = button.dataset.ruleAction;
+    if (button.dataset.ruleKind === "relay") {
+      const relayRule = appState.rules.find((rule) => rule.kind === "relay");
+      if (action === "edit") openProxyRelayRuleDialog(relayRule);
+      return;
+    }
     const groupId = button.dataset.ruleGroup;
     if (groupId) {
       const group = appState.rules.find((rule) => rule.groupId === groupId);
@@ -989,10 +1388,24 @@ function bindEvents() {
   });
   byId("save-sources").addEventListener("click", saveSourcesFromForm);
   byId("import-paste").addEventListener("click", openPasteDialog);
-  byId("import-file").addEventListener("click", () => invoke("importFile"));
-  byId("portable-config-import").addEventListener("click", () => invoke("importPortableConfig"));
-  byId("portable-config-export").addEventListener("click", () => invoke("exportPortableConfig"));
+  byId("import-file").addEventListener("click", () => {
+    if (appState?.capabilities?.browserFiles) {
+      openBrowserTextFile(".yaml,.yml,.txt,.conf,.json", (file, content) => invoke("importFileText", file.name, content));
+    } else invoke("importFile");
+  });
+  byId("portable-config-import").addEventListener("click", () => {
+    if (appState?.capabilities?.browserFiles) {
+      openBrowserTextFile(".json", (_file, content) => invoke("importPortableConfigText", content));
+    } else invoke("importPortableConfig");
+  });
+  byId("portable-config-export").addEventListener("click", async () => {
+    if (appState?.capabilities?.browserFiles) {
+      const content = await invoke("exportPortableConfigText");
+      if (content) downloadTextFile("network-manager-config.json", content);
+    } else invoke("exportPortableConfig");
+  });
   byId("test-all-nodes").addEventListener("click", () => invoke("testAllNodes"));
+  byId("manage-node-groups").addEventListener("click", openNodeGroupManager);
   byId("delete-error-nodes").addEventListener("click", () => {
     const count = appState.nodes.filter((node) => node.latencyStatus === "error").length;
     if (!count) return;
@@ -1003,10 +1416,29 @@ function bindEvents() {
     );
   });
   byId("node-grid").addEventListener("click", (event) => {
+    const groupToggle = event.target.closest("[data-node-group-toggle]");
+    if (groupToggle) {
+      toggleNodeGroup(groupToggle.dataset.nodeGroupToggle);
+      return;
+    }
     const testButton = event.target.closest("[data-node-test]");
     if (testButton) {
       event.stopPropagation();
       invoke("testNode", testButton.dataset.nodeTest);
+      return;
+    }
+    const groupButton = event.target.closest("[data-node-group]");
+    if (groupButton) {
+      event.stopPropagation();
+      const node = appState.nodes.find((item) => item.name === groupButton.dataset.nodeGroup);
+      if (node) openNodeGroupDialog(node);
+      return;
+    }
+    const dialerButton = event.target.closest("[data-node-dialer]");
+    if (dialerButton) {
+      event.stopPropagation();
+      const node = appState.nodes.find((item) => item.name === dialerButton.dataset.nodeDialer);
+      if (node) openNodeDialerDialog(node);
       return;
     }
     const button = event.target.closest("[data-node-delete]");
@@ -1028,7 +1460,12 @@ function bindEvents() {
     }
   });
   byId("add-subscription").addEventListener("click", () => {
-    invoke("addSubscription", byId("subscription-name").value, byId("subscription-url").value);
+    invoke(
+      "addSubscription",
+      byId("subscription-name").value,
+      byId("subscription-url").value,
+      byId("subscription-group").value,
+    );
   });
   byId("refresh-subscriptions").addEventListener("click", () => invoke("refreshAllSubscriptions"));
   byId("subscription-grid").addEventListener("click", (event) => {
@@ -1057,7 +1494,7 @@ function bindEvents() {
       dnsPort: Number(byId("setting-dns-port").value),
       strictRoute: byId("setting-strict-route").checked,
       startOnLaunch: byId("setting-start-on-launch").checked,
-      closeToTray: byId("setting-close-to-tray").checked,
+      closeToTray: true,
       startWithWindows: byId("setting-start-with-windows").checked,
     }));
     settingsInitialized = false;
@@ -1071,6 +1508,7 @@ function bindEvents() {
 }
 
 function initialize() {
+  window.networkManagerReady = false;
   bindEvents();
   refreshState();
   window.setInterval(refreshState, 1000);

@@ -5,6 +5,21 @@ on:
   pull_request:
 
 jobs:
+  test-linux-headless:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          cache: pip
+      - run: python -m pip install -e . pytest ruff
+      - run: python -m ruff check src tests scripts
+      - run: python -m pytest -q tests/test_headless.py tests/test_linux_packaging.py
+      - run: python -m network_manager.headless --help
+      - run: node --check src/network_manager/web/app.js
+      - run: bash -n apps/linux/install.sh
+
   test-windows:
     runs-on: windows-latest
     steps:

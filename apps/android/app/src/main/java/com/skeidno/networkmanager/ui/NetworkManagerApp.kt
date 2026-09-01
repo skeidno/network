@@ -25,6 +25,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -41,7 +42,9 @@ import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Dns
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FileOpen
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.PlayArrow
@@ -57,6 +60,9 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -101,7 +107,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.skeidno.networkmanager.R
 import com.skeidno.networkmanager.data.AppState
 import com.skeidno.networkmanager.data.FallbackTarget
+import com.skeidno.networkmanager.data.InstalledApp
 import com.skeidno.networkmanager.data.LatencyStatus
+import com.skeidno.networkmanager.data.PortableRule
 import com.skeidno.networkmanager.data.ProxyNode
 import com.skeidno.networkmanager.data.RoutingMode
 import com.skeidno.networkmanager.data.Subscription
@@ -123,6 +131,7 @@ fun NetworkManagerApp(
     onExportConfiguration: () -> Unit,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val installedApps by viewModel.installedApps.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     var page by rememberSaveable { mutableStateOf(AppPage.Overview) }
 
@@ -169,9 +178,12 @@ fun NetworkManagerApp(
                         )
                         AppPage.Rules -> RulesPage(
                             state = state,
+                            installedApps = installedApps,
                             onRuleEnabled = viewModel::setRuleGroupEnabled,
                             onCommonTarget = viewModel::setCommonRuleTarget,
                             onFallback = viewModel::setFallback,
+                            onSavePortableRules = viewModel::savePortableRules,
+                            onDeletePortableRule = viewModel::deletePortableRule,
                             onShowNodes = { page = AppPage.Nodes },
                         )
                         AppPage.Nodes -> NodesPage(
@@ -179,6 +191,9 @@ fun NetworkManagerApp(
                             onSelect = viewModel::selectNode,
                             onDelete = viewModel::deleteNode,
                             onDeleteErrors = viewModel::deleteErrorNodes,
+                            onCreateGroup = viewModel::createNodeGroup,
+                            onAssignGroup = viewModel::assignNodeGroup,
+                            onDeleteGroup = viewModel::deleteNodeGroup,
                             onImportText = viewModel::importText,
                             onAddSubscription = viewModel::addSubscription,
                             onRefreshSubscription = viewModel::refreshSubscription,
@@ -311,6 +326,15 @@ private fun StatusPanel(state: AppState) {
             Column {
                 Text(if (state.running) "全流量接管运行中" else "全流量接管已停止", fontWeight = FontWeight.Bold)
                 Text(state.statusMessage, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                if (state.error.isNotBlank()) {
+                    Text(
+                        state.error,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
         }
     }
@@ -371,13 +395,18 @@ private fun TrafficChart(download: List<Long>, upload: List<Long>) {
 @Composable
 private fun RulesPage(
     state: AppState,
+    installedApps: List<InstalledApp>,
     onRuleEnabled: (Boolean) -> Unit,
     onCommonTarget: (FallbackTarget) -> Unit,
     onFallback: (FallbackTarget) -> Unit,
+    onSavePortableRules: (Int?, String, List<String>, FallbackTarget) -> Boolean,
+    onDeletePortableRule: (Int) -> Unit,
     onShowNodes: () -> Unit,
 ) {
     var showDomains by rememberSaveable { mutableStateOf(false) }
     var showPortableRules by rememberSaveable { mutableStateOf(false) }
+    var showRuleEditor by rememberSaveable { mutableStateOf(false) }
+    var editingRuleIndex by rememberSaveable { mutableStateOf<Int?>(null) }
     val selected = state.nodes.firstOrNull { it.id == state.selectedNodeId }
     Column(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
@@ -417,10 +446,27 @@ private fun RulesPage(
                 onSelected = onCommonTarget,
             )
         }
-        if (state.portableRules.isNotEmpty()) {
-            SectionCard(title = "跨设备规则", icon = Icons.AutoMirrored.Filled.Rule) {
-                Text("${state.portableRules.size} 条域名 / IP 规则", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                TextButton(onClick = { showPortableRules = true }) { Text("查看规则") }
+        SectionCard(title = "跨设备规则", icon = Icons.AutoMirrored.Filled.Rule) {
+            Text(
+                "${state.portableRules.size} 条应用 / 域名 / IP 规则",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    modifier = Modifier.testTag("rules-add"),
+                    onClick = {
+                        editingRuleIndex = null
+                        showRuleEditor = true
+                    },
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("添加规则")
+                }
+                OutlinedButton(
+                    enabled = state.portableRules.isNotEmpty(),
+                    onClick = { showPortableRules = true },
+                ) { Text("查看规则") }
             }
         }
         SectionCard(title = "强制保底规则", icon = Icons.Default.CheckCircle) {
@@ -455,14 +501,35 @@ private fun RulesPage(
             title = { Text("跨设备规则") },
             text = {
                 LazyColumn(Modifier.heightIn(max = 440.dp)) {
-                    items(state.portableRules) { rule ->
-                        Column(Modifier.fillMaxWidth().padding(vertical = 9.dp)) {
-                            Text(rule.value, fontWeight = FontWeight.SemiBold)
-                            Text(
-                                "${rule.type} · ${rule.target.label}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                    itemsIndexed(state.portableRules) { index, rule ->
+                        Row(
+                            Modifier.fillMaxWidth().padding(vertical = 5.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f).padding(vertical = 4.dp)) {
+                                Text(rule.value, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    "${portableRuleTypeLabel(rule.type)} · ${rule.target.label}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            IconButton(
+                                onClick = {
+                                    editingRuleIndex = index
+                                    showPortableRules = false
+                                    showRuleEditor = true
+                                },
+                            ) {
+                                Icon(Icons.Default.Edit, contentDescription = "编辑规则")
+                            }
+                            IconButton(onClick = { onDeletePortableRule(index) }) {
+                                Icon(
+                                    Icons.Default.DeleteOutline,
+                                    contentDescription = "删除规则",
+                                    tint = MaterialTheme.colorScheme.error,
+                                )
+                            }
                         }
                         HorizontalDivider()
                     }
@@ -471,6 +538,191 @@ private fun RulesPage(
             confirmButton = { TextButton(onClick = { showPortableRules = false }) { Text("完成") } },
         )
     }
+    if (showRuleEditor) {
+        PortableRuleEditorDialog(
+            ruleIndex = editingRuleIndex,
+            rule = editingRuleIndex?.let(state.portableRules::getOrNull),
+            installedApps = installedApps,
+            onDismiss = { showRuleEditor = false },
+            onSave = { index, type, values, target ->
+                if (onSavePortableRules(index, type, values, target)) {
+                    showRuleEditor = false
+                }
+            },
+        )
+    }
+}
+
+private val portableRuleOptions = listOf(
+    "package_name" to "应用程序",
+    "domain" to "完整域名",
+    "domain_suffix" to "域名后缀",
+    "domain_keyword" to "域名关键词",
+    "ip_cidr" to "IP / CIDR",
+)
+
+private fun portableRuleTypeLabel(type: String): String =
+    portableRuleOptions.firstOrNull { it.first == type }?.second ?: type
+
+@Composable
+private fun PortableRuleEditorDialog(
+    ruleIndex: Int?,
+    rule: PortableRule?,
+    installedApps: List<InstalledApp>,
+    onDismiss: () -> Unit,
+    onSave: (Int?, String, List<String>, FallbackTarget) -> Unit,
+) {
+    var ruleType by remember(ruleIndex, rule) { mutableStateOf(rule?.type ?: "domain_suffix") }
+    var target by remember(ruleIndex, rule) { mutableStateOf(rule?.target ?: FallbackTarget.Proxy) }
+    var valuesText by remember(ruleIndex, rule) {
+        mutableStateOf(rule?.value.takeUnless { rule?.type == "package_name" }.orEmpty())
+    }
+    var manualPackages by remember(ruleIndex, rule) {
+        mutableStateOf(rule?.value.takeIf { rule?.type == "package_name" }.orEmpty())
+    }
+    var selectedPackages by remember(ruleIndex, rule) {
+        mutableStateOf(
+            rule?.takeIf { it.type == "package_name" }?.let { setOf(it.value) }.orEmpty(),
+        )
+    }
+    var appSearch by remember(ruleIndex, rule) { mutableStateOf("") }
+    var typeMenuExpanded by remember { mutableStateOf(false) }
+    val visibleApps = installedApps.filter { app ->
+        appSearch.isBlank() ||
+            app.label.contains(appSearch, ignoreCase = true) ||
+            app.packageName.contains(appSearch, ignoreCase = true)
+    }
+    val manualValues = manualPackages.lineSequence().map(String::trim).filter(String::isNotBlank).toList()
+    val values = if (ruleType == "package_name") {
+        (selectedPackages + manualValues).toList().sorted()
+    } else {
+        valuesText.lineSequence().map(String::trim).filter(String::isNotBlank).toList()
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (rule == null) "添加分流规则" else "编辑分流规则") },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Box {
+                    OutlinedButton(
+                        modifier = Modifier.fillMaxWidth().testTag("rule-type-selector"),
+                        onClick = { typeMenuExpanded = true },
+                    ) {
+                        Text(portableRuleTypeLabel(ruleType), Modifier.weight(1f))
+                    }
+                    DropdownMenu(
+                        expanded = typeMenuExpanded,
+                        onDismissRequest = { typeMenuExpanded = false },
+                    ) {
+                        portableRuleOptions.forEach { (value, label) ->
+                            DropdownMenuItem(
+                                text = { Text(label) },
+                                onClick = {
+                                    ruleType = value
+                                    typeMenuExpanded = false
+                                },
+                            )
+                        }
+                    }
+                }
+                if (ruleType == "package_name") {
+                    Text("选择已安装应用（可多选）", fontWeight = FontWeight.SemiBold)
+                    OutlinedTextField(
+                        value = appSearch,
+                        onValueChange = { appSearch = it },
+                        label = { Text("搜索应用或包名") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth().testTag("rule-app-search"),
+                    )
+                    Surface(
+                        modifier = Modifier.fillMaxWidth().heightIn(max = 230.dp),
+                        shape = RoundedCornerShape(6.dp),
+                        border = CardDefaults.outlinedCardBorder(),
+                    ) {
+                        LazyColumn {
+                            items(visibleApps, key = InstalledApp::packageName) { app ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            selectedPackages = if (app.packageName in selectedPackages) {
+                                                selectedPackages - app.packageName
+                                            } else {
+                                                selectedPackages + app.packageName
+                                            }
+                                        }
+                                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Checkbox(
+                                        checked = app.packageName in selectedPackages,
+                                        onCheckedChange = { checked ->
+                                            selectedPackages = if (checked) {
+                                                selectedPackages + app.packageName
+                                            } else {
+                                                selectedPackages - app.packageName
+                                            }
+                                        },
+                                    )
+                                    Column(Modifier.weight(1f)) {
+                                        Text(app.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        Text(
+                                            app.packageName,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    OutlinedTextField(
+                        value = manualPackages,
+                        onValueChange = { manualPackages = it },
+                        label = { Text("其他包名（一行一个）") },
+                        minLines = 2,
+                        maxLines = 4,
+                        modifier = Modifier.fillMaxWidth().testTag("rule-package-values"),
+                    )
+                } else {
+                    OutlinedTextField(
+                        value = valuesText,
+                        onValueChange = { valuesText = it },
+                        label = { Text("匹配内容（一行一条）") },
+                        minLines = 6,
+                        maxLines = 10,
+                        modifier = Modifier.fillMaxWidth().testTag("rule-values"),
+                    )
+                }
+                Text("流量去向", fontWeight = FontWeight.SemiBold)
+                SegmentedChoice(
+                    options = FallbackTarget.entries,
+                    selected = target,
+                    label = { it.label },
+                    onSelected = { target = it },
+                )
+                Text(
+                    "将保存 ${values.distinctBy(String::lowercase).size} 条规则",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                modifier = Modifier.testTag("rule-save"),
+                enabled = values.isNotEmpty(),
+                onClick = { onSave(ruleIndex, ruleType, values, target) },
+            ) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }
 
 @Composable
@@ -479,8 +731,11 @@ private fun NodesPage(
     onSelect: (String) -> Unit,
     onDelete: (String) -> Unit,
     onDeleteErrors: () -> Unit,
-    onImportText: (String) -> Unit,
-    onAddSubscription: (String, String) -> Unit,
+    onCreateGroup: (String) -> Unit,
+    onAssignGroup: (String, String) -> Unit,
+    onDeleteGroup: (String) -> Unit,
+    onImportText: (String, String) -> Unit,
+    onAddSubscription: (String, String, String) -> Unit,
     onRefreshSubscription: (String) -> Unit,
     onDeleteSubscription: (String) -> Unit,
     onTest: () -> Unit,
@@ -489,8 +744,14 @@ private fun NodesPage(
     var importDialog by rememberSaveable { mutableStateOf(false) }
     var deleteNodeId by rememberSaveable { mutableStateOf<String?>(null) }
     var deleteErrorsDialog by rememberSaveable { mutableStateOf(false) }
+    var groupManager by rememberSaveable { mutableStateOf(false) }
+    var groupNodeId by rememberSaveable { mutableStateOf<String?>(null) }
     val errorCount = state.nodes.count { it.latencyStatus == LatencyStatus.Error }
     val testing = state.nodes.any { it.latencyStatus == LatencyStatus.Testing }
+    val groupedNodes = state.nodes.groupBy { node ->
+        node.group.ifBlank { node.sourceName.ifBlank { "手动导入" } }
+    }
+    val groupOrder = (state.nodeGroups + groupedNodes.keys).distinct()
     LazyVerticalGrid(
         columns = GridCells.Adaptive(168.dp),
         modifier = Modifier.fillMaxSize(),
@@ -503,7 +764,10 @@ private fun NodesPage(
                 modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Button(onClick = { importDialog = true }) {
+                Button(
+                    onClick = { importDialog = true },
+                    modifier = Modifier.testTag("nodes-import"),
+                ) {
                     Icon(Icons.Default.Add, contentDescription = null)
                     Spacer(Modifier.width(6.dp))
                     Text("导入")
@@ -527,6 +791,11 @@ private fun NodesPage(
                         },
                     )
                 }
+                OutlinedButton(onClick = { groupManager = true }) {
+                    Icon(Icons.Default.Folder, contentDescription = null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("分组")
+                }
             }
         }
         if (state.subscriptions.isNotEmpty()) {
@@ -536,18 +805,41 @@ private fun NodesPage(
                     state.subscriptions.forEach { subscription ->
                         SubscriptionRow(subscription, onRefreshSubscription, onDeleteSubscription)
                     }
-                    Text("节点", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
                 }
             }
         }
-        items(state.nodes, key = { it.id }) { node ->
-            NodeCard(
-                node = node,
-                selected = node.id == state.selectedNodeId,
-                onClick = { onSelect(node.id) },
-                onTest = { onTestNode(node.id) },
-                onDelete = { deleteNodeId = node.id },
-            )
+        groupOrder.forEach { groupName ->
+            val groupNodes = groupedNodes[groupName].orEmpty()
+            item(key = "group-$groupName", span = { GridItemSpan(maxLineSpan) }) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp, bottom = 2.dp)
+                        .testTag("node-group-$groupName"),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(19.dp))
+                    Spacer(Modifier.width(7.dp))
+                    Text(groupName, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Spacer(Modifier.width(8.dp))
+                    Text("${groupNodes.size} 个", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    val failed = groupNodes.count { it.latencyStatus == LatencyStatus.Error }
+                    if (failed > 0) {
+                        Spacer(Modifier.width(8.dp))
+                        Text("$failed 个异常", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            }
+            items(groupNodes, key = { it.id }) { node ->
+                NodeCard(
+                    node = node,
+                    selected = node.id == state.selectedNodeId,
+                    onClick = { onSelect(node.id) },
+                    onTest = { onTestNode(node.id) },
+                    onGroup = { groupNodeId = node.id },
+                    onDelete = { deleteNodeId = node.id },
+                )
+            }
         }
         if (state.nodes.isEmpty()) {
             item(span = { GridItemSpan(maxLineSpan) }) {
@@ -557,14 +849,15 @@ private fun NodesPage(
     }
     if (importDialog) {
         ImportDialog(
+            groups = state.nodeGroups,
             onDismiss = { importDialog = false },
-            onImportText = {
+            onImportText = { content, group ->
                 importDialog = false
-                onImportText(it)
+                onImportText(content, group)
             },
-            onAddSubscription = { name, url ->
+            onAddSubscription = { name, url, group ->
                 importDialog = false
-                onAddSubscription(name, url)
+                onAddSubscription(name, url, group)
             },
         )
     }
@@ -597,6 +890,29 @@ private fun NodesPage(
             },
         )
     }
+    if (groupManager) {
+        NodeGroupManagerDialog(
+            groups = state.nodeGroups,
+            nodes = state.nodes,
+            onCreate = onCreateGroup,
+            onDelete = onDeleteGroup,
+            onDismiss = { groupManager = false },
+        )
+    }
+    groupNodeId?.let { nodeId ->
+        val node = state.nodes.firstOrNull { it.id == nodeId }
+        if (node != null) {
+            NodeGroupPickerDialog(
+                node = node,
+                groups = state.nodeGroups,
+                onAssign = { group ->
+                    onAssignGroup(node.id, group)
+                    groupNodeId = null
+                },
+                onDismiss = { groupNodeId = null },
+            )
+        }
+    }
 }
 
 @Composable
@@ -616,7 +932,11 @@ private fun SubscriptionRow(
             Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
                 Text(subscription.name, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text("${subscription.nodeCount} 个节点", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    "${subscription.nodeCount} 个节点${subscription.group.takeIf(String::isNotBlank)?.let { " · $it" }.orEmpty()}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             IconButton(onClick = { onRefresh(subscription.id) }) {
                 Icon(Icons.Default.Refresh, contentDescription = "刷新订阅")
@@ -634,6 +954,7 @@ private fun NodeCard(
     selected: Boolean,
     onClick: () -> Unit,
     onTest: () -> Unit,
+    onGroup: () -> Unit,
     onDelete: () -> Unit,
 ) {
     val borderColor = if (selected) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline
@@ -658,12 +979,150 @@ private fun NodeCard(
                     Icon(Icons.Default.DeleteOutline, contentDescription = "删除节点", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(19.dp))
                 }
             }
-            AssistChip(onClick = {}, label = { Text(node.protocol, fontSize = 11.sp) })
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                AssistChip(onClick = {}, label = { Text(node.protocol, fontSize = 11.sp) })
+                Spacer(Modifier.weight(1f))
+                IconButton(onClick = onGroup, modifier = Modifier.size(32.dp)) {
+                    Icon(Icons.Default.Folder, contentDescription = "移动到分组", modifier = Modifier.size(19.dp))
+                }
+            }
             Spacer(Modifier.weight(1f))
             Text(node.sourceName, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text("${node.server}:${node.port}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
+}
+
+@Composable
+private fun NodeGroupManagerDialog(
+    groups: List<String>,
+    nodes: List<ProxyNode>,
+    onCreate: (String) -> Unit,
+    onDelete: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var name by rememberSaveable { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("节点分组管理") },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    "未指定自定义分组的节点，会按订阅、服务器部署或手动导入来源自动归类。",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it.take(40) },
+                        modifier = Modifier.weight(1f),
+                        label = { Text("新分组名称") },
+                        singleLine = true,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Button(
+                        enabled = name.isNotBlank(),
+                        onClick = {
+                            onCreate(name.trim())
+                            name = ""
+                        },
+                    ) { Text("新建") }
+                }
+                if (groups.isEmpty()) {
+                    Text("尚未创建自定义分组", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                } else {
+                    groups.forEach { group ->
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("managed-node-group-$group"),
+                            shape = RoundedCornerShape(7.dp),
+                            border = CardDefaults.outlinedCardBorder(),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 5.dp, bottom = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(group, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text(
+                                        "${nodes.count { it.group == group }} 个节点",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                IconButton(onClick = { onDelete(group) }) {
+                                    Icon(
+                                        Icons.Default.DeleteOutline,
+                                        contentDescription = "删除分组",
+                                        tint = MaterialTheme.colorScheme.error,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
+    )
+}
+
+@Composable
+private fun NodeGroupPickerDialog(
+    node: ProxyNode,
+    groups: List<String>,
+    onAssign: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("移动到分组") },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(node.name, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                val automaticLabel = "按来源自动归类（${node.sourceName.ifBlank { "手动导入" }}）"
+                if (node.group.isBlank()) {
+                    Button(modifier = Modifier.fillMaxWidth(), onClick = { onAssign("") }) {
+                        Text(automaticLabel, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                } else {
+                    OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = { onAssign("") }) {
+                        Text(automaticLabel, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                groups.forEach { group ->
+                    if (node.group == group) {
+                        Button(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("assign-node-group-$group"),
+                            onClick = { onAssign(group) },
+                        ) {
+                            Text(group, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    } else {
+                        OutlinedButton(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("assign-node-group-$group"),
+                            onClick = { onAssign(group) },
+                        ) {
+                            Text(group, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }
 
 @Composable
@@ -699,13 +1158,16 @@ private enum class ImportMode { Subscription, Text }
 
 @Composable
 private fun ImportDialog(
+    groups: List<String>,
     onDismiss: () -> Unit,
-    onImportText: (String) -> Unit,
-    onAddSubscription: (String, String) -> Unit,
+    onImportText: (String, String) -> Unit,
+    onAddSubscription: (String, String, String) -> Unit,
 ) {
     var mode by rememberSaveable { mutableStateOf(ImportMode.Subscription) }
     var name by rememberSaveable { mutableStateOf("") }
     var value by rememberSaveable { mutableStateOf("") }
+    var group by rememberSaveable { mutableStateOf("") }
+    var groupMenu by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("导入节点") },
@@ -726,11 +1188,40 @@ private fun ImportDialog(
                         singleLine = true,
                     )
                 }
+                Box {
+                    OutlinedButton(
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = { groupMenu = true },
+                    ) {
+                        Text(
+                            if (group.isBlank()) "分组：按来源自动归类" else "分组：$group",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    DropdownMenu(expanded = groupMenu, onDismissRequest = { groupMenu = false }) {
+                        (listOf("") + groups).forEach { option ->
+                            DropdownMenuItem(
+                                text = { Text(option.ifBlank { "按来源自动归类" }) },
+                                onClick = {
+                                    group = option
+                                    groupMenu = false
+                                },
+                            )
+                        }
+                    }
+                }
                 OutlinedTextField(
                     value = value,
                     onValueChange = { value = it },
-                    modifier = Modifier.fillMaxWidth().heightIn(min = if (mode == ImportMode.Text) 150.dp else 56.dp),
-                    label = { Text(if (mode == ImportMode.Subscription) "订阅地址" else "节点链接、Base64 或 Clash YAML") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = if (mode == ImportMode.Text) 150.dp else 56.dp)
+                        .testTag("import-value"),
+                    label = { Text(if (mode == ImportMode.Subscription) "订阅地址" else "分享链接、代理 IP、Base64 或 Clash YAML") },
+                    supportingText = if (mode == ImportMode.Text) {
+                        { Text("代理 IP：主机:端口:用户名:密码") }
+                    } else null,
                     leadingIcon = { Icon(if (mode == ImportMode.Subscription) Icons.Default.Link else Icons.Default.ContentPaste, contentDescription = null) },
                     singleLine = mode == ImportMode.Subscription,
                 )
@@ -739,9 +1230,13 @@ private fun ImportDialog(
         confirmButton = {
             Button(
                 enabled = value.isNotBlank(),
+                modifier = Modifier.testTag("import-confirm"),
                 onClick = {
-                    if (mode == ImportMode.Subscription) onAddSubscription(name, value.trim())
-                    else onImportText(value.trim())
+                    if (mode == ImportMode.Subscription) {
+                        onAddSubscription(name, value.trim(), group)
+                    } else {
+                        onImportText(value.trim(), group)
+                    }
                 },
             ) { Text("导入") }
         },
@@ -759,7 +1254,7 @@ private fun SettingsPage(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         SectionCard(title = "应用信息", icon = Icons.Default.Settings) {
-            InfoRow("版本", "Android 0.4.0")
+            InfoRow("版本", "Android 0.5.0")
             HorizontalDivider()
             InfoRow("代理核心", "sing-box 1.13.20 · libbox")
             HorizontalDivider()

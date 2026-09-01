@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 import paramiko
 
-from network_manager.models import SshServerProfile
+from network_manager.models import SshServerProfile, server_proxy_port_error
 
 
 SING_BOX_VERSION = "1.13.20"
@@ -42,6 +42,8 @@ class DeploymentResult:
     deployed_at: str
     firewall: str
     reused: bool = False
+    public_reachable: bool | None = None
+    public_error: str = ""
 
 
 def deployment_source_id(profile_id: str) -> str:
@@ -82,6 +84,9 @@ class ServerProxyDeployer:
         credential: str = "",
         progress: Callable[[str], None] | None = None,
     ) -> DeploymentResult:
+        port_error = server_proxy_port_error(profile.proxy_port, profile.port)
+        if port_error:
+            raise ServerDeploymentError(port_error)
         report = progress or (lambda _stage: None)
         report("正在连接 SSH")
         client = self._connect(profile, credential)
@@ -151,7 +156,7 @@ class ServerProxyDeployer:
                     pass
             client.close()
 
-    def inspect(self, profile: SshServerProfile, credential: str = "") -> dict[str, str]:
+    def inspect(self, profile: SshServerProfile, credential: str = "") -> dict[str, object]:
         client = self._connect(profile, credential)
         try:
             status = self._run(
@@ -162,9 +167,48 @@ class ServerProxyDeployer:
                 client,
                 f"test -x {REMOTE_BINARY} && {REMOTE_BINARY} version | head -n 1 || true",
             ).strip()
-            return {"status": status or "not-installed", "version": version}
+            result: dict[str, object] = {
+                "status": status or "not-installed",
+                "version": version,
+            }
+            if status == "active":
+                raw_config = self._run(
+                    client,
+                    f"test -r {REMOTE_ROOT}/config.json && "
+                    f"cat {REMOTE_ROOT}/config.json || true",
+                )
+                node = self._node_from_remote_config(profile, raw_config)
+                if node is not None:
+                    result["nodeConfig"] = node
+            return result
         finally:
             client.close()
+
+    @staticmethod
+    def _node_from_remote_config(
+        profile: SshServerProfile, raw_config: str
+    ) -> dict[str, object] | None:
+        try:
+            config = json.loads(raw_config)
+            inbounds = config.get("inbounds", [])
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        for inbound in inbounds:
+            if not isinstance(inbound, dict):
+                continue
+            try:
+                listen_port = int(inbound.get("listen_port", 0))
+            except (TypeError, ValueError):
+                continue
+            password = str(inbound.get("password", ""))
+            if (
+                inbound.get("type") == "shadowsocks"
+                and inbound.get("method") == SHADOWSOCKS_METHOD
+                and listen_port == profile.proxy_port
+                and password
+            ):
+                return build_shadowsocks_node(profile, password)
+        return None
 
     def _connect(self, profile: SshServerProfile, credential: str) -> paramiko.SSHClient:
         options: dict[str, object] = {

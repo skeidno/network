@@ -2,6 +2,7 @@ package com.skeidno.networkmanager.ui
 
 import android.app.Application
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.TrafficStats
 import android.net.Uri
 import android.os.Process
@@ -10,12 +11,15 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.skeidno.networkmanager.data.AppRepository
 import com.skeidno.networkmanager.data.FallbackTarget
+import com.skeidno.networkmanager.data.InstalledApp
 import com.skeidno.networkmanager.data.RoutingMode
 import com.skeidno.networkmanager.vpn.NetworkVpnService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -25,9 +29,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     private val mutableMessages = MutableSharedFlow<String>(extraBufferCapacity = 4)
     val messages = mutableMessages.asSharedFlow()
+    private val mutableInstalledApps = MutableStateFlow<List<InstalledApp>>(emptyList())
+    val installedApps = mutableInstalledApps.asStateFlow()
 
     init {
         viewModelScope.launch { sampleTraffic() }
+        viewModelScope.launch(Dispatchers.Default) {
+            mutableInstalledApps.value = loadLaunchableApps()
+        }
     }
 
     fun setMode(mode: RoutingMode) {
@@ -50,6 +59,30 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         applyConfigurationIfRunning()
     }
 
+    fun savePortableRules(
+        index: Int?,
+        type: String,
+        values: List<String>,
+        target: FallbackTarget,
+    ): Boolean = runCatching {
+        repository.savePortableRules(index, type, values, target)
+    }.fold(
+        onSuccess = { count ->
+            mutableMessages.tryEmit("已保存 $count 条规则")
+            applyConfigurationIfRunning()
+            true
+        },
+        onFailure = {
+            mutableMessages.tryEmit(it.message ?: "规则保存失败")
+            false
+        },
+    )
+
+    fun deletePortableRule(index: Int) {
+        repository.deletePortableRule(index)
+        applyConfigurationIfRunning()
+    }
+
     fun selectNode(id: String) {
         repository.selectNode(id)
         applyConfigurationIfRunning()
@@ -60,6 +93,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         applyConfigurationIfRunning()
     }
 
+    fun createNodeGroup(name: String) {
+        runCatching { repository.createNodeGroup(name) }
+            .onFailure { mutableMessages.tryEmit(it.message ?: "创建分组失败") }
+    }
+
+    fun assignNodeGroup(id: String, name: String) {
+        runCatching { repository.assignNodeGroup(id, name) }
+            .onFailure { mutableMessages.tryEmit(it.message ?: "更新分组失败") }
+    }
+
+    fun deleteNodeGroup(name: String) = repository.deleteNodeGroup(name)
+
     fun deleteErrorNodes() {
         val removed = repository.deleteErrorNodes()
         if (removed == 0) return
@@ -69,17 +114,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun importText(content: String) {
+    fun importText(content: String, group: String = "") {
         viewModelScope.launch {
-            runCatching { withContext(Dispatchers.Default) { repository.importText(content) } }
+            runCatching {
+                withContext(Dispatchers.Default) { repository.importText(content, group = group) }
+            }
                 .onSuccess { mutableMessages.emit("已导入 $it 个节点") }
                 .onFailure { mutableMessages.emit(it.message ?: "导入失败") }
         }
     }
 
-    fun addSubscription(name: String, url: String) {
+    fun addSubscription(name: String, url: String, group: String = "") {
         viewModelScope.launch {
-            runCatching { repository.addSubscription(name, url) }
+            runCatching { repository.addSubscription(name, url, group) }
                 .onSuccess { mutableMessages.emit("订阅更新完成，共 $it 个节点") }
                 .onFailure { mutableMessages.emit(it.message ?: "订阅导入失败") }
         }
@@ -180,6 +227,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }.onFailure { mutableMessages.emit(it.message ?: "配置应用失败") }
         }
+    }
+
+    private fun loadLaunchableApps(): List<InstalledApp> {
+        val application = getApplication<Application>()
+        val packageManager = application.packageManager
+        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        return packageManager.queryIntentActivities(intent, PackageManager.MATCH_ALL)
+            .map { resolveInfo ->
+                InstalledApp(
+                    label = resolveInfo.loadLabel(packageManager).toString()
+                        .ifBlank { resolveInfo.activityInfo.packageName },
+                    packageName = resolveInfo.activityInfo.packageName,
+                )
+            }
+            .filterNot { it.packageName == application.packageName }
+            .distinctBy(InstalledApp::packageName)
+            .sortedBy { it.label.lowercase() }
     }
 
     private suspend fun sampleTraffic() {
