@@ -4,6 +4,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager.NameNotFoundException
 import android.net.VpnService
 import android.os.Build
@@ -185,7 +186,11 @@ class NetworkVpnService : VpnService(), CommandServerHandler {
     }
 
     override fun setSystemProxyEnabled(enabled: Boolean) = Unit
-    override fun writeDebugMessage(message: String?) = Unit
+    override fun writeDebugMessage(message: String?) {
+        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            Log.d(CORE_LOG_TAG, message.orEmpty())
+        }
+    }
 
     override fun onRevoke() {
         stopCore()
@@ -241,5 +246,6 @@ class NetworkVpnService : VpnService(), CommandServerHandler {
         private const val CHANNEL_ID = "network-manager-vpn"
         private const val NOTIFICATION_ID = 1101
         private const val LOG_TAG = "NetworkVpnService"
+        private const val CORE_LOG_TAG = "NetworkVpnCore"
     }
 }

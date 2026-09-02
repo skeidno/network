@@ -173,7 +173,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repository.testAllNodes()
             val available = state.value.nodes.count { it.latencyMs != null }
-            mutableMessages.emit("批量测速完成，$available 个节点可连接")
+            mutableMessages.emit("批量入口检测完成，$available 个节点端口可连接")
         }
     }
 
@@ -181,10 +181,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             runCatching { repository.testNode(id) }
                 .onSuccess { node ->
-                    val result = node.latencyMs?.let { "${it} ms" } ?: "测速失败"
+                    val result = node.latencyMs?.let { "入口 ${it} ms" } ?: "入口检测失败"
                     mutableMessages.emit("${node.name}：$result")
                 }
-                .onFailure { mutableMessages.emit(it.message ?: "节点测速失败") }
+                .onFailure { mutableMessages.emit(it.message ?: "节点入口检测失败") }
         }
     }
 

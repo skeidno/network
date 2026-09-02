@@ -2,6 +2,7 @@ package com.skeidno.networkmanager.vpn
 
 import com.skeidno.networkmanager.data.AppState
 import com.skeidno.networkmanager.data.FallbackTarget
+import com.skeidno.networkmanager.data.PortableRule
 import com.skeidno.networkmanager.data.ProxyNode
 import com.skeidno.networkmanager.data.RoutingMode
 import org.json.JSONArray
@@ -72,6 +73,10 @@ object SingBoxConfigBuilder {
             )
         orderedNodes.mapNotNull { proxyEndpointRelayRule(it, nodeIdsByName) }
             .forEach(rules::put)
+        val enabledPortableRules = state.portableRules.filter { it.enabled }
+        enabledPortableRules.filter { it.type == "package_name" }
+            .mapNotNull { rule -> toRouteRule(rule, orderedNodes.isNotEmpty()) }
+            .forEach(rules::put)
         if (state.ruleGroup.enabled) {
             val commonOutbound = if (
                 state.commonRuleTarget == FallbackTarget.Proxy && orderedNodes.isNotEmpty()
@@ -82,24 +87,9 @@ object SingBoxConfigBuilder {
                     .put("outbound", commonOutbound),
             )
         }
-        state.portableRules.filter { it.enabled }.forEach { rule ->
-            val field = when (rule.type) {
-                "package_name" -> "package_name"
-                "domain" -> "domain"
-                "domain_suffix" -> "domain_suffix"
-                "domain_keyword" -> "domain_keyword"
-                "ip_cidr" -> "ip_cidr"
-                else -> return@forEach
-            }
-            val target = if (
-                rule.target == FallbackTarget.Proxy && orderedNodes.isNotEmpty()
-            ) "proxy" else "direct"
-            rules.put(
-                JSONObject()
-                    .put(field, JSONArray().put(rule.value))
-                    .put("outbound", target),
-            )
-        }
+        enabledPortableRules.filterNot { it.type == "package_name" }
+            .mapNotNull { rule -> toRouteRule(rule, orderedNodes.isNotEmpty()) }
+            .forEach(rules::put)
         val finalOutbound = when (state.mode) {
             RoutingMode.Global -> if (orderedNodes.isEmpty()) "direct" else "proxy"
             RoutingMode.Smart -> if (orderedNodes.isEmpty()) "direct" else "smart"
@@ -108,17 +98,55 @@ object SingBoxConfigBuilder {
                 state.fallbackTarget == FallbackTarget.Proxy && orderedNodes.isNotEmpty()
             ) "proxy" else "direct"
         }
+        val dnsServers = JSONArray()
+            .put(JSONObject().put("type", "local").put("tag", "local"))
+        if (orderedNodes.isNotEmpty()) {
+            dnsServers.put(remoteDnsServer("remote-proxy", "proxy"))
+            if (state.mode == RoutingMode.Smart) {
+                dnsServers.put(remoteDnsServer("remote-smart", "smart"))
+            }
+        }
+        val dnsRules = JSONArray()
+            .put(
+                JSONObject()
+                    .put("domain_suffix", JSONArray(lanDomainSuffixes))
+                    .put("action", "route")
+                    .put("server", "local"),
+            )
+        enabledPortableRules.filter { it.type == "package_name" }
+            .mapNotNull { rule -> toDnsRule(rule, orderedNodes.isNotEmpty()) }
+            .forEach(dnsRules::put)
+        if (state.ruleGroup.enabled) {
+            val commonServer = if (
+                state.commonRuleTarget == FallbackTarget.Proxy && orderedNodes.isNotEmpty()
+            ) "remote-proxy" else "local"
+            dnsRules.put(
+                JSONObject()
+                    .put("domain_suffix", JSONArray(state.ruleGroup.domains))
+                    .put("action", "route")
+                    .put("server", commonServer),
+            )
+        }
+        enabledPortableRules.filterNot { it.type == "package_name" }
+            .mapNotNull { rule -> toDnsRule(rule, orderedNodes.isNotEmpty()) }
+            .forEach(dnsRules::put)
+        val finalDnsServer = when (state.mode) {
+            RoutingMode.Global -> if (orderedNodes.isEmpty()) "local" else "remote-proxy"
+            RoutingMode.Smart -> if (orderedNodes.isEmpty()) "local" else "remote-smart"
+            RoutingMode.Direct -> "local"
+            RoutingMode.Rule -> if (
+                state.fallbackTarget == FallbackTarget.Proxy && orderedNodes.isNotEmpty()
+            ) "remote-proxy" else "local"
+        }
 
         return JSONObject()
             .put("log", JSONObject().put("level", "info").put("timestamp", true))
             .put(
                 "dns",
                 JSONObject()
-                    .put(
-                        "servers",
-                        JSONArray().put(JSONObject().put("type", "local").put("tag", "local")),
-                    )
-                    .put("final", "local")
+                    .put("servers", dnsServers)
+                    .put("rules", dnsRules)
+                    .put("final", finalDnsServer)
                     .put("strategy", "prefer_ipv4"),
             )
             .put(
@@ -141,10 +169,59 @@ object SingBoxConfigBuilder {
                 JSONObject()
                     .put("rules", rules)
                     .put("final", finalOutbound)
+                    .put("default_domain_resolver", "local")
                     .put("auto_detect_interface", true),
             )
             .toString(2)
     }
+
+    private fun toRouteRule(rule: PortableRule, hasProxy: Boolean): JSONObject? {
+        val field = when (rule.type) {
+            "package_name" -> "package_name"
+            "domain" -> "domain"
+            "domain_suffix" -> "domain_suffix"
+            "domain_keyword" -> "domain_keyword"
+            "ip_cidr" -> "ip_cidr"
+            else -> return null
+        }
+        val target = if (rule.target == FallbackTarget.Proxy && hasProxy) "proxy" else "direct"
+        return JSONObject()
+            .put(field, JSONArray().put(rule.value))
+            .put("outbound", target)
+    }
+
+    private fun toDnsRule(rule: PortableRule, hasProxy: Boolean): JSONObject? {
+        val field = when (rule.type) {
+            "package_name" -> "package_name"
+            "domain" -> "domain"
+            "domain_suffix" -> "domain_suffix"
+            "domain_keyword" -> "domain_keyword"
+            else -> return null
+        }
+        val server = if (rule.target == FallbackTarget.Proxy && hasProxy) {
+            "remote-proxy"
+        } else {
+            "local"
+        }
+        return JSONObject()
+            .put(field, JSONArray().put(rule.value))
+            .put("action", "route")
+            .put("server", server)
+    }
+
+    private fun remoteDnsServer(tag: String, detour: String): JSONObject = JSONObject()
+        .put("type", "https")
+        .put("tag", tag)
+        .put("server", "1.1.1.1")
+        .put("server_port", 443)
+        .put("path", "/dns-query")
+        .put(
+            "tls",
+            JSONObject()
+                .put("enabled", true)
+                .put("server_name", "cloudflare-dns.com"),
+        )
+        .put("detour", detour)
 
     internal fun toOutbound(
         node: ProxyNode,

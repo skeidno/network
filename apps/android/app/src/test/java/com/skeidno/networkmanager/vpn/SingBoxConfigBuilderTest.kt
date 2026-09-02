@@ -53,6 +53,8 @@ class SingBoxConfigBuilderTest {
         )
 
         assertEquals("proxy", config.getJSONObject("route").getString("final"))
+        assertEquals("remote-proxy", config.getJSONObject("dns").getString("final"))
+        assertEquals("local", config.getJSONObject("route").getString("default_domain_resolver"))
         assertEquals("node-1", config.getJSONArray("outbounds").getJSONObject(1).getString("default"))
     }
 
@@ -69,6 +71,9 @@ class SingBoxConfigBuilderTest {
         assertEquals("urltest", smart.getString("type"))
         assertEquals("1m", smart.getString("interval"))
         assertEquals(120, smart.getInt("tolerance"))
+        val dns = config.getJSONObject("dns")
+        assertEquals("remote-smart", dns.getString("final"))
+        assertEquals("smart", dns.getJSONArray("servers").getJSONObject(2).getString("detour"))
     }
 
     @Test
@@ -106,9 +111,74 @@ class SingBoxConfigBuilderTest {
         )
 
         val rules = config.getJSONObject("route").getJSONArray("rules")
-        val appRule = rules.getJSONObject(5)
+        val appRule = rules.getJSONObject(4)
         assertEquals("com.discord", appRule.getJSONArray("package_name").getString(0))
         assertEquals("proxy", appRule.getString("outbound"))
+    }
+
+    @Test
+    fun applicationRulesTakePriorityOverAllDomainRules() {
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(
+                AppState(
+                    mode = RoutingMode.Rule,
+                    fallbackTarget = FallbackTarget.Direct,
+                    selectedNodeId = node.id,
+                    nodes = listOf(node),
+                    portableRules = listOf(
+                        PortableRule("domain_suffix", "example.com", FallbackTarget.Direct),
+                        PortableRule("package_name", "com.example.app", FallbackTarget.Proxy),
+                        PortableRule("domain", "api.example.com", FallbackTarget.Direct),
+                    ),
+                ),
+            ),
+        )
+
+        val rules = config.getJSONObject("route").getJSONArray("rules")
+        val appRuleIndex = (0 until rules.length()).first {
+            rules.getJSONObject(it).has("package_name")
+        }
+        val publicDomainRuleIndexes = (0 until rules.length()).filter { index ->
+            val rule = rules.getJSONObject(index)
+            val values = rule.optJSONArray("domain") ?: rule.optJSONArray("domain_suffix")
+                ?: rule.optJSONArray("domain_keyword")
+            values != null && (0 until values.length()).any { valueIndex ->
+                values.getString(valueIndex) !in setOf("lan", "local", "home.arpa")
+            }
+        }
+        val appRule = rules.getJSONObject(appRuleIndex)
+
+        assertTrue(publicDomainRuleIndexes.all { appRuleIndex < it })
+        assertEquals(2, appRule.length())
+        assertEquals("com.example.app", appRule.getJSONArray("package_name").getString(0))
+        assertEquals("proxy", appRule.getString("outbound"))
+    }
+
+    @Test
+    fun applicationProxyRuleAlsoUsesRemoteDnsThroughSelectedNode() {
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(
+                AppState(
+                    mode = RoutingMode.Rule,
+                    fallbackTarget = FallbackTarget.Direct,
+                    selectedNodeId = node.id,
+                    nodes = listOf(node),
+                    portableRules = listOf(
+                        PortableRule("package_name", "com.example.app", FallbackTarget.Proxy),
+                    ),
+                ),
+            ),
+        )
+
+        val dns = config.getJSONObject("dns")
+        val remote = dns.getJSONArray("servers").getJSONObject(1)
+        val appRule = dns.getJSONArray("rules").getJSONObject(1)
+
+        assertEquals("remote-proxy", remote.getString("tag"))
+        assertEquals("proxy", remote.getString("detour"))
+        assertEquals("com.example.app", appRule.getJSONArray("package_name").getString(0))
+        assertEquals("remote-proxy", appRule.getString("server"))
+        assertEquals("local", dns.getString("final"))
     }
 
     @Test

@@ -104,6 +104,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.skeidno.networkmanager.BuildConfig
 import com.skeidno.networkmanager.R
 import com.skeidno.networkmanager.data.AppState
 import com.skeidno.networkmanager.data.DEFAULT_PROXY_DOMAINS
@@ -820,7 +821,7 @@ private fun NodesPage(
                 OutlinedButton(onClick = onTest, enabled = state.nodes.isNotEmpty() && !testing) {
                     Icon(Icons.Default.Speed, contentDescription = null)
                     Spacer(Modifier.width(6.dp))
-                    Text("批量测速")
+                    Text("批量入口检测")
                 }
                 IconButton(
                     onClick = { deleteErrorsDialog = true },
@@ -920,7 +921,7 @@ private fun NodesPage(
     if (deleteErrorsDialog) {
         AlertDialog(
             onDismissRequest = { deleteErrorsDialog = false },
-            title = { Text("删除测速失败节点") },
+            title = { Text("删除入口检测失败节点") },
             text = { Text("确定删除 $errorCount 个 Error 节点？订阅记录会保留，之后刷新原订阅即可恢复。") },
             confirmButton = {
                 TextButton(
@@ -1018,7 +1019,7 @@ private fun NodeCard(
                     enabled = node.latencyStatus != LatencyStatus.Testing,
                     modifier = Modifier.size(32.dp),
                 ) {
-                    Icon(Icons.Default.Wifi, contentDescription = "测试该节点", modifier = Modifier.size(19.dp))
+                    Icon(Icons.Default.Wifi, contentDescription = "检测节点入口", modifier = Modifier.size(19.dp))
                 }
                 IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
                     Icon(Icons.Default.DeleteOutline, contentDescription = "删除节点", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(19.dp))
@@ -1028,7 +1029,11 @@ private fun NodeCard(
                 AssistChip(onClick = {}, label = { Text(node.protocol, fontSize = 11.sp) })
                 Spacer(Modifier.weight(1f))
                 IconButton(onClick = onGroup, modifier = Modifier.size(32.dp)) {
-                    Icon(Icons.Default.Folder, contentDescription = "移动到分组", modifier = Modifier.size(19.dp))
+                    Icon(
+                        Icons.Default.Folder,
+                        contentDescription = "移动 ${node.name} 到分组",
+                        modifier = Modifier.size(19.dp),
+                    )
                 }
             }
             Spacer(Modifier.weight(1f))
@@ -1175,7 +1180,7 @@ private fun Latency(node: ProxyNode) {
     val text = when (node.latencyStatus) {
         LatencyStatus.Idle -> ""
         LatencyStatus.Testing -> "..."
-        LatencyStatus.Available -> "${node.latencyMs} ms"
+        LatencyStatus.Available -> "入口 ${node.latencyMs} ms"
         LatencyStatus.Error -> "Error"
     }
     val color = when {
@@ -1299,7 +1304,7 @@ private fun SettingsPage(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         SectionCard(title = "应用信息", icon = Icons.Default.Settings) {
-            InfoRow("版本", "Android 0.6.0")
+            InfoRow("版本号", "v${BuildConfig.VERSION_NAME}（构建 ${BuildConfig.VERSION_CODE}）")
             HorizontalDivider()
             InfoRow("代理核心", "sing-box 1.13.20 · libbox")
             HorizontalDivider()

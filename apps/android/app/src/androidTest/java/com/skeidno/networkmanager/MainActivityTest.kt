@@ -25,7 +25,7 @@ class MainActivityTest {
     fun mobileNavigationHasNodesAndNoSshScreen() {
         composeRule.onNodeWithTag("page-title").assertIsDisplayed()
         composeRule.onNodeWithTag("nav-nodes").performClick()
-        composeRule.onNodeWithText("批量测速").assertIsDisplayed()
+        composeRule.onNodeWithText("批量入口检测").assertIsDisplayed()
         composeRule.onNodeWithText("SSH 服务器").assertDoesNotExist()
     }
 
@@ -56,6 +56,9 @@ class MainActivityTest {
     @Test
     fun settingsExposePortableImportAndExport() {
         composeRule.onNodeWithTag("nav-settings").performClick()
+        composeRule.onNodeWithText(
+            "v${BuildConfig.VERSION_NAME}（构建 ${BuildConfig.VERSION_CODE}）",
+        ).assertIsDisplayed()
         composeRule.onNodeWithText("跨设备配置").assertIsDisplayed()
         composeRule.onNodeWithText("导入").assertIsDisplayed()
         composeRule.onNodeWithText("导出").assertIsDisplayed()
@@ -84,7 +87,8 @@ class MainActivityTest {
         composeRule.onNodeWithTag("managed-node-group-住宅代理").assertIsDisplayed()
         composeRule.onNodeWithText("完成").performClick()
 
-        composeRule.onNodeWithContentDescription("移动到分组").performClick()
+        composeRule.onNodeWithContentDescription("移动 HTTP Proxy proxy.example.com:18080 到分组")
+            .performClick()
         composeRule.onNodeWithTag("assign-node-group-住宅代理").performClick()
         composeRule.onNodeWithTag("node-group-住宅代理").assertIsDisplayed()
     }
