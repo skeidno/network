@@ -61,6 +61,14 @@ powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1
 
 输出位于 `dist/NetworkManager/`。构建为稳定的一目录包并带管理员清单；Mihomo 作为独立子进程运行，主程序异常退出时 Windows Job Object 会清理核心。
 
+正式安装包使用 Inno Setup 7 构建，默认安装到当前用户目录并创建开始菜单和桌面快捷方式：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build_windows_installer.ps1
+```
+
+输出位于 `release-assets/v<版本>/NetworkManager-Setup-x64-v<版本>.exe`，支持覆盖升级和标准卸载。卸载不会删除 `%LOCALAPPDATA%\NetWorkManger` 中的用户配置。
+
 构建脚本会为当前用户创建桌面快捷方式。也可单独执行：
 
 ```powershell

@@ -20,8 +20,8 @@ android {
         applicationId = "com.skeidno.networkmanager"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.6.1"
+        versionCode = 6
+        versionName = "0.6.2"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
     }
