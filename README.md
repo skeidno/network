@@ -2,6 +2,8 @@
 
 一个跨平台 TUN 分流管理器。Windows 使用一体化桌面窗口，Linux 以 systemd 无界面服务运行并通过 WebGUI 配置；Android 使用原生 `VpnService`。三端共用订阅、节点与分流配置格式。
 
+每个发布版本必须同时提供新构建的 Windows、Android 正式 APK 与 Linux 成品，详细约束见 [`docs/RELEASE_POLICY.md`](docs/RELEASE_POLICY.md)。
+
 ## 当前能力
 
 - 规则分流、全局 Clash、全局 v2ray、全局内置节点、智能节点和直连模式
