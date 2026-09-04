@@ -65,6 +65,11 @@ def tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo:
     return info
 
 
+def copy_release_text(source: Path, destination: Path) -> None:
+    """Write release text with Unix line endings, even when built on Windows."""
+    destination.write_text(source.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build ready-to-install Linux release archives")
     parser.add_argument("--output", type=Path, default=ROOT / "release")
@@ -90,7 +95,7 @@ def main() -> int:
                 LINUX_ROOT / "network-manager.service",
                 LINUX_ROOT / "README.md",
             ):
-                shutil.copy2(source, package_root / source.name)
+                copy_release_text(source, package_root / source.name)
             shutil.copy2(wheel, package_root / wheel.name)
             shutil.copy2(core, package_root / core.name)
             release_manifest = {
