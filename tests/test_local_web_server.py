@@ -62,6 +62,7 @@ def test_loopback_web_server_auth_and_bridge(tmp_path) -> None:
     try:
         page = requests.get(server.url, timeout=3)
         assert page.status_code == 200
+        assert page.raw.version == 11
         assert server.token in page.text
         assert "__SESSION_TOKEN__" not in page.text
 

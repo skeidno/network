@@ -153,6 +153,7 @@ class HeadlessController:
         self._unhealthy_polls = 0
         self._recovery_attempts = 0
         self._next_recovery_at = 0.0
+        self._last_monitor_running = False
         self._closed = False
         self._stop_event = threading.Event()
         self._operations = ThreadPoolExecutor(max_workers=4, thread_name_prefix="headless-op")
@@ -951,19 +952,29 @@ class HeadlessController:
         return True
 
     def _monitor_loop(self) -> None:
-        while not self._stop_event.wait(1):
+        while True:
+            interval = 1.0 if self.core.is_running or self._desired_running or self._busy else 5.0
+            if self._stop_event.wait(interval):
+                return
             for line in self.core.drain_logs(300):
                 self._append_log(line)
-            if self.core.is_running:
-                self._poll_traffic()
-                if self.core.is_healthy:
+            running = self.core.is_running
+            if running:
+                if self._poll_traffic() or self.core.is_healthy:
                     self._unhealthy_polls = 0
                 else:
                     self._unhealthy_polls += 1
-            else:
+            elif self._last_monitor_running:
                 self._traffic_tracker.reset()
                 self._download_samples.append(0.0)
                 self._upload_samples.append(0.0)
+                with self._state_lock:
+                    self._traffic.update(
+                        downloadRate="0 B/s",
+                        uploadRate="0 B/s",
+                        connections="0",
+                    )
+            self._last_monitor_running = running
             if (
                 self._desired_running
                 and not self._busy
@@ -975,7 +986,7 @@ class HeadlessController:
                 self._unhealthy_polls = 0
                 self._queue_core_action("start")
 
-    def _poll_traffic(self) -> None:
+    def _poll_traffic(self) -> bool:
         try:
             response = requests.get(
                 f"http://127.0.0.1:{self.config.controller_port}/connections",
@@ -987,7 +998,7 @@ class HeadlessController:
                 parse_connection_snapshot(response.json())
             )
         except (requests.RequestException, TypeError, ValueError):
-            return
+            return False
         with self._state_lock:
             self._download_samples.append(sample.download_rate)
             self._upload_samples.append(sample.upload_rate)
@@ -998,6 +1009,7 @@ class HeadlessController:
                 "uploadTotal": format_bytes(sample.upload_total),
                 "connections": str(sample.active_connections),
             }
+        return True
 
     def _source_state(self, upstream: Upstream) -> dict[str, object]:
         available = upstream.enabled and port_is_open(upstream.host, upstream.port)

@@ -87,8 +87,12 @@ class WebBridge(QObject):
         self._bridge_closed = False
         self._toast_lock = Lock()
         self._toasts: deque[dict[str, str]] = deque(maxlen=40)
+        self._process_cache_lock = Lock()
         self._running_process_cache: list[str] = []
         self._running_process_cache_at = 0.0
+        self._running_process_refresh_pending = False
+        self._credential_presence_cache: dict[str, tuple[float, bool]] = {}
+        self._is_admin = is_admin()
         self.server_deploy_completed.connect(self._server_deploy_finished)
 
     @Slot(result=str)
@@ -168,7 +172,7 @@ class WebBridge(QObject):
                 "running": running,
                 "busy": self.window._operation_active,
                 "status": core_status,
-                "admin": is_admin(),
+                "admin": self._is_admin,
                 "mode": config.mode,
                 "modeLabel": MODE_LABELS.get(config.mode, config.mode),
                 "mixedPort": config.mixed_port,
@@ -298,8 +302,24 @@ class WebBridge(QObject):
 
     def _running_process_names(self) -> list[str]:
         now = time.monotonic()
-        if now - self._running_process_cache_at < 5:
-            return list(self._running_process_cache)
+        with self._process_cache_lock:
+            cached = list(self._running_process_cache)
+            if now - self._running_process_cache_at < 10:
+                return cached
+            if self._running_process_refresh_pending or self._bridge_closed:
+                return cached
+            self._running_process_refresh_pending = True
+        try:
+            future = self._node_executor.submit(self._scan_running_process_names)
+        except RuntimeError:
+            with self._process_cache_lock:
+                self._running_process_refresh_pending = False
+            return cached
+        future.add_done_callback(self._running_process_names_finished)
+        return cached
+
+    @staticmethod
+    def _scan_running_process_names() -> list[str]:
         names: dict[str, str] = {}
         for process in psutil.process_iter(["name"]):
             try:
@@ -308,17 +328,31 @@ class WebBridge(QObject):
                 continue
             if name:
                 names.setdefault(name.casefold(), name)
-        self._running_process_cache = sorted(names.values(), key=str.casefold)[:600]
-        self._running_process_cache_at = now
-        return list(self._running_process_cache)
+        return sorted(names.values(), key=str.casefold)[:600]
+
+    def _running_process_names_finished(self, future: Future[list[str]]) -> None:
+        try:
+            names = future.result()
+        except Exception:
+            names = None
+        with self._process_cache_lock:
+            if names is not None:
+                self._running_process_cache = names
+                self._running_process_cache_at = time.monotonic()
+            self._running_process_refresh_pending = False
 
     def _has_credential(self, profile: SshServerProfile) -> bool:
         if not profile.remember_password:
             return False
+        cached = self._credential_presence_cache.get(profile.profile_id)
+        if cached and time.monotonic() - cached[0] < 30:
+            return cached[1]
         try:
-            return bool(self.window.credential_store.get(profile.profile_id))
+            present = bool(self.window.credential_store.get(profile.profile_id))
         except CredentialStoreError:
-            return False
+            present = False
+        self._credential_presence_cache[profile.profile_id] = (time.monotonic(), present)
+        return present
 
     def _deployed_node(self, profile: SshServerProfile) -> ImportedNode | None:
         source_id = deployment_source_id(profile.profile_id)
@@ -1321,6 +1355,7 @@ class WebBridge(QObject):
                 self.window.credential_store.set(profile.profile_id, password)
             elif not profile.remember_password:
                 self.window.credential_store.delete(profile.profile_id)
+            getattr(self, "_credential_presence_cache", {}).pop(profile.profile_id, None)
             if endpoint_changed:
                 self.window._save_and_apply("服务器地址已更新，旧节点已移除")
             else:
@@ -1558,6 +1593,7 @@ class WebBridge(QObject):
             self._notify("error", errors[0])
             return
         self.window.credential_store.delete(profile_id)
+        getattr(self, "_credential_presence_cache", {}).pop(profile_id, None)
         self.window.store.save(self.window.config)
         with self._deployment_lock:
             self._deployment_states.pop(profile_id, None)
@@ -1714,6 +1750,7 @@ class WebBridge(QObject):
             try:
                 self.window.credential_store.set(profile_id, credential)
                 profile.remember_password = True
+                getattr(self, "_credential_presence_cache", {}).pop(profile_id, None)
                 message += "，SSH 凭据已安全保存"
             except CredentialStoreError as exc:
                 message += f"；凭据保存失败：{exc}"

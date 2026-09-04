@@ -155,6 +155,12 @@ class MainWindow(QMainWindow):
         self.traffic_network = QNetworkAccessManager(self)
         self._traffic_reply: QNetworkReply | None = None
         self._traffic_core_active = False
+        self._traffic_reply_kind = ""
+        self._last_background_health_request_at = 0.0
+        self._controller_healthy = False
+        self._controller_request_failures = 0
+        self._port_probe_active = False
+        self._last_status_signature: tuple[object, ...] | None = None
 
         self.setWindowTitle("Network Manager")
         self.resize(1180, 780)
@@ -166,7 +172,7 @@ class MainWindow(QMainWindow):
         self._load_config_into_ui()
 
         self.poll_timer = QTimer(self)
-        self.poll_timer.setInterval(700)
+        self.poll_timer.setInterval(1000)
         self.poll_timer.timeout.connect(self._poll_core)
         self.poll_timer.start()
         self.health_timer = QTimer(self)
@@ -254,7 +260,7 @@ class MainWindow(QMainWindow):
         core_layout.addWidget(self.sidebar_core_status)
         sidebar_layout.addWidget(core_panel)
         sidebar_layout.addSpacing(12)
-        version = QLabel("Network Manager  ·  v0.6.2")
+        version = QLabel("Network Manager  ·  v0.6.3")
         version.setObjectName("sidebarVersion")
         sidebar_layout.addWidget(version)
 
@@ -1397,6 +1403,8 @@ class MainWindow(QMainWindow):
         self._update_status("正在启动 TUN 核心...")
 
         def success(_result: object) -> None:
+            self._controller_healthy = True
+            self._controller_request_failures = 0
             self._auto_recovery_attempts = 0
             self._next_auto_recovery_at = 0.0
             self._core_unhealthy_polls = 0
@@ -1433,6 +1441,7 @@ class MainWindow(QMainWindow):
         self._update_status("正在停止并恢复网络...")
 
         def finished() -> None:
+            self._controller_healthy = False
             self._operation_active = False
             self._update_status()
 
@@ -1449,6 +1458,8 @@ class MainWindow(QMainWindow):
             self._update_status()
 
         def success(_result: object) -> None:
+            self._controller_healthy = True
+            self._controller_request_failures = 0
             self._auto_recovery_attempts = 0
             self._next_auto_recovery_at = 0.0
             self._core_unhealthy_polls = 0
@@ -1509,27 +1520,65 @@ class MainWindow(QMainWindow):
         self._run_task(lambda: exit_ip_through_proxy(url), success, "出口检测失败")
 
     def _refresh_port_status(self) -> None:
-        for key, upstream, endpoint_label, status_label in (
-            ("clash", self.config.clash, self.clash_overview_endpoint, self.clash_overview_status),
-            ("v2ray", self.config.v2ray, self.v2ray_overview_endpoint, self.v2ray_overview_status),
-        ):
-            endpoint_label.setText(f"{upstream.host}:{upstream.port}")
-            if not upstream.enabled:
-                status_label.setText("已禁用")
-                state = "muted"
-            elif port_is_open(upstream.host, upstream.port):
-                status_label.setText("正在监听")
-                state = "ok"
-            else:
-                status_label.setText("端口未监听")
-                state = "error"
-            status_label.setProperty("state", state)
-            self._repolish(status_label)
-            widgets = self.source_widgets.get(key)
-            if widgets:
-                widgets["status"].setText(status_label.text())
-                widgets["status"].setProperty("state", state)
-                self._repolish(widgets["status"])
+        if self._port_probe_active:
+            return
+        snapshots = {
+            key: (upstream.enabled, upstream.host, upstream.port)
+            for key, upstream in (("clash", self.config.clash), ("v2ray", self.config.v2ray))
+        }
+        self._port_probe_active = True
+
+        def probe() -> dict[str, tuple[str, int, str, str]]:
+            results: dict[str, tuple[str, int, str, str]] = {}
+            for key, (enabled, host, port) in snapshots.items():
+                if not enabled:
+                    text, state = "已禁用", "muted"
+                elif port_is_open(host, port):
+                    text, state = "正在监听", "ok"
+                else:
+                    text, state = "端口未监听", "error"
+                results[key] = (host, port, text, state)
+            return results
+
+        def apply_results(results: object) -> None:
+            if not isinstance(results, dict):
+                return
+            for key, upstream, endpoint_label, status_label in (
+                (
+                    "clash",
+                    self.config.clash,
+                    self.clash_overview_endpoint,
+                    self.clash_overview_status,
+                ),
+                (
+                    "v2ray",
+                    self.config.v2ray,
+                    self.v2ray_overview_endpoint,
+                    self.v2ray_overview_status,
+                ),
+            ):
+                result = results.get(key)
+                if not result or (upstream.host, upstream.port) != result[:2]:
+                    continue
+                _host, _port, text, state = result
+                endpoint = f"{upstream.host}:{upstream.port}"
+                if endpoint_label.text() != endpoint:
+                    endpoint_label.setText(endpoint)
+                self._set_status_widget(status_label, text, state)
+                widgets = self.source_widgets.get(key)
+                if widgets:
+                    self._set_status_widget(widgets["status"], text, state)
+
+        def finished() -> None:
+            self._port_probe_active = False
+
+        self._run_task(
+            probe,
+            apply_results,
+            "端口检测失败",
+            finished,
+            lambda _message: None,
+        )
 
     def _update_summary(self) -> None:
         if not hasattr(self, "process_rule_count"):
@@ -1558,7 +1607,7 @@ class MainWindow(QMainWindow):
             if self._core_desired_running and not self._next_auto_recovery_at:
                 self._next_auto_recovery_at = time.monotonic() + 2.0
         if running:
-            if self.core.is_healthy:
+            if self._controller_healthy:
                 self._core_unhealthy_polls = 0
             else:
                 self._core_unhealthy_polls += 1
@@ -1591,10 +1640,13 @@ class MainWindow(QMainWindow):
                 self._next_auto_recovery_at = 0.0
                 self.statusBar().showMessage("TUN 核心连续恢复失败，请检查运行日志", 8000)
         self._last_running = running
+        if not running:
+            self._controller_healthy = False
         self._update_status()
 
     def _request_traffic_update(self) -> None:
         if not self.core.is_running:
+            self._controller_healthy = False
             if self._traffic_core_active:
                 self._set_traffic_inactive()
             return
@@ -1606,8 +1658,18 @@ class MainWindow(QMainWindow):
         if self._traffic_reply is not None:
             return
 
+        request_kind = "traffic"
+        request_path = "connections"
+        if not self.isVisible() or self.isMinimized():
+            now = time.monotonic()
+            if now - self._last_background_health_request_at < 4.0:
+                return
+            self._last_background_health_request_at = now
+            request_kind = "health"
+            request_path = "version"
+
         request = QNetworkRequest(
-            QUrl(f"http://127.0.0.1:{self.config.controller_port}/connections")
+            QUrl(f"http://127.0.0.1:{self.config.controller_port}/{request_path}")
         )
         request.setRawHeader(
             b"Authorization", f"Bearer {self.config.controller_secret}".encode("utf-8")
@@ -1615,16 +1677,28 @@ class MainWindow(QMainWindow):
         request.setTransferTimeout(900)
         reply = self.traffic_network.get(request)
         self._traffic_reply = reply
-        reply.finished.connect(lambda current=reply: self._traffic_reply_finished(current))
+        self._traffic_reply_kind = request_kind
+        reply.finished.connect(
+            lambda current=reply, kind=request_kind: self._traffic_reply_finished(current, kind)
+        )
 
-    def _traffic_reply_finished(self, reply: QNetworkReply) -> None:
+    def _traffic_reply_finished(self, reply: QNetworkReply, request_kind: str) -> None:
         if self._traffic_reply is reply:
             self._traffic_reply = None
+            self._traffic_reply_kind = ""
         try:
             if not self.core.is_running:
                 return
             if reply.error() != QNetworkReply.NetworkError.NoError:
-                self._set_traffic_status("数据暂不可用", "error")
+                self._controller_request_failures += 1
+                if self._controller_request_failures >= 3:
+                    self._controller_healthy = False
+                if request_kind == "traffic":
+                    self._set_traffic_status("数据暂不可用", "error")
+                return
+            self._controller_healthy = True
+            self._controller_request_failures = 0
+            if request_kind == "health":
                 return
             payload = json.loads(bytes(reply.readAll()).decode("utf-8"))
             snapshot = parse_connection_snapshot(payload)
@@ -1646,6 +1720,11 @@ class MainWindow(QMainWindow):
         self._set_traffic_status("实时更新", "active")
 
     def _set_traffic_status(self, text: str, state: str) -> None:
+        if (
+            self.traffic_monitor_status.text() == text
+            and self.traffic_monitor_status.property("state") == state
+        ):
+            return
         self.traffic_monitor_status.setText(text)
         self.traffic_monitor_status.setProperty("state", state)
         self._repolish(self.traffic_monitor_status)
@@ -1693,6 +1772,10 @@ class MainWindow(QMainWindow):
             main = detail_override or "全流量接管已停止"
             detail = "当前不会修改系统路由。"
             state = "stopped"
+        signature = (status, main, detail, state, running, self._operation_active)
+        if signature == self._last_status_signature:
+            return
+        self._last_status_signature = signature
         self.header_status.setText(status)
         self.header_status.setProperty("state", state)
         self._repolish(self.header_status)
@@ -1714,6 +1797,15 @@ class MainWindow(QMainWindow):
         )
         self.tray_toggle_action.setText("停止接管" if running else "启动接管")
         self.tray.setToolTip(f"Network Manager · {status}")
+
+    @classmethod
+    def _set_status_widget(cls, widget: QWidget, text: str, state: str) -> None:
+        changed = widget.text() != text or widget.property("state") != state
+        if not changed:
+            return
+        widget.setText(text)
+        widget.setProperty("state", state)
+        cls._repolish(widget)
 
     def _run_task(
         self,

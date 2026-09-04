@@ -8,6 +8,7 @@ import json
 import mimetypes
 from pathlib import Path
 import secrets
+import sys
 import threading
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -33,6 +34,14 @@ class DirectBridgeDispatcher:
         if method not in self.allowed_methods:
             raise ValueError("不支持的操作")
         return getattr(self.bridge, method)(*args)
+
+
+class QuietThreadingHTTPServer(ThreadingHTTPServer):
+    def handle_error(self, request: object, client_address: object) -> None:
+        error = sys.exc_info()[1]
+        if isinstance(error, (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
 
 
 def _qt_dispatcher(bridge: Any, allowed_methods: set[str]) -> Any:
@@ -99,7 +108,7 @@ class LocalWebServer:
             if direct_dispatch
             else _qt_dispatcher(bridge, allowed_methods)
         )
-        self._httpd: ThreadingHTTPServer | None = None
+        self._httpd: QuietThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
     @property
@@ -117,6 +126,7 @@ class LocalWebServer:
 
         class RequestHandler(BaseHTTPRequestHandler):
             server_version = "NetworkManagerWeb/1.0"
+            protocol_version = "HTTP/1.1"
 
             def do_GET(self) -> None:  # noqa: N802
                 path = urlsplit(self.path).path
@@ -255,7 +265,7 @@ class LocalWebServer:
             def log_message(self, _format: str, *_args: object) -> None:
                 return
 
-        self._httpd = ThreadingHTTPServer((self.host, self.port), RequestHandler)
+        self._httpd = QuietThreadingHTTPServer((self.host, self.port), RequestHandler)
         self._httpd.daemon_threads = True
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,

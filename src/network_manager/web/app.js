@@ -11,12 +11,14 @@ let settingsInitialized = false;
 let refreshing = false;
 let logsRefreshing = false;
 let lastLogsRefreshAt = 0;
+let lastLogsContent = null;
 let coreActionPending = false;
 let coreActionObservedBusy = false;
 let requestedPage = currentPage;
 let pageSwitchFrame = 0;
-let initialRetryTimer = 0;
 let initialFailureCount = 0;
+let statePollTimer = 0;
+const renderSignatures = new Map();
 const COLLAPSED_NODE_GROUPS_KEY = "network-manager.collapsed-node-groups";
 const DEFAULT_SERVER_PROXY_PORT = 24443;
 const MIN_RANDOM_SERVER_PROXY_PORT = 10000;
@@ -97,6 +99,19 @@ const TARGETS = [
 
 const byId = (id) => document.getElementById(id);
 
+function setText(target, value) {
+  const element = typeof target === "string" ? byId(target) : target;
+  const text = String(value ?? "");
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function shouldRender(key, value) {
+  const signature = JSON.stringify(value);
+  if (renderSignatures.get(key) === signature) return false;
+  renderSignatures.set(key, signature);
+  return true;
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -131,7 +146,7 @@ async function invoke(method, ...args) {
     const payload = await response.json();
     if (!payload.ok) throw new Error(payload.error || "操作失败");
     await refreshState();
-    window.setTimeout(refreshState, 120);
+    scheduleStateRefresh(statePollDelay());
     return payload.result;
   } catch (error) {
     showToast("error", error.message || "操作失败");
@@ -169,6 +184,7 @@ function commitPageSwitch() {
   });
   byId("page-title").textContent = PAGE_TITLES[page];
   renderActivePage();
+  scheduleStateRefresh(0);
 }
 
 function setPage(page) {
@@ -188,38 +204,56 @@ function setNodeTab(tab) {
 }
 
 async function refreshState() {
-  if (refreshing) return;
+  if (refreshing) return false;
   refreshing = true;
   try {
     const response = await apiRequest("/api/state");
     appState = await response.json();
     initialFailureCount = 0;
-    if (initialRetryTimer) window.clearTimeout(initialRetryTimer);
-    initialRetryTimer = 0;
     renderState();
     document.body.classList.add("app-ready");
     window.networkManagerReady = true;
     (appState.toasts || []).forEach((item) => showToast(item.kind, item.message));
+    return true;
   } catch (_error) {
     if (appState) {
-      byId("overview-status-detail").textContent = "后台连接中断，正在重试";
+      setText("overview-status-detail", "后台连接中断，正在重试");
+      renderSignatures.delete("overview-core");
     } else {
       initialFailureCount += 1;
       setBootstrapStatus(
         initialFailureCount < 4 ? "后台正在启动，正在重试…" : "暂时无法连接后台，继续重试…",
         initialFailureCount >= 4,
       );
-      if (!initialRetryTimer) {
-        const delay = Math.min(2000, 150 * (2 ** Math.min(initialFailureCount, 4)));
-        initialRetryTimer = window.setTimeout(() => {
-          initialRetryTimer = 0;
-          refreshState();
-        }, delay);
-      }
     }
+    return false;
   } finally {
     refreshing = false;
   }
+}
+
+function statePollDelay() {
+  if (!appState) return Math.min(2000, 150 * (2 ** Math.min(initialFailureCount, 4)));
+  if (document.hidden) return 10000;
+  const nodeTesting = (appState.nodes || []).some((node) => node.latencyStatus === "testing");
+  const serverDeploying = (appState.sshServers || []).some(
+    (server) => server.deployment?.status === "deploying",
+  );
+  if (appState.core?.busy || coreActionPending || nodeTesting || serverDeploying) return 500;
+  if (currentPage === "overview" && appState.core?.running) return 1000;
+  if (currentPage === "logs") return 1500;
+  return 2500;
+}
+
+function scheduleStateRefresh(delay = 0) {
+  if (statePollTimer) window.clearTimeout(statePollTimer);
+  statePollTimer = window.setTimeout(pollState, Math.max(0, delay));
+}
+
+async function pollState() {
+  statePollTimer = 0;
+  await refreshState();
+  scheduleStateRefresh(statePollDelay());
 }
 
 function renderState() {
@@ -232,6 +266,7 @@ function renderState() {
 function applyCapabilities() {
   const capabilities = appState.capabilities || {};
   const sshDeployment = capabilities.sshDeployment !== false;
+  if (!shouldRender("capabilities", { capabilities, version: appState.version })) return;
   byId("server-deployment-nav").classList.toggle("is-hidden", !sshDeployment);
   byId("page-servers").classList.toggle("is-hidden", !sshDeployment);
   byId("overview-ssh-row").classList.toggle("is-hidden", !sshDeployment);
@@ -249,11 +284,12 @@ function applyCapabilities() {
 function renderChrome() {
   const { core, traffic } = appState;
   const badge = byId("header-status");
-  badge.textContent = core.status;
-  badge.className = `status-badge${core.running ? " is-running" : ""}${core.busy ? " is-busy" : ""}`;
+  setText(badge, core.status);
+  const badgeClass = `status-badge${core.running ? " is-running" : ""}${core.busy ? " is-busy" : ""}`;
+  if (badge.className !== badgeClass) badge.className = badgeClass;
   renderSidebarRate("upload", traffic.uploadRate);
   renderSidebarRate("download", traffic.downloadRate);
-  byId("sidebar-memory").textContent = traffic.memoryMb;
+  setText("sidebar-memory", traffic.memoryMb);
   renderSidebarTrafficChart(traffic.downloadSamples, traffic.uploadSamples);
 }
 
@@ -291,13 +327,14 @@ function downloadTextFile(name, content, contentType = "application/json") {
 function renderSidebarRate(direction, rate) {
   const parts = String(rate || "0 B/s").trim().split(/\s+/);
   const rawAmount = parts[0] || "0";
-  byId(`sidebar-${direction}`).textContent = Number(rawAmount) === 0 ? "0.00" : rawAmount;
-  byId(`sidebar-${direction}-unit`).textContent = parts.slice(1).join(" ") || "B/s";
+  setText(`sidebar-${direction}`, Number(rawAmount) === 0 ? "0.00" : rawAmount);
+  setText(`sidebar-${direction}-unit`, parts.slice(1).join(" ") || "B/s");
 }
 
 function renderSidebarTrafficChart(downloadValues, uploadValues) {
   const downloads = normalizedSamples(downloadValues);
   const uploads = normalizedSamples(uploadValues);
+  if (!shouldRender("sidebar-traffic-chart", { downloads, uploads })) return;
   const peak = Math.max(1024, ...downloads, ...uploads);
   const width = 200;
   const height = 76;
@@ -324,45 +361,58 @@ function renderOverview() {
     coreActionPending = false;
     coreActionObservedBusy = false;
   }
-  byId("admin-banner").classList.toggle("is-hidden", core.admin);
-  byId("overview-status-title").textContent = core.running ? "全流量接管运行中" : "全流量接管已停止";
-  byId("overview-status-detail").textContent = core.running
-    ? `${core.modeLabel} · 本地入口 127.0.0.1:${core.mixedPort}`
-    : "当前不会修改系统路由";
+  if (shouldRender("overview-core", {
+    admin: core.admin,
+    running: core.running,
+    busy: core.busy,
+    mode: core.mode,
+    modeLabel: core.modeLabel,
+    mixedPort: core.mixedPort,
+    pending: coreActionPending,
+    hasNodes: appState.nodes.length > 0,
+  })) {
+    byId("admin-banner").classList.toggle("is-hidden", core.admin);
+    setText("overview-status-title", core.running ? "全流量接管运行中" : "全流量接管已停止");
+    setText("overview-status-detail", core.running
+      ? `${core.modeLabel} · 本地入口 127.0.0.1:${core.mixedPort}`
+      : "当前不会修改系统路由");
 
-  const toggle = byId("core-toggle");
-  toggle.disabled = core.busy || coreActionPending;
-  toggle.className = `button large ${core.running ? "secondary" : "primary"}`;
-  toggle.innerHTML = (core.busy || coreActionPending)
-    ? `${icon("refresh-cw")}<span>处理中</span>`
-    : core.running
-      ? `${icon("square")}<span>停止接管</span>`
-      : `${icon("play")}<span>启动接管</span>`;
+    const toggle = byId("core-toggle");
+    toggle.disabled = core.busy || coreActionPending;
+    toggle.className = `button large ${core.running ? "secondary" : "primary"}`;
+    toggle.innerHTML = (core.busy || coreActionPending)
+      ? `${icon("refresh-cw")}<span>处理中</span>`
+      : core.running
+        ? `${icon("square")}<span>停止接管</span>`
+        : `${icon("play")}<span>启动接管</span>`;
 
-  byId("mode-switch").innerHTML = MODE_META.map(([mode, label]) => {
-    const disabled = ["GLOBAL_BUILTIN", "SMART"].includes(mode) && appState.nodes.length === 0;
-    return `<button class="segment${core.mode === mode ? " is-active" : ""}" data-mode="${mode}"${disabled ? " disabled" : ""}>${label}</button>`;
-  }).join("");
-  const modeMeta = MODE_META.find(([mode]) => mode === core.mode);
-  byId("mode-description").textContent = modeMeta ? modeMeta[2] : core.modeLabel;
+    byId("mode-switch").innerHTML = MODE_META.map(([mode, label]) => {
+      const disabled = ["GLOBAL_BUILTIN", "SMART"].includes(mode) && appState.nodes.length === 0;
+      return `<button class="segment${core.mode === mode ? " is-active" : ""}" data-mode="${mode}"${disabled ? " disabled" : ""}>${label}</button>`;
+    }).join("");
+    const modeMeta = MODE_META.find(([mode]) => mode === core.mode);
+    setText("mode-description", modeMeta ? modeMeta[2] : core.modeLabel);
+  }
 
-  renderSourceStatus("clash", sources.clash);
-  renderSourceStatus("v2ray", sources.v2ray);
-  renderSourceStatus("ssh", sources.ssh);
-  byId("summary-process").textContent = summary.processRules;
-  byId("summary-network").textContent = summary.networkRules;
-  byId("summary-nodes").textContent = summary.nodes;
-  byId("summary-default").textContent = summary.defaultTarget;
+  if (shouldRender("overview-summary", { summary, sources })) {
+    renderSourceStatus("clash", sources.clash);
+    renderSourceStatus("v2ray", sources.v2ray);
+    renderSourceStatus("ssh", sources.ssh);
+    setText("summary-process", summary.processRules);
+    setText("summary-network", summary.networkRules);
+    setText("summary-nodes", summary.nodes);
+    setText("summary-default", summary.defaultTarget);
+  }
 
-  byId("traffic-status").textContent = traffic.status;
+  setText("traffic-status", traffic.status);
   byId("traffic-status").classList.toggle("is-running", core.running);
-  byId("traffic-download").textContent = traffic.downloadRate;
-  byId("traffic-upload").textContent = traffic.uploadRate;
-  byId("traffic-connections").textContent = traffic.connections;
-  byId("traffic-download-total").textContent = traffic.downloadTotal;
-  byId("traffic-upload-total").textContent = traffic.uploadTotal;
+  setText("traffic-download", traffic.downloadRate);
+  setText("traffic-upload", traffic.uploadRate);
+  setText("traffic-connections", traffic.connections);
+  setText("traffic-download-total", traffic.downloadTotal);
+  setText("traffic-upload-total", traffic.uploadTotal);
   renderTrafficChart(traffic.downloadSamples, traffic.uploadSamples);
-  byId("exit-ip").textContent = appState.exitIp;
+  setText("exit-ip", appState.exitIp);
 }
 
 async function toggleCoreFromUi() {
@@ -376,16 +426,9 @@ async function toggleCoreFromUi() {
   if (!accepted) {
     coreActionPending = false;
     await refreshState();
+    scheduleStateRefresh(statePollDelay());
     return;
   }
-  window.setTimeout(async () => {
-    await refreshState();
-    if (!appState?.core?.busy) {
-      coreActionPending = false;
-      coreActionObservedBusy = false;
-      renderOverview();
-    }
-  }, 500);
 }
 
 function renderSourceStatus(key, source) {
@@ -400,6 +443,7 @@ function renderSourceStatus(key, source) {
 function renderTrafficChart(downloadValues, uploadValues) {
   const downloads = normalizedSamples(downloadValues);
   const uploads = normalizedSamples(uploadValues);
+  if (!shouldRender("traffic-chart", { downloads, uploads })) return;
   const peak = Math.max(1024, ...downloads, ...uploads);
   const width = 1000;
   const height = 185;
@@ -455,6 +499,7 @@ function formatTime(value) {
 
 function renderRules() {
   const rules = appState.rules;
+  if (!shouldRender("rules", { rules, fallbackRule: appState.fallbackRule })) return;
   byId("rules-empty").classList.add("is-hidden");
   const regularRows = rules.map((rule) => {
     const statusClass = rule.partiallyEnabled ? " is-partial" : rule.enabled ? " is-enabled" : "";
@@ -552,6 +597,12 @@ function renderSources() {
 
 function renderNodes() {
   const sourceNodes = appState.nodes;
+  if (!shouldRender("nodes", {
+    nodes: sourceNodes,
+    nodeGroups: appState.nodeGroups,
+    coreRunning: appState.core.running,
+    collapsed: [...collapsedNodeGroups].sort(),
+  })) return;
   const testing = sourceNodes.some((node) => node.latencyStatus === "testing");
   const nodes = testing ? sourceNodes : [...sourceNodes].sort(compareNodeLatency);
   const testButton = byId("test-all-nodes");
@@ -649,6 +700,7 @@ function saveSourcesFromForm() {
 
 function renderSubscriptions() {
   const sources = appState.subscriptions;
+  if (!shouldRender("subscriptions", { sources, nodeGroups: appState.nodeGroups })) return;
   syncSubscriptionGroupSelect();
   byId("subscriptions-empty").classList.toggle("is-hidden", sources.length > 0);
   byId("subscription-grid").innerHTML = sources.map((source) => `
@@ -681,6 +733,7 @@ function syncSubscriptionGroupSelect() {
 
 function renderSshServers() {
   const servers = appState.sshServers || [];
+  if (!shouldRender("ssh-servers", servers)) return;
   byId("ssh-servers-empty").classList.toggle("is-hidden", servers.length > 0);
   const deploying = servers.find((server) => server.deployment?.status === "deploying");
   const deployedCount = servers.filter((server) => server.deployed).length;
@@ -743,7 +796,10 @@ async function refreshLogs() {
     if (currentPage !== "logs") return;
     const output = byId("log-output");
     const shouldFollow = output.scrollTop + output.clientHeight >= output.scrollHeight - 30;
-    output.textContent = logs || "暂无运行日志";
+    const content = logs || "暂无运行日志";
+    if (content === lastLogsContent) return;
+    lastLogsContent = content;
+    output.textContent = content;
     if (shouldFollow) output.scrollTop = output.scrollHeight;
   } catch (_error) { /* state polling reports connectivity */ }
   finally { logsRefreshing = false; }
@@ -976,7 +1032,7 @@ function openRuleDialog(rule = null) {
       };
       invoke("saveRule", JSON.stringify(payload));
       closeModal();
-      window.setTimeout(refreshState, 250);
+      scheduleStateRefresh(250);
     } },
   ]);
   const ruleType = byId("modal-rule-type");
@@ -1032,7 +1088,7 @@ function openRuleGroupDialog(group, focusValues = false) {
         values,
       }));
       closeModal();
-      window.setTimeout(refreshState, 250);
+      scheduleStateRefresh(250);
     } },
   ]);
   document.querySelectorAll(".group-target-option").forEach((option) => {
@@ -1086,7 +1142,7 @@ function openFallbackRuleDialog() {
       const target = document.querySelector(".group-target-option.is-active")?.dataset.groupTarget;
       invoke("setDefaultTarget", target);
       closeModal();
-      window.setTimeout(refreshState, 250);
+      scheduleStateRefresh(250);
     } },
   ]);
   document.querySelectorAll(".group-target-option").forEach((option) => {
@@ -1430,7 +1486,7 @@ function bindEvents() {
     if (event.key === "Escape") closeCustomSelects();
   });
   document.querySelectorAll(".tab").forEach((item) => item.addEventListener("click", () => setNodeTab(item.dataset.nodeTab)));
-  byId("header-refresh").addEventListener("click", refreshState);
+  byId("header-refresh").addEventListener("click", () => scheduleStateRefresh(0));
   byId("core-toggle").addEventListener("click", toggleCoreFromUi);
   byId("mode-switch").addEventListener("click", (event) => {
     const button = event.target.closest("[data-mode]");
@@ -1605,8 +1661,8 @@ function bindEvents() {
 function initialize() {
   window.networkManagerReady = false;
   bindEvents();
-  refreshState();
-  window.setInterval(refreshState, 1000);
+  document.addEventListener("visibilitychange", () => scheduleStateRefresh(document.hidden ? 10000 : 0));
+  pollState();
 }
 
 initialize();

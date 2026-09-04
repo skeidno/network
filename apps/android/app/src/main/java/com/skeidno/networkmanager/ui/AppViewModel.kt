@@ -20,6 +20,9 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -46,7 +49,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     val installedApps = mutableInstalledApps.asStateFlow()
 
     init {
-        viewModelScope.launch { sampleTraffic() }
+        viewModelScope.launch(Dispatchers.Default) { sampleTraffic() }
         viewModelScope.launch(Dispatchers.Default) {
             mutableInstalledApps.value = loadLaunchableApps()
         }
@@ -274,23 +277,46 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun sampleTraffic() {
-        var lastRx = TrafficStats.getUidRxBytes(Process.myUid()).coerceAtLeast(0)
-        var lastTx = TrafficStats.getUidTxBytes(Process.myUid()).coerceAtLeast(0)
-        while (true) {
-            delay(1_000)
-            val rx = TrafficStats.getUidRxBytes(Process.myUid()).coerceAtLeast(0)
-            val tx = TrafficStats.getUidTxBytes(Process.myUid()).coerceAtLeast(0)
-            val current = state.value
-            val down = if (current.running) (rx - lastRx).coerceAtLeast(0) else 0
-            val up = if (current.running) (tx - lastTx).coerceAtLeast(0) else 0
-            repository.updateTraffic(
-                download = down,
-                upload = up,
-                totalDownload = current.totalDownloadBytes + down,
-                totalUpload = current.totalUploadBytes + up,
-            )
-            lastRx = rx
-            lastTx = tx
+        state.map { it.running }.distinctUntilChanged().collectLatest { running ->
+            if (!running) {
+                val current = state.value
+                if (current.downloadBytesPerSecond != 0L || current.uploadBytesPerSecond != 0L) {
+                    repository.updateTraffic(
+                        download = 0,
+                        upload = 0,
+                        totalDownload = current.totalDownloadBytes,
+                        totalUpload = current.totalUploadBytes,
+                    )
+                }
+                return@collectLatest
+            }
+
+            var lastRx = TrafficStats.getUidRxBytes(Process.myUid()).coerceAtLeast(0)
+            var lastTx = TrafficStats.getUidTxBytes(Process.myUid()).coerceAtLeast(0)
+            while (true) {
+                delay(1_000)
+                val rx = TrafficStats.getUidRxBytes(Process.myUid()).coerceAtLeast(0)
+                val tx = TrafficStats.getUidTxBytes(Process.myUid()).coerceAtLeast(0)
+                val current = state.value
+                if (!current.running) return@collectLatest
+                val down = (rx - lastRx).coerceAtLeast(0)
+                val up = (tx - lastTx).coerceAtLeast(0)
+                val chartSettled = current.downloadSamples.all { it == 0L } &&
+                    current.uploadSamples.all { it == 0L }
+                if (
+                    down != 0L || up != 0L || !chartSettled ||
+                    current.downloadBytesPerSecond != 0L || current.uploadBytesPerSecond != 0L
+                ) {
+                    repository.updateTraffic(
+                        download = down,
+                        upload = up,
+                        totalDownload = current.totalDownloadBytes + down,
+                        totalUpload = current.totalUploadBytes + up,
+                    )
+                }
+                lastRx = rx
+                lastTx = tx
+            }
         }
     }
 }
