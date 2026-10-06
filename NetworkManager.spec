@@ -4,8 +4,8 @@
 a = Analysis(
     ['src\\network_manager\\__main__.py'],
     pathex=['src'],
-    binaries=[('vendor\\mihomo.exe', 'vendor')],
-    datas=[('src\\network_manager\\style.qss', 'network_manager'), ('src\\network_manager\\web', 'network_manager\\web'), ('THIRD_PARTY_NOTICES.md', '.')],
+    binaries=[('vendor/mihomo.exe', 'vendor')],
+    datas=[('src/network_manager/style.qss', 'network_manager'), ('src/network_manager/web', 'network_manager/web'), ('THIRD_PARTY_NOTICES.md', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
