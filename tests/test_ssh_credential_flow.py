@@ -4,19 +4,29 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from network_manager.models import ImportedNode, SshServerProfile, default_config
-from network_manager.server_deployer import DeploymentResult, deployment_source_id
+from network_manager.server_deployer import (
+    DeploymentResult,
+    ServerDeploymentError,
+    deployment_source_id,
+    shadowsocks_share_link,
+)
 from network_manager.ui.web_window import WebBridge
 
 
 class FakeCredentialStore:
     def __init__(self) -> None:
         self.saved: list[tuple[str, str]] = []
+        self.values: dict[str, str] = {}
 
     def set(self, profile_id: str, credential: str) -> None:
         self.saved.append((profile_id, credential))
+        self.values[profile_id] = credential
 
-    def delete(self, _profile_id: str) -> None:
-        return
+    def get(self, profile_id: str) -> str:
+        return self.values.get(profile_id, "")
+
+    def delete(self, profile_id: str) -> None:
+        self.values.pop(profile_id, None)
 
 
 class FakeConfigStore:
@@ -45,6 +55,15 @@ class FakeWindow:
 
 
 class FakeBridge:
+    # Reuse the real helpers so the deployment flow under test behaves like production.
+    _server_deployment_candidate = staticmethod(WebBridge._server_deployment_candidate)
+    _node_matches_profile_endpoint = staticmethod(
+        WebBridge._node_matches_profile_endpoint
+    )
+    _with_public_access_check = staticmethod(WebBridge._with_public_access_check)
+    _deploy_server_if_needed = WebBridge._deploy_server_if_needed
+    _finish_server_deploy_future = WebBridge._finish_server_deploy_future
+
     def __init__(self, profile: SshServerProfile, core_running: bool = False) -> None:
         self._bridge_closed = False
         self._deployment_lock = Lock()
@@ -101,7 +120,12 @@ def test_successful_server_deployment_persists_credential_and_node() -> None:
     bridge = FakeBridge(profile)
 
     WebBridge._server_deploy_finished(
-        bridge, profile.profile_id, True, "deployed", deployment_payload(profile), "secret"
+        bridge,
+        profile.profile_id,
+        True,
+        "deployed",
+        deployment_payload(profile),
+        "secret",
     )
 
     assert bridge.window.credential_store.saved == [(profile.profile_id, "secret")]
@@ -227,7 +251,9 @@ def test_deployed_port_matching_default_remains_check_only() -> None:
     assert previous_port == 0
 
 
-def test_deployed_different_high_port_uses_configured_port_as_repair_candidate() -> None:
+def test_deployed_different_high_port_uses_configured_port_as_repair_candidate() -> (
+    None
+):
     profile = SshServerProfile(
         "server-1",
         "Test server",
@@ -332,6 +358,198 @@ def test_saving_explicit_common_server_proxy_port_is_allowed() -> None:
     assert updated.deployed_node_id == ""
     assert bridge.window.applied == 1
     assert bridge.notifications[-1] == ("success", "服务器登录配置已保存")
+
+
+class ImmediateFuture:
+    def __init__(
+        self, result: object = None, error: BaseException | None = None
+    ) -> None:
+        self._result = result
+        self._error = error
+
+    def add_done_callback(self, callback) -> None:
+        callback(self)
+
+    def result(self) -> object:
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
+class ImmediateExecutor:
+    def submit(self, function, *args, **kwargs) -> ImmediateFuture:
+        try:
+            return ImmediateFuture(result=function(*args, **kwargs))
+        except Exception as exc:  # mirrors the real Future error handover
+            return ImmediateFuture(error=exc)
+
+
+class RecordingDeployer:
+    """Report a healthy remote service and remember the credential it was given."""
+
+    def __init__(self, node_config: dict[str, object]) -> None:
+        self.node_config = node_config
+        self.credentials: list[str] = []
+
+    def inspect(self, _profile, credential: str) -> dict[str, object]:
+        self.credentials.append(credential)
+        return {
+            "status": "active",
+            "version": "sing-box version 1.13.20",
+            "nodeConfig": self.node_config,
+        }
+
+    def deploy(self, *_args, **_kwargs):
+        raise AssertionError("an active remote service must not be redeployed")
+
+
+class RotatingDeployer(RecordingDeployer):
+    """Same healthy remote service, but able to run a real redeploy on demand."""
+
+    def __init__(self, node_config: dict[str, object], rotated_password: str) -> None:
+        super().__init__(node_config)
+        self.rotated_password = rotated_password
+        self.deploy_calls = 0
+
+    def deploy(self, profile, _credential, _progress) -> DeploymentResult:
+        self.deploy_calls += 1
+        node = dict(self.node_config)
+        node["password"] = self.rotated_password
+        node["port"] = profile.proxy_port
+        return DeploymentResult(
+            node_config=node,
+            share_link=shadowsocks_share_link(node),
+            version="sing-box version 1.13.20",
+            deployed_at="2026-10-06T10:00:00+08:00",
+            firewall="ufw",
+        )
+
+
+def deploy_bridge(
+    profile: SshServerProfile, deployer: RecordingDeployer, saved: str
+) -> FakeBridge:
+    bridge = FakeBridge(profile)
+    bridge.window.credential_store.set(profile.profile_id, saved)
+    bridge.window.credential_store.saved.clear()
+    bridge._ssh_executor = ImmediateExecutor()
+    bridge.window.server_deployer = deployer
+    bridge.server_deploy_completed = SimpleNamespace(
+        emit=lambda *args: WebBridge._server_deploy_finished(bridge, *args)
+    )
+    return bridge
+
+
+def reused_node_config(profile: SshServerProfile) -> dict[str, object]:
+    return {
+        "name": profile.name,
+        "type": "ss",
+        "server": profile.host,
+        "port": profile.proxy_port,
+        "cipher": "2022-blake3-aes-128-gcm",
+        "password": "base64-password",
+        "udp": True,
+    }
+
+
+def test_deploying_with_new_password_overrides_saved_credential() -> None:
+    profile = SshServerProfile(
+        "server-1", "Test server", "192.0.2.1", remember_password=True
+    )
+    deployer = RecordingDeployer(reused_node_config(profile))
+    bridge = deploy_bridge(profile, deployer, "old-password")
+
+    with patch(
+        "network_manager.ui.web_window.check_public_tcp_endpoint",
+        return_value=(True, ""),
+    ):
+        WebBridge.deploySshServer(bridge, profile.profile_id, "new-password", False)
+
+    assert deployer.credentials == ["new-password"]
+    assert bridge.window.credential_store.saved == [("server-1", "new-password")]
+    assert bridge.window.credential_store.get("server-1") == "new-password"
+    assert profile.remember_password is True
+    assert any("覆盖更新" in message for _kind, message in bridge.notifications)
+
+
+def test_deploying_without_password_still_uses_saved_credential() -> None:
+    profile = SshServerProfile(
+        "server-1", "Test server", "192.0.2.1", remember_password=True
+    )
+    deployer = RecordingDeployer(reused_node_config(profile))
+    bridge = deploy_bridge(profile, deployer, "old-password")
+
+    with patch(
+        "network_manager.ui.web_window.check_public_tcp_endpoint",
+        return_value=(True, ""),
+    ):
+        WebBridge.deploySshServer(bridge, profile.profile_id, "", False)
+
+    assert deployer.credentials == ["old-password"]
+    assert bridge.window.credential_store.saved == []
+    assert bridge.window.credential_store.get("server-1") == "old-password"
+
+
+def test_forced_redeploy_rotates_node_password() -> None:
+    profile = SshServerProfile(
+        "server-1", "Test server", "192.0.2.1", remember_password=True
+    )
+    deployer = RotatingDeployer(reused_node_config(profile), "rotated-password")
+    bridge = deploy_bridge(profile, deployer, "old-password")
+
+    with patch(
+        "network_manager.ui.web_window.check_public_tcp_endpoint",
+        return_value=(True, ""),
+    ):
+        WebBridge.deploySshServer(bridge, profile.profile_id, "", False, True)
+
+    assert deployer.deploy_calls == 1
+    assert bridge.window.config.imported_nodes[0].config["password"] == "rotated-password"
+    assert profile.deployed_node_id
+    assert any("轮换" in message for _kind, message in bridge.notifications)
+
+
+def test_check_service_without_force_keeps_running_service_password() -> None:
+    profile = SshServerProfile(
+        "server-1", "Test server", "192.0.2.1", remember_password=True
+    )
+    deployer = RotatingDeployer(reused_node_config(profile), "rotated-password")
+    bridge = deploy_bridge(profile, deployer, "old-password")
+
+    with patch(
+        "network_manager.ui.web_window.check_public_tcp_endpoint",
+        return_value=(True, ""),
+    ):
+        WebBridge.deploySshServer(bridge, profile.profile_id, "", False, False)
+
+    assert deployer.deploy_calls == 0
+    assert bridge.window.config.imported_nodes[0].config["password"] == "base64-password"
+
+
+def test_failed_deployment_with_new_password_keeps_old_credential() -> None:
+    profile = SshServerProfile(
+        "server-1", "Test server", "192.0.2.1", remember_password=True
+    )
+
+    class FailingDeployer:
+        def inspect(self, _profile, _credential):
+            raise ServerDeploymentError("SSH 认证失败，请检查用户名、密码或私钥")
+
+    bridge = FakeBridge(profile)
+    bridge.window.credential_store.set(profile.profile_id, "old-password")
+    bridge.window.credential_store.saved.clear()
+    bridge._ssh_executor = ImmediateExecutor()
+    bridge.window.server_deployer = FailingDeployer()
+    bridge.server_deploy_completed = SimpleNamespace(
+        emit=lambda *args: WebBridge._server_deploy_finished(bridge, *args)
+    )
+
+    with patch(
+        "network_manager.ui.web_window.check_public_tcp_endpoint",
+        return_value=(True, ""),
+    ):
+        WebBridge.deploySshServer(bridge, profile.profile_id, "typed-wrong", True)
+
+    assert bridge.window.credential_store.get("server-1") == "old-password"
 
 
 def test_fallback_rule_target_is_persisted() -> None:

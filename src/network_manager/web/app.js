@@ -1406,24 +1406,27 @@ function openSshServerDialog(server = null) {
 }
 
 function deploySshServer(server) {
-  if (server.authMethod === "agent" || server.hasCredential) {
+  if (server.authMethod === "agent") {
     invoke("deploySshServer", server.profileId, "");
     return;
   }
+  const hasSaved = Boolean(server.hasCredential);
   const label = server.authMethod === "key" ? "私钥口令（没有可留空）" : "SSH 密码";
   openModal(`${server.deployed ? "检查或修复" : "部署"} ${server.name}`, `
     <div class="form-grid">
       <div class="group-dialog-summary"><strong>${escapeHtml(server.username)}@${escapeHtml(server.host)}:${server.port}</strong><span>${server.deployed ? "先检查远端服务；仅在服务缺失或停止时修复" : `将部署代理节点：${escapeHtml(server.host)}:${server.proxyPort}`}</span></div>
-      <label><span>${label}</span><input id="modal-connect-password" type="password" autocomplete="current-password" autofocus></label>
-      <label class="switch-row"><span><strong>成功后记住凭据</strong><small>后续检查或修复无需再次输入</small></span><input id="modal-connect-remember" type="checkbox" checked><i></i></label>
+      <label><span>${label}</span><input id="modal-connect-password" type="password" autocomplete="current-password"${hasSaved ? "" : " autofocus"} placeholder="${hasSaved ? "已保存；留空继续使用，输入新密码将覆盖" : ""}"></label>
+      <label class="switch-row"><span><strong>${hasSaved ? "保存并覆盖旧凭据" : "成功后记住凭据"}</strong><small>${hasSaved ? "新密码验证通过后会替换这台服务器已保存的凭据" : "后续检查或修复无需再次输入"}</small></span><input id="modal-connect-remember" type="checkbox" checked><i></i></label>
+      ${server.deployed ? `<label class="switch-row"><span><strong>轮换节点密码</strong><small>强制重新部署并生成新的节点密码，旧的 ss:// 链接会失效</small></span><input id="modal-connect-redeploy" type="checkbox"><i></i></label>` : ""}
     </div>`, [
       { label: "取消", kind: "secondary", action: closeModal },
-    { label: server.deployed ? "检查服务" : "开始部署", kind: "primary", action: () => {
+      { label: server.deployed ? "检查服务" : "开始部署", kind: "primary", action: () => {
       invoke(
         "deploySshServer",
         server.profileId,
         byId("modal-connect-password").value,
         byId("modal-connect-remember").checked,
+        Boolean(byId("modal-connect-redeploy")?.checked),
       );
       closeModal();
     } },

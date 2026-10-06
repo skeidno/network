@@ -1370,9 +1370,13 @@ class WebBridge(QObject):
         ) as exc:
             self._notify("error", str(exc) or "服务器配置无效")
 
-    @Slot(str, str, bool)
+    @Slot(str, str, bool, bool)
     def deploySshServer(
-        self, profile_id: str, password: str, remember_credential: bool = False
+        self,
+        profile_id: str,
+        password: str,
+        remember_credential: bool = False,
+        force_redeploy: bool = False,
     ) -> None:
         profile = self._ssh_profile(profile_id)
         if profile is None:
@@ -1389,6 +1393,7 @@ class WebBridge(QObject):
             ):
                 self._notify("info", "已有服务器部署任务正在执行")
                 return
+        override = bool(password)
         if not password and profile.remember_password:
             try:
                 password = self.window.credential_store.get(profile.profile_id)
@@ -1429,7 +1434,9 @@ class WebBridge(QObject):
         self._notify(
             "info",
             (
-                f"检测到旧端口 {repair_from_port}，正在迁移到 {deployment_profile.proxy_port}"
+                f"正在重新部署 {profile.name} 并轮换节点密码"
+                if force_redeploy
+                else f"检测到旧端口 {repair_from_port}，正在迁移到 {deployment_profile.proxy_port}"
                 if repair_from_port
                 else f"正在检查 {profile.name}"
                 if existing_config
@@ -1443,13 +1450,17 @@ class WebBridge(QObject):
             existing_config,
             profile.deployed_at,
             progress,
+            force_redeploy,
         )
         future.add_done_callback(
             lambda completed: self._finish_server_deploy_future(
                 profile.profile_id,
                 completed,
-                password if remember_credential else "",
+                # A typed credential is an override: once it authenticates the stored
+                # one is stale, so persist it instead of silently reusing it next time.
+                password if (remember_credential or override) else "",
                 repair_from_port,
+                force_redeploy,
             )
         )
 
@@ -1472,38 +1483,44 @@ class WebBridge(QObject):
         existing_node_config: dict[str, object] | None,
         deployed_at: str,
         progress: Callable[[str], None],
+        force: bool = False,
     ) -> DeploymentResult:
-        if existing_node_config:
-            progress("正在检查远端代理服务")
+        if force:
+            progress("正在重新部署并轮换节点密码")
         else:
-            progress("正在查找远端现有代理服务")
-        inspection = self.window.server_deployer.inspect(profile, credential)
-        if inspection.get("status") == "active":
-            inspected_node = inspection.get("nodeConfig")
-            node = dict(inspected_node) if isinstance(inspected_node, dict) else {}
-            if not node and WebBridge._node_matches_profile_endpoint(
-                existing_node_config, profile
-            ):
-                node = dict(existing_node_config or {})
-            if node:
-                timestamp = deployed_at or datetime.now().astimezone().isoformat(
-                    timespec="seconds"
-                )
-                return WebBridge._with_public_access_check(
-                    profile,
-                    DeploymentResult(
-                        node_config=node,
-                        share_link=shadowsocks_share_link(node),
-                        version=str(inspection.get("version") or profile.deployed_version),
-                        deployed_at=timestamp,
-                        firewall="unchanged",
-                        reused=True,
-                    ),
-                    progress,
-                )
-            progress("远端服务配置不匹配，正在修复部署")
-        else:
-            progress("远端服务未运行，正在修复部署")
+            if existing_node_config:
+                progress("正在检查远端代理服务")
+            else:
+                progress("正在查找远端现有代理服务")
+            inspection = self.window.server_deployer.inspect(profile, credential)
+            if inspection.get("status") == "active":
+                inspected_node = inspection.get("nodeConfig")
+                node = dict(inspected_node) if isinstance(inspected_node, dict) else {}
+                if not node and WebBridge._node_matches_profile_endpoint(
+                    existing_node_config, profile
+                ):
+                    node = dict(existing_node_config or {})
+                if node:
+                    timestamp = deployed_at or datetime.now().astimezone().isoformat(
+                        timespec="seconds"
+                    )
+                    return WebBridge._with_public_access_check(
+                        profile,
+                        DeploymentResult(
+                            node_config=node,
+                            share_link=shadowsocks_share_link(node),
+                            version=str(
+                                inspection.get("version") or profile.deployed_version
+                            ),
+                            deployed_at=timestamp,
+                            firewall="unchanged",
+                            reused=True,
+                        ),
+                        progress,
+                    )
+                progress("远端服务配置不匹配，正在修复部署")
+            else:
+                progress("远端服务未运行，正在修复部署")
         result = self.window.server_deployer.deploy(profile, credential, progress)
         return WebBridge._with_public_access_check(profile, result, progress)
 
@@ -1627,6 +1644,7 @@ class WebBridge(QObject):
         future: Future[DeploymentResult],
         credential: str = "",
         repair_from_port: int = 0,
+        rotated: bool = False,
     ) -> None:
         if self._bridge_closed:
             return
@@ -1642,6 +1660,8 @@ class WebBridge(QObject):
                     if result.reused
                     else "服务器代理部署完成"
                 )
+            if rotated and not result.reused:
+                message = f"{message}，节点密码已轮换"
             result_json = json.dumps(
                 {
                     "node": result.node_config,
@@ -1747,11 +1767,12 @@ class WebBridge(QObject):
         )
         profile.proxy_reachability_error = str(payload.get("publicError", ""))
         if credential:
+            replaced = profile.remember_password
             try:
                 self.window.credential_store.set(profile_id, credential)
                 profile.remember_password = True
                 getattr(self, "_credential_presence_cache", {}).pop(profile_id, None)
-                message += "，SSH 凭据已安全保存"
+                message += "，SSH 凭据已覆盖更新" if replaced else "，SSH 凭据已安全保存"
             except CredentialStoreError as exc:
                 message += f"；凭据保存失败：{exc}"
         apply_automatic_node_dialers(self.window.config.imported_nodes)
