@@ -7,6 +7,17 @@
   <title>Network Manager</title>
   <link rel="icon" href="icons/network.svg" type="image/svg+xml">
   <link rel="stylesheet" href="styles.css">
+  <script>
+    // Resolve the theme before first paint so the shell never flashes the
+    // wrong palette while app.js is still loading.
+    (function () {
+      var stored = "system";
+      try { stored = localStorage.getItem("network-manager.theme") || "system"; } catch (_e) { /* storage optional */ }
+      var dark = stored === "dark" || (stored === "system" &&
+        window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+      document.documentElement.dataset.theme = dark ? "dark" : "light";
+    })();
+  </script>
 </head>
 <body>
   <div id="bootstrap-status" class="bootstrap-status" role="status" aria-live="polite">
@@ -41,22 +52,22 @@
       </div>
 
       <nav class="navigation" aria-label="主导航">
-        <button class="nav-item is-active" data-page="overview">
+        <button class="nav-item is-active" data-page="overview" title="运行概览">
           <span class="icon" style="--icon:url('./icons/house.svg')"></span><span>运行概览</span>
         </button>
-        <button class="nav-item" data-page="rules">
+        <button class="nav-item" data-page="rules" title="分流规则">
           <span class="icon" style="--icon:url('./icons/route.svg')"></span><span>分流规则</span>
         </button>
-        <button class="nav-item" data-page="nodes">
+        <button class="nav-item" data-page="nodes" title="代理与节点">
           <span class="icon" style="--icon:url('./icons/server.svg')"></span><span>代理与节点</span>
         </button>
-        <button id="server-deployment-nav" class="nav-item" data-page="servers">
+        <button id="server-deployment-nav" class="nav-item" data-page="servers" title="服务器部署">
           <span class="icon" style="--icon:url('./icons/database.svg')"></span><span>服务器部署</span>
         </button>
-        <button class="nav-item" data-page="settings">
+        <button class="nav-item" data-page="settings" title="设置">
           <span class="icon" style="--icon:url('./icons/settings.svg')"></span><span>设置</span>
         </button>
-        <button class="nav-item" data-page="logs">
+        <button class="nav-item" data-page="logs" title="运行日志">
           <span class="icon" style="--icon:url('./icons/file-text.svg')"></span><span>运行日志</span>
         </button>
       </nav>
@@ -87,6 +98,7 @@
         <h1 id="page-title">运行概览</h1>
         <div class="topbar-actions">
           <span id="header-status" class="status-badge">已停止</span>
+          <button id="theme-toggle" class="icon-button" aria-label="切换主题" title="切换主题"></button>
           <button id="header-refresh" class="icon-button" aria-label="刷新界面" title="刷新界面">
             <span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span>
           </button>
@@ -155,6 +167,16 @@
                 <div><strong id="summary-default">直连</strong><span>默认出口</span></div>
               </div>
             </section>
+
+            <section class="panel exit-panel">
+              <div class="panel-heading compact">
+                <div class="heading-icon warm"><span class="icon" style="--icon:url('./icons/earth.svg')"></span></div>
+                <div><h2>当前出口</h2><p id="exit-ip">尚未检测</p></div>
+              </div>
+              <button id="test-exit" class="button secondary">
+                <span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span><span>检测出口 IP</span>
+              </button>
+            </section>
           </div>
 
           <section class="panel traffic-panel">
@@ -172,16 +194,6 @@
             </div>
             <div id="traffic-chart" class="traffic-chart" aria-label="最近 60 秒上传和下载速率"></div>
           </section>
-
-          <section class="panel exit-panel">
-            <div class="panel-heading compact">
-              <div class="heading-icon warm"><span class="icon" style="--icon:url('./icons/earth.svg')"></span></div>
-              <div><h2>当前出口</h2><p id="exit-ip">尚未检测</p></div>
-            </div>
-            <button id="test-exit" class="button secondary">
-              <span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span><span>检测出口 IP</span>
-            </button>
-          </section>
         </section>
 
         <section id="page-rules" class="page">
@@ -196,7 +208,7 @@
               <thead><tr><th>状态</th><th>类型</th><th>匹配内容</th><th>去向</th><th>备注</th><th class="actions-column">操作</th></tr></thead>
               <tbody id="rules-body"></tbody>
             </table>
-            <div id="rules-empty" class="empty-state is-hidden">暂无分流规则</div>
+            <div id="rules-empty" class="empty-state has-icon is-hidden" style="--icon:url('./icons/list-filter.svg')">暂无分流规则</div>
           </section>
         </section>
 
@@ -221,7 +233,7 @@
               <button id="manage-node-groups" class="button secondary"><span class="icon" style="--icon:url('./icons/folder-open.svg')"></span><span>分组管理</span></button>
             </div>
             <div id="node-grid" class="node-group-list"></div>
-            <div id="nodes-empty" class="empty-state is-hidden">暂无已导入节点</div>
+            <div id="nodes-empty" class="empty-state has-icon is-hidden" style="--icon:url('./icons/server.svg')">暂无已导入节点</div>
           </div>
 
           <div id="node-tab-subscriptions" class="node-tab">
@@ -233,7 +245,7 @@
               <button id="refresh-subscriptions" class="icon-button" aria-label="刷新全部订阅" title="刷新全部订阅"><span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span></button>
             </div>
             <div id="subscription-grid" class="subscription-grid"></div>
-            <div id="subscriptions-empty" class="empty-state compact is-hidden">暂无订阅记录</div>
+            <div id="subscriptions-empty" class="empty-state compact has-icon is-hidden" style="--icon:url('./icons/download.svg')">暂无订阅记录</div>
           </div>
         </section>
 
@@ -249,7 +261,7 @@
             <span class="toolbar-context">自动安装加密代理服务，并生成可跨设备导入的节点链接</span>
           </div>
           <div id="ssh-server-grid" class="ssh-server-grid"></div>
-          <div id="ssh-servers-empty" class="empty-state is-hidden">暂无服务器，添加 SSH 登录信息后即可自动部署</div>
+          <div id="ssh-servers-empty" class="empty-state has-icon is-hidden" style="--icon:url('./icons/database.svg')">暂无服务器，添加 SSH 登录信息后即可自动部署</div>
         </section>
 
         <section id="page-settings" class="page">

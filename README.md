@@ -45,6 +45,10 @@ powershell -ExecutionPolicy Bypass -File scripts/run_windows_admin.ps1
 
 普通权限也可执行 `python -m network_manager` 查看和编辑配置，但不能启动 TUN 接管。
 
+## 界面与主题
+
+WebGUI 使用同一套设计变量（颜色、阴影、圆角、间距）渲染，支持浅色与深色两套主题。顶栏的“主题”按钮在**跟随系统 → 浅色 → 深色**之间循环切换，选择会保存在本地浏览器存储中，下次打开自动恢复；未手动选择时跟随操作系统外观。样式变量集中在 `src/network_manager/web/styles.css` 的 `:root` 与 `:root[data-theme="dark"]`，新增界面元素请复用变量而不是写死颜色。
+
 ## 服务器代理部署
 
 在“服务器部署”页面填写 Linux 服务器 IP/域名、SSH 端口、用户名、远端代理端口和认证方式，然后点击“部署代理”。新配置会生成一个 `10000` 以上的随机默认部署端口，可在“设置”中手动修改或重新随机。已部署服务的端口与当前默认值不一致时，会在“检查服务”时迁移到当前默认端口。当前自动部署要求服务器使用 systemd 且 SSH 用户为 `root`。

@@ -1471,6 +1471,53 @@ function showToast(kind, message) {
   window.setTimeout(() => toast.remove(), 3600);
 }
 
+const THEME_KEY = "network-manager.theme";
+const THEME_ORDER = ["system", "light", "dark"];
+const THEME_LABELS = { system: "跟随系统", light: "浅色模式", dark: "深色模式" };
+
+function readStoredTheme() {
+  try {
+    const value = localStorage.getItem(THEME_KEY);
+    return THEME_ORDER.includes(value) ? value : "system";
+  } catch (_error) {
+    // Local storage is optional in embedded browser profiles.
+    return "system";
+  }
+}
+
+function storeTheme(theme) {
+  try { localStorage.setItem(THEME_KEY, theme); } catch (_error) { /* optional */ }
+}
+
+function prefersDarkTheme() {
+  return Boolean(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+}
+
+function applyTheme(theme) {
+  const resolved = theme === "system" ? (prefersDarkTheme() ? "dark" : "light") : theme;
+  document.documentElement.dataset.theme = resolved;
+  const button = byId("theme-toggle");
+  if (!button) return;
+  const glyph = theme === "system" ? "monitor" : theme === "dark" ? "moon" : "sun";
+  const label = `主题：${THEME_LABELS[theme]}（点击切换）`;
+  button.innerHTML = icon(glyph);
+  button.title = label;
+  button.setAttribute("aria-label", label);
+}
+
+function cycleTheme() {
+  const next = THEME_ORDER[(THEME_ORDER.indexOf(readStoredTheme()) + 1) % THEME_ORDER.length];
+  storeTheme(next);
+  applyTheme(next);
+}
+
+function bindScrollShadow() {
+  const scroller = byId("page-content");
+  const update = () => document.body.classList.toggle("page-scrolled", scroller.scrollTop > 0);
+  scroller.addEventListener("scroll", update, { passive: true });
+  update();
+}
+
 function bindEvents() {
   if (CUSTOM_FRAME) {
     byId("window-drag-region").addEventListener("pointerdown", (event) => {
@@ -1482,6 +1529,8 @@ function bindEvents() {
     });
   }
   document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => setPage(item.dataset.page)));
+  byId("theme-toggle").addEventListener("click", cycleTheme);
+  bindScrollShadow();
   document.addEventListener("click", (event) => {
     if (!event.target.closest(".custom-select")) closeCustomSelects();
   });
@@ -1663,8 +1712,15 @@ function bindEvents() {
 
 function initialize() {
   window.networkManagerReady = false;
+  applyTheme(readStoredTheme());
   bindEvents();
   document.addEventListener("visibilitychange", () => scheduleStateRefresh(document.hidden ? 10000 : 0));
+  if (window.matchMedia) {
+    const query = window.matchMedia("(prefers-color-scheme: dark)");
+    query.addEventListener?.("change", () => {
+      if (readStoredTheme() === "system") applyTheme("system");
+    });
+  }
   pollState();
 }
 
