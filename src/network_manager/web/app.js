@@ -765,6 +765,7 @@ function renderSshServers() {
         <button class="button primary" data-ssh-action="deploy" data-profile-id="${server.profileId}"${isDeploying || Boolean(deploying) ? " disabled" : ""}>${icon(isDeploying || server.deployed ? "refresh-cw" : "hard-drive-download")}<span>${server.deployed ? "检查服务" : "部署代理"}</span></button>
         <button class="button secondary compact-button" data-ssh-action="copy" data-profile-id="${server.profileId}"${server.shareLink ? "" : " disabled"}>${icon("link")}<span>复制节点</span></button>
         <button class="icon-button" data-ssh-action="edit" data-profile-id="${server.profileId}" title="编辑" aria-label="编辑">${icon("square-pen")}</button>
+        ${server.hasCredential ? `<button class="icon-button" data-ssh-action="forget" data-profile-id="${server.profileId}" title="清除已保存的密码" aria-label="清除已保存的密码">${icon("key-round")}</button>` : ""}
         <button class="icon-button danger" data-ssh-action="delete" data-profile-id="${server.profileId}" title="删除" aria-label="删除">${icon("trash-2")}</button>
       </div>
     </article>`;
@@ -1347,7 +1348,10 @@ function openPasteDialog() {
 
 function openSshServerDialog(server = null) {
   const authMethod = server?.authMethod || "password";
-  const rememberCredential = server ? server.rememberPassword : authMethod !== "agent";
+  const hasSavedCredential = Boolean(server?.hasCredential);
+  const rememberCredential = server
+    ? server.rememberPassword || hasSavedCredential
+    : authMethod !== "agent";
   openModal(server ? "编辑服务器部署" : "添加服务器部署", `
     <div class="form-grid ssh-form-grid">
       <label class="wide-field"><span>名称</span><input id="modal-ssh-name" value="${escapeHtml(server?.name || "我的服务器")}" required></label>
@@ -1359,7 +1363,7 @@ function openSshServerDialog(server = null) {
       <label><span>认证方式</span><select id="modal-ssh-auth"><option value="password"${authMethod === "password" ? " selected" : ""}>账号密码</option><option value="key"${authMethod === "key" ? " selected" : ""}>私钥文件</option><option value="agent"${authMethod === "agent" ? " selected" : ""}>SSH Agent</option></select></label>
       <label id="modal-ssh-secret-field"><span>密码 / 私钥口令</span><input id="modal-ssh-password" type="password" autocomplete="new-password" placeholder="${server?.hasCredential ? "已安全保存，留空保持不变" : "连接凭据"}"></label>
       <label id="modal-ssh-key-field" class="wide-field"><span>私钥路径</span><div class="input-action"><input id="modal-ssh-key-path" value="${escapeHtml(server?.keyPath || "")}" placeholder="选择 OpenSSH 私钥"><button id="modal-pick-ssh-key" type="button" class="icon-button" title="选择私钥" aria-label="选择私钥">${icon("folder-open")}</button></div></label>
-      <label class="switch-row wide-field"><span><strong>记住凭据</strong><small>Windows 下使用当前用户 DPAPI 加密</small></span><input id="modal-ssh-remember" type="checkbox"${rememberCredential ? " checked" : ""}><i></i></label>
+      <label class="switch-row wide-field"><span><strong>记住凭据</strong><small>${hasSavedCredential ? "已保存密码；留空即保持不变，取消勾选会删除已保存的密码" : "Windows 下使用当前用户 DPAPI 加密"}</small></span><input id="modal-ssh-remember" type="checkbox"${rememberCredential ? " checked" : ""}><i></i></label>
       <div class="group-dialog-summary wide-field"><strong>部署内容</strong><span>在 Linux 服务器安装独立 Shadowsocks 2022 服务，SSH 断开后仍可使用。</span></div>
     </div>`, [
     { label: "取消", kind: "secondary", action: closeModal },
@@ -1680,7 +1684,8 @@ function bindEvents() {
     if (button.dataset.sshAction === "deploy") deploySshServer(server);
     else if (button.dataset.sshAction === "copy") invoke("copyServerNode", server.profileId);
     else if (button.dataset.sshAction === "edit") openSshServerDialog(server);
-    else confirmAction("删除服务器记录", `将删除“${server.name}”和对应内置节点，但不会卸载远端服务。确定继续？`, () => invoke("deleteSshServer", server.profileId));
+    else if (button.dataset.sshAction === "forget") confirmAction("清除已保存的密码", `将删除“${server.name}”已保存的 SSH 密码，服务器记录和代理节点都会保留。确定继续？`, () => invoke("forgetSshCredential", server.profileId));
+    else confirmAction("删除服务器记录", `将删除“${server.name}”和对应内置节点，已保存的 SSH 密码也会一并清除，但不会卸载远端服务。确定继续？`, () => invoke("deleteSshServer", server.profileId));
   });
   byId("settings-form").addEventListener("submit", (event) => {
     event.preventDefault();

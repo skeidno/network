@@ -342,8 +342,8 @@ class WebBridge(QObject):
             self._running_process_refresh_pending = False
 
     def _has_credential(self, profile: SshServerProfile) -> bool:
-        if not profile.remember_password:
-            return False
+        # Presence is decided by the store, not by the "记住凭据" flag: if both ever
+        # disagree, the saved password must stay reachable instead of becoming invisible.
         cached = self._credential_presence_cache.get(profile.profile_id)
         if cached and time.monotonic() - cached[0] < 30:
             return cached[1]
@@ -1351,16 +1351,28 @@ class WebBridge(QObject):
                 self.window.config.imported_nodes = previous_nodes
                 self.window.config.selected_node = previous_selected_node
                 raise ValueError(errors[0])
-            if profile.remember_password and password:
-                self.window.credential_store.set(profile.profile_id, password)
-            elif not profile.remember_password:
-                self.window.credential_store.delete(profile.profile_id)
-            getattr(self, "_credential_presence_cache", {}).pop(profile.profile_id, None)
             if endpoint_changed:
                 self.window._save_and_apply("服务器地址已更新，旧节点已移除")
             else:
                 self.window.store.save(self.window.config)
-            self._notify("success", "服务器登录配置已保存")
+            # Credentials are handled after the profile is stored on purpose: a failure
+            # to read or write the secret must never roll back the server record, and a
+            # saved password is only dropped when "记住凭据" is explicitly turned off.
+            remember = profile.remember_password
+            notice = ""
+            try:
+                has_stored = self.window.credential_store.has(profile.profile_id)
+                if remember and password:
+                    self.window.credential_store.set(profile.profile_id, password)
+                elif not remember and has_stored:
+                    self.window.credential_store.delete(profile.profile_id)
+                    notice = "，已按你的选择清除这台服务器保存的密码"
+                elif remember and not password and not has_stored:
+                    notice = "，尚未保存密码，下次部署时仍需输入"
+            except CredentialStoreError as exc:
+                notice = f"；密码未能保存：{exc}"
+            getattr(self, "_credential_presence_cache", {}).pop(profile.profile_id, None)
+            self._notify("success", f"服务器登录配置已保存{notice}")
         except (
             KeyError,
             TypeError,
@@ -1394,7 +1406,7 @@ class WebBridge(QObject):
                 self._notify("info", "已有服务器部署任务正在执行")
                 return
         override = bool(password)
-        if not password and profile.remember_password:
+        if not password:
             try:
                 password = self.window.credential_store.get(profile.profile_id)
             except CredentialStoreError as exc:
@@ -1568,6 +1580,28 @@ class WebBridge(QObject):
         self._notify("success", "代理节点链接已复制，可在其他设备导入")
 
     @Slot(str)
+    def forgetSshCredential(self, profile_id: str) -> None:
+        """Drop only the saved secret; the server record and its node stay untouched."""
+        profile = self._ssh_profile(profile_id)
+        if profile is None:
+            self._notify("error", "SSH 服务器不存在")
+            return
+        try:
+            existed = self.window.credential_store.has(profile_id)
+            self.window.credential_store.delete(profile_id)
+        except CredentialStoreError as exc:
+            self._notify("error", str(exc))
+            return
+        if profile.remember_password:
+            profile.remember_password = False
+            self.window.store.save(self.window.config)
+        getattr(self, "_credential_presence_cache", {}).pop(profile_id, None)
+        if existed:
+            self._notify("success", "已清除这台服务器保存的密码，下次部署需要重新输入")
+        else:
+            self._notify("info", "这台服务器没有已保存的密码")
+
+    @Slot(str)
     def deleteSshServer(self, profile_id: str) -> None:
         with self._deployment_lock:
             if self._deployment_states.get(profile_id, {}).get("status") == "deploying":
@@ -1616,7 +1650,7 @@ class WebBridge(QObject):
             self._deployment_states.pop(profile_id, None)
         if self.window.core.is_running and removed_names:
             self.window._save_and_apply("服务器节点已从本地移除")
-        self._notify("success", "本地服务器记录和对应内置节点已删除；远端服务未卸载")
+        self._notify("success", "本地服务器记录和对应内置节点已删除；保存的 SSH 密码已一并清除，远端服务未卸载")
 
     @Slot(result=str)
     def pickSshKey(self) -> str:
@@ -1881,6 +1915,7 @@ class WebMainWindow(NativeMainWindow):
             "deploySshServer",
             "copyServerNode",
             "deleteSshServer",
+            "forgetSshCredential",
             "pickSshKey",
             "windowAction",
         }

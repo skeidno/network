@@ -72,11 +72,12 @@ class CredentialStore:
     def set(self, profile_id: str, password: str) -> None:
         if not self.can_persist:
             raise CredentialStoreError("当前系统暂不支持保存密码，请使用 SSH 密钥")
+        if not password:
+            # An empty value must never erase a stored secret by accident. Removing a
+            # credential is an explicit decision, so callers have to use delete().
+            return
         values = self._load()
-        if password:
-            values[profile_id] = _protect_windows(password)
-        else:
-            values.pop(profile_id, None)
+        values[profile_id] = _protect_windows(password)
         self._save(values)
 
     def get(self, profile_id: str) -> str:
@@ -87,6 +88,11 @@ class CredentialStore:
             return ""
         return _unprotect_windows(protected)
 
+    def has(self, profile_id: str) -> bool:
+        if not self.can_persist:
+            return False
+        return bool(self._load().get(profile_id))
+
     def delete(self, profile_id: str) -> None:
         values = self._load()
         if profile_id in values:
@@ -94,15 +100,34 @@ class CredentialStore:
             self._save(values)
 
     def _load(self) -> dict[str, str]:
+        """Read the encrypted store.
+
+        A file that exists but cannot be parsed is treated as an error instead of an
+        empty mapping: callers write back whatever they loaded, so silently returning
+        ``{}`` here would drop every other saved password on the next save.
+        """
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return {}
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return {}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            self._quarantine()
+            raise CredentialStoreError(
+                "SSH 凭据文件无法读取，已备份为 .corrupt 文件，请重新输入密码"
+            ) from exc
         if not isinstance(payload, dict):
-            return {}
+            self._quarantine()
+            raise CredentialStoreError(
+                "SSH 凭据文件格式异常，已备份为 .corrupt 文件，请重新输入密码"
+            )
         return {str(key): str(value) for key, value in payload.items()}
+
+    def _quarantine(self) -> None:
+        """Move an unreadable store aside so nothing overwrites it."""
+        try:
+            self.path.replace(self.path.with_suffix(self.path.suffix + ".corrupt"))
+        except OSError:
+            pass
 
     def _save(self, values: dict[str, str]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

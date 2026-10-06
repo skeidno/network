@@ -1,8 +1,13 @@
 import json
+import os
+from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from network_manager.credential_store import CredentialStore, CredentialStoreError
 from network_manager.models import ImportedNode, SshServerProfile, default_config
 from network_manager.server_deployer import (
     DeploymentResult,
@@ -24,6 +29,9 @@ class FakeCredentialStore:
 
     def get(self, profile_id: str) -> str:
         return self.values.get(profile_id, "")
+
+    def has(self, profile_id: str) -> bool:
+        return bool(self.values.get(profile_id))
 
     def delete(self, profile_id: str) -> None:
         self.values.pop(profile_id, None)
@@ -717,3 +725,116 @@ def test_stale_local_node_does_not_block_remote_port_repair() -> None:
     assert result.reused is False
     assert result.node_config["port"] == 35123
     assert len(stages) == 3
+
+
+def ssh_payload(profile: SshServerProfile, remember: bool, port: int = 24444) -> str:
+    return json.dumps(
+        {
+            "profileId": profile.profile_id,
+            "name": profile.name,
+            "host": profile.host,
+            "port": 22,
+            "username": "root",
+            "authMethod": "password",
+            "rememberPassword": remember,
+            "proxyPort": port,
+        }
+    )
+
+
+def test_editing_server_without_password_keeps_stored_credential() -> None:
+    profile = SshServerProfile(
+        "server-1", "Test server", "192.0.2.1", remember_password=True
+    )
+    bridge = FakeBridge(profile)
+    bridge.window.credential_store.set(profile.profile_id, "saved-password")
+
+    WebBridge.saveSshServer(bridge, ssh_payload(profile, True), "")
+
+    assert bridge.window.credential_store.get("server-1") == "saved-password"
+    assert bridge.notifications[-1] == ("success", "服务器登录配置已保存")
+
+
+def test_editing_server_with_new_password_replaces_stored_credential() -> None:
+    profile = SshServerProfile(
+        "server-1", "Test server", "192.0.2.1", remember_password=True
+    )
+    bridge = FakeBridge(profile)
+    bridge.window.credential_store.set(profile.profile_id, "old-password")
+
+    WebBridge.saveSshServer(bridge, ssh_payload(profile, True), "rotated-password")
+
+    assert bridge.window.credential_store.get("server-1") == "rotated-password"
+
+
+def test_turning_off_remember_reports_cleared_credential() -> None:
+    profile = SshServerProfile(
+        "server-1", "Test server", "192.0.2.1", remember_password=True
+    )
+    bridge = FakeBridge(profile)
+    bridge.window.credential_store.set(profile.profile_id, "saved-password")
+
+    WebBridge.saveSshServer(bridge, ssh_payload(profile, False), "")
+
+    assert bridge.window.credential_store.get("server-1") == ""
+    assert "清除" in bridge.notifications[-1][1]
+
+
+def test_forgetting_credential_keeps_server_record() -> None:
+    profile = SshServerProfile(
+        "server-1", "Test server", "192.0.2.1", remember_password=True
+    )
+    bridge = FakeBridge(profile)
+    bridge.window.credential_store.set(profile.profile_id, "saved-password")
+
+    WebBridge.forgetSshCredential(bridge, profile.profile_id)
+
+    assert bridge.window.credential_store.get("server-1") == ""
+    assert profile.remember_password is False
+    assert [item.profile_id for item in bridge.window.config.ssh_servers] == ["server-1"]
+    assert any("清除" in message for _kind, message in bridge.notifications)
+
+
+def test_forgetting_credential_without_stored_value_reports_info() -> None:
+    profile = SshServerProfile("server-1", "Test server", "192.0.2.1")
+    bridge = FakeBridge(profile)
+
+    WebBridge.forgetSshCredential(bridge, profile.profile_id)
+
+    assert bridge.notifications[-1][0] == "info"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DPAPI 凭据存储仅在 Windows 上可用")
+def test_credential_store_ignores_empty_password(tmp_path: Path) -> None:
+    store = CredentialStore(tmp_path / "ssh-credentials.json")
+    store.set("server-1", "saved-password")
+
+    store.set("server-1", "")
+
+    assert store.get("server-1") == "saved-password"
+    assert store.has("server-1") is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DPAPI 凭据存储仅在 Windows 上可用")
+def test_credential_store_keeps_other_servers_when_saving(tmp_path: Path) -> None:
+    store = CredentialStore(tmp_path / "ssh-credentials.json")
+    store.set("server-1", "first-password")
+
+    store.set("server-2", "second-password")
+
+    assert store.get("server-1") == "first-password"
+    assert store.get("server-2") == "second-password"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DPAPI 凭据存储仅在 Windows 上可用")
+def test_corrupt_credential_file_is_quarantined_instead_of_overwritten(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ssh-credentials.json"
+    path.write_text("{ 这不是合法 JSON", encoding="utf-8")
+    store = CredentialStore(path)
+
+    with pytest.raises(CredentialStoreError):
+        store.set("server-1", "new-password")
+
+    assert (tmp_path / "ssh-credentials.json.corrupt").exists()
