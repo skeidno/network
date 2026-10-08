@@ -412,7 +412,18 @@ function renderOverview() {
   setText("traffic-download-total", traffic.downloadTotal);
   setText("traffic-upload-total", traffic.uploadTotal);
   renderTrafficChart(traffic.downloadSamples, traffic.uploadSamples);
-  setText("exit-ip", appState.exitIp);
+  // 「尚未检测」「内核未运行」是灰的占位态，检测失败要能一眼看出是红的。
+  const renderExit = (id, value) => {
+    const text = value || "尚未检测";
+    const el = byId(id);
+    setText(id, text);
+    el.classList.toggle("pending", text === "尚未检测" || text === "内核未运行");
+    el.classList.toggle("failed", text === "检测失败");
+    return text;
+  };
+  const localIp = renderExit("exit-ip-local", appState.localIp);
+  const proxyIp = renderExit("exit-ip-proxy", appState.exitIp);
+  setText("exit-ip", localIp === "尚未检测" && proxyIp === "尚未检测" ? "尚未检测" : "出口已检测");
 }
 
 async function toggleCoreFromUi() {
