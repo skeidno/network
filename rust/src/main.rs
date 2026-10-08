@@ -106,6 +106,94 @@ fn print_help() {
     );
 }
 
+/// 唤醒已经在运行的实例：先让它自己走一遍显示逻辑（会按需重建 WebView），
+/// 失败再退回到直接显示它的窗口。
+async fn wake_existing_instance(options: &Options) -> bool {
+    let base = format!("http://{}:{}", options.host, options.port);
+    if let Ok(client) = reqwest::Client::builder().no_proxy().build() {
+        if let Ok(response) = client.get(format!("{base}/")).send().await {
+            let html = response.text().await.unwrap_or_default();
+            let token = html
+                .split("name=\"network-session-token\" content=\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_default()
+                .to_string();
+            if !token.is_empty() {
+                let body = serde_json::json!({"method": "windowAction", "args": ["show"]});
+                let sent = client
+                    .post(format!("{base}/api/call"))
+                    .header("X-Network-Session", token)
+                    .header("Content-Type", "application/json")
+                    .body(serde_json::to_string(&body).unwrap_or_default())
+                    .send()
+                    .await;
+                if matches!(sent, Ok(response) if response.status().is_success()) {
+                    return true;
+                }
+            }
+        }
+    }
+    show_existing_window()
+}
+
+/// 兜底：按照窗口标题找到已运行实例的主窗口并显示。
+#[cfg(windows)]
+fn show_existing_window() -> bool {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, SetForegroundWindow, ShowWindow};
+
+    struct Finder {
+        owner: u32,
+        found: Option<HWND>,
+    }
+
+    unsafe extern "system" fn each(window: HWND, lparam: LPARAM) -> BOOL {
+        let finder = lparam.0 as *mut Finder;
+        let mut title = [0u16; 256];
+        let length =
+            windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(window, &mut title);
+        if length > 0 {
+            let title = String::from_utf16_lossy(&title[..length as usize]);
+            if title.starts_with("Network Manager") {
+                let mut pid = 0u32;
+                windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                    window,
+                    Some(&mut pid),
+                );
+                if pid != (*finder).owner {
+                    (*finder).found = Some(window);
+                    return BOOL(0);
+                }
+            }
+        }
+        BOOL(1)
+    }
+
+    unsafe {
+        let mut finder = Finder {
+            owner: std::process::id(),
+            found: None,
+        };
+        let _ = EnumWindows(
+            Some(each),
+            LPARAM(&mut finder as *mut Finder as isize),
+        );
+        if let Some(window) = finder.found {
+            let _ = ShowWindow(window, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
+            let _ = SetForegroundWindow(window);
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+fn show_existing_window() -> bool {
+    false
+}
+
 fn is_loopback(host: &str) -> bool {
     matches!(host.to_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1")
 }
@@ -168,7 +256,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let close_to_tray = app.config.close_to_tray;
 
     let shared: Shared = Arc::new(Mutex::new(app));
-    let bound = serve(shared.clone(), &options.host, options.port).await?;
+    let bound = match serve(shared.clone(), &options.host, options.port).await {
+        Ok(bound) => bound,
+        Err(err) => {
+            // 端口被占用 = 已经有一个实例在跑（通常是关到托盘了）。
+            // 托盘里可能还混着旧实例被强杀后留下的死图标，点了没反应会让人误以为
+            // 程序坏了，所以这里给一条不依赖托盘的唤醒通道：再启动一次就唤起窗口。
+            if wake_existing_instance(&options).await {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+    };
     let url = display_url(&options.host, bound.port());
     println!("Network Manager {VERSION} WebGUI: {url}");
 

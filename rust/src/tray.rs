@@ -40,7 +40,7 @@ mod windows_impl {
         RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu,
         TranslateMessage, HICON, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MSG,
         TRACK_POPUP_MENU_FLAGS, WM_CLOSE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-        WM_RBUTTONUP, WNDCLASSW,
+        WM_LBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW,
     };
 
     const TRAY_MESSAGE: u32 = 0x0400 + 1; // WM_USER + 1
@@ -200,7 +200,9 @@ mod windows_impl {
     fn handle_tray_event(lparam: LPARAM, sender: &Sender<TrayCommand>) {
         let event = lparam.0 as u32;
         match event {
-            WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
+            // 按下也响应：某些 explorer 版本/主题下抬起消息可能不到达，
+            // 而 Open 是幂等的（窗口已经可见时不会重复重建 WebView）。
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
                 let _ = sender.send(TrayCommand::Open);
             }
             WM_RBUTTONUP => {
