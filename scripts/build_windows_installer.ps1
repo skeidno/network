@@ -2,7 +2,8 @@ param(
   [string]$Version = "",
   [string]$IsccPath = "",
   [string]$OutputDir = "",
-  [switch]$SkipWindowsBuild
+  [switch]$Rust = $true,
+  [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,11 +23,45 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
   throw "Installer version must use MAJOR.MINOR.PATCH: $Version"
 }
 
-if (-not $SkipWindowsBuild) {
-  & (Join-Path $PSScriptRoot "build_windows.ps1") -SkipDesktopShortcut
+# Desktop app is now built from Rust: a single exe plus mihomo.exe beside it.
+if ($Rust) {
+  $sourceDir = Join-Path $ProjectRoot "dist-rs\NetworkManager"
+
+  if (-not $SkipBuild) {
+    & cargo build --release --offline --manifest-path (Join-Path $ProjectRoot "rust\Cargo.toml")
+    if ($LASTEXITCODE -ne 0) {
+      throw "cargo build failed with exit code $LASTEXITCODE"
+    }
+  }
+
+  $built = Join-Path $ProjectRoot "rust\target\release\network-manager-rs.exe"
+  if (-not (Test-Path -LiteralPath $built -PathType Leaf)) {
+    throw "Rust build was not found: $built"
+  }
+
+  if (-not (Test-Path -LiteralPath $sourceDir -PathType Container)) {
+    New-Item -ItemType Directory -Path $sourceDir -Force | Out-Null
+  }
+  Copy-Item -LiteralPath $built -Destination (Join-Path $sourceDir "NetworkManager.exe") -Force
+
+  $core = Join-Path $sourceDir "mihomo.exe"
+  if (-not (Test-Path -LiteralPath $core -PathType Leaf)) {
+    $vendored = Join-Path $ProjectRoot "dist\NetworkManager\_internal\vendor\mihomo.exe"
+    if (Test-Path -LiteralPath $vendored -PathType Leaf) {
+      Copy-Item -LiteralPath $vendored -Destination $core -Force
+    }
+    else {
+      throw "mihomo.exe was not found beside the app or under dist\NetworkManager\_internal\vendor"
+    }
+  }
+}
+else {
+  if (-not $SkipBuild) {
+    & (Join-Path $PSScriptRoot "build_windows.ps1") -SkipDesktopShortcut
+  }
+  $sourceDir = Join-Path $ProjectRoot "dist\NetworkManager"
 }
 
-$sourceDir = Join-Path $ProjectRoot "dist\NetworkManager"
 $executable = Join-Path $sourceDir "NetworkManager.exe"
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
   throw "Windows build was not found: $executable"
@@ -36,7 +71,9 @@ if (-not $OutputDir) {
   $OutputDir = Join-Path $ProjectRoot "release-assets\v$Version"
 }
 $OutputDir = [IO.Path]::GetFullPath($OutputDir)
-New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
+if (-not (Test-Path -LiteralPath $OutputDir -PathType Container)) {
+  New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+}
 
 $compilerCandidates = @(
   $IsccPath,
