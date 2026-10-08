@@ -1,7 +1,6 @@
 //! Native desktop shell: a tao window hosting a wry WebView pointed at the
 //! embedded WebGUI, plus the Win32 tray icon.
 
-use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -11,6 +10,7 @@ use wry::WebViewBuilderExtWindows;
 use tao::dpi::LogicalSize;
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::WindowBuilder;
 
 use crate::server::Shared;
@@ -24,7 +24,8 @@ pub enum AppEvent {
     Maximize,
     Close,
     Quit,
-    ToggleCore,
+    /// 托盘线程发来的命令（打开界面 / 启停内核 / 退出）。
+    Tray(TrayCommand),
 }
 
 pub struct Shell {
@@ -37,6 +38,10 @@ pub struct Shell {
 }
 
 static PROXY: OnceLock<Mutex<Option<EventLoopProxy<AppEvent>>>> = OnceLock::new();
+
+/// 事件循环内部出现异常（被 catch_unwind 收住）时的返回标记，
+/// main 据此收掉内核后退出，而不是退回「开浏览器 + 等 Ctrl-C」的兜底路径。
+pub const LOOP_CRASHED: &str = "event-loop-crashed";
 
 /// Bridge used by the HTTP command layer to drive the desktop shell.
 pub fn send(event: AppEvent) {
@@ -98,11 +103,13 @@ fn show_window(
     window.set_visible(true);
     window.set_focus();
     if *hidden {
+        // 只有重建成功才清掉标记：失败时保留 hidden，下一次再试，避免窗口
+        // 永远停在「看得见但点不动」的状态。
         if let Ok(rebuilt) = build_webview(window, url) {
             *webview = Some(rebuilt);
+            *hidden = false;
         }
     }
-    *hidden = false;
     set_window_visible(true);
 }
 
@@ -127,7 +134,10 @@ fn default_icon_path() -> Option<String> {
 }
 
 pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
-    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
+    // 用 run_return 而不是 run：run 内部会直接 std::process::exit()，
+    // 事件循环一结束进程就没了，托盘图标来不及摘、内核也来不及收。
+    // run_return 会把控制权交回来，我们能在循环外从容做收尾。
+    let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     PROXY
         .set(Mutex::new(Some(proxy)))
@@ -156,112 +166,127 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
     let url = shell.url.clone();
     let mut webview = Some(build_webview(&window, &url)?);
 
-    let tray_receiver: Option<Receiver<TrayCommand>> = icon_path.as_deref().and_then(|path| {
-        let (sender, receiver) = channel();
-        match crate::tray::spawn(path, sender) {
-            Ok(()) => Some(receiver),
-            Err(err) => {
-                eprintln!("{err}");
-                None
-            }
+    if let Some(path) = icon_path.as_deref() {
+        if let Err(err) = crate::tray::spawn(path) {
+            eprintln!("{err}");
         }
-    });
+    }
 
     let close_to_tray = shell.close_to_tray;
     let runtime = tokio::runtime::Handle::current();
     let mut quitting = false;
     let mut window_hidden = shell.start_hidden;
-    let mut next_poll = Instant::now();
     // 运行期每 2 分钟检查一次日志体积，超过上限就只保留最新的部分。
+    // 这是事件循环唯一的定时唤醒源：托盘命令改走 EventLoopProxy 即时唤醒，
+    // 不再需要每 200ms 轮询一次（既耗电，又会被 tao 的定时器反复唤醒）。
     let mut next_log_trim = Instant::now() + Duration::from_secs(120);
 
-    event_loop.run(move |event, _target, control| {
-        *control = ControlFlow::WaitUntil(next_poll);
-        match event {
-            Event::NewEvents(StartCause::Init) => {
-                let _ = &webview;
-            }
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => {
-                    if quitting || !close_to_tray {
-                        // 真正退出：先让托盘线程摘掉图标，避免留下点了没反应的死图标。
-                        crate::tray::request_close();
-                        *control = ControlFlow::Exit;
-                    } else {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        event_loop.run_return(move |event, _target, control| {
+            *control = ControlFlow::WaitUntil(next_log_trim);
+            match event {
+                Event::NewEvents(StartCause::Init) => {
+                    let _ = &webview;
+                }
+                Event::WindowEvent { event, .. } => match event {
+                    WindowEvent::CloseRequested => {
+                        if quitting || !close_to_tray {
+                            request_exit(control);
+                        } else {
+                            window.set_visible(false);
+                            set_window_visible(false);
+                            window_hidden = true;
+                        }
+                    }
+                    WindowEvent::Destroyed => request_exit(control),
+                    _ => {}
+                },
+                // tao 收到 WM_ENDSESSION（注销 / 关机 / 重启）时会把内部状态直接置为
+                // Destroyed；此后只要再派发任意一条事件就会
+                // panic!("cannot move state from Destroyed")，进程当场 abort ——
+                // 托盘图标来不及摘（变成点了没反应的死图标），内核也只剩作业对象兜底。
+                //
+                // 这里立刻投递 WM_QUIT 让消息泵停下：后续事件不会再被派发，
+                // 循环随即结束，控制权回到 run()，由它在循环外做有序收尾。
+                // 注意处理函数里绝不能做阻塞操作（比如等托盘线程摘图标）：
+                // 那会让消息泵在处理函数执行期间继续派发事件，造成事件处理器重入，
+                // 触发 "either event handler is re-entrant" 恐慌。
+                Event::LoopDestroyed => stop_message_pump(),
+                Event::UserEvent(action) => match action {
+                    AppEvent::Show => show_window(&window, &mut webview, &url, &mut window_hidden),
+                    AppEvent::Hide | AppEvent::Close => {
                         window.set_visible(false);
                         set_window_visible(false);
                         window_hidden = true;
                     }
-                }
-                WindowEvent::Destroyed => {
-                    crate::tray::request_close();
-                    *control = ControlFlow::Exit;
-                }
-                _ => {}
-            },
-            Event::UserEvent(action) => match action {
-                AppEvent::Show => show_window(&window, &mut webview, &url, &mut window_hidden),
-                AppEvent::Hide => {
-                    window.set_visible(false);
-                    set_window_visible(false);
-                    window_hidden = true;
-                }
-                AppEvent::Minimize => window.set_minimized(true),
-                AppEvent::Maximize => window.set_maximized(!window.is_maximized()),
-                AppEvent::Close => {
-                    window.set_visible(false);
-                    set_window_visible(false);
-                    window_hidden = true;
-                }
-                AppEvent::Quit => {
-                    quitting = true;
-                    crate::tray::request_close();
-                    *control = ControlFlow::Exit;
-                }
-                AppEvent::ToggleCore => {
-                    let state = Arc::clone(&shared);
-                    runtime.spawn(async move {
-                        let mut guard = state.lock().await;
-                        if guard.core.is_running() {
-                            let _ = guard.core.stop();
-                        } else {
-                            let config = guard.config.clone();
-                            if let Err(err) = guard.core.start(&config) {
-                                guard.notify("error", err);
-                            }
-                        }
-                    });
-                }
-            },
-            _ => {}
-        }
-
-        if let Some(receiver) = tray_receiver.as_ref() {
-            while let Ok(command) = receiver.try_recv() {
-                match command {
-                    TrayCommand::Open => {
-                        show_window(&window, &mut webview, &url, &mut window_hidden);
-                    }
-                    TrayCommand::ToggleCore => {
-                        let _ = PROXY
-                            .get()
-                            .and_then(|slot| slot.lock().ok())
-                            .and_then(|guard| guard.as_ref().map(|p| p.send_event(AppEvent::ToggleCore)));
-                    }
-                    TrayCommand::Quit => {
+                    AppEvent::Minimize => window.set_minimized(true),
+                    AppEvent::Maximize => window.set_maximized(!window.is_maximized()),
+                    AppEvent::Quit => {
                         quitting = true;
-                        crate::tray::request_close();
-                        *control = ControlFlow::Exit;
+                        request_exit(control);
                     }
-                }
+                    AppEvent::Tray(command) => match command {
+                        TrayCommand::Open => {
+                            show_window(&window, &mut webview, &url, &mut window_hidden)
+                        }
+                        TrayCommand::ToggleCore => toggle_core(&runtime, &shared),
+                        TrayCommand::Quit => {
+                            quitting = true;
+                            request_exit(control);
+                        }
+                    },
+                },
+                _ => {}
+            }
+
+            if Instant::now() >= next_log_trim {
+                crate::core::trim_core_log();
+                next_log_trim = Instant::now() + Duration::from_secs(120);
+            }
+        });
+    }));
+
+    // 消息泵已经停了，这里做阻塞清理才是安全的（不会造成事件处理器重入）。
+    crate::tray::request_close();
+    if result.is_err() {
+        return Err(LOOP_CRASHED.into());
+    }
+    Ok(())
+}
+
+/// 结束事件循环：只置标志，不做任何阻塞操作。
+///
+/// 摘托盘图标要等托盘线程回话（最多 600ms），必须放到事件循环之外，
+/// 否则处理函数执行期间消息泵继续派发事件，会导致事件处理器重入恐慌。
+fn request_exit(control: &mut ControlFlow) {
+    *control = ControlFlow::Exit;
+}
+
+/// 立刻停掉消息泵（投递 WM_QUIT）。
+#[cfg(windows)]
+fn stop_message_pump() {
+    use windows::Win32::UI::WindowsAndMessaging::PostQuitMessage;
+    unsafe {
+        PostQuitMessage(0);
+    }
+}
+
+#[cfg(not(windows))]
+fn stop_message_pump() {}
+
+/// 启停内核（丢给 tokio 异步执行，避免阻塞界面线程）。
+fn toggle_core(runtime: &tokio::runtime::Handle, shared: &Shared) {
+    let state = Arc::clone(shared);
+    runtime.spawn(async move {
+        let mut guard = state.lock().await;
+        if guard.core.is_running() {
+            let _ = guard.core.stop();
+        } else {
+            let config = guard.config.clone();
+            if let Err(err) = guard.core.start(&config) {
+                guard.notify("error", err);
             }
         }
-        if Instant::now() >= next_log_trim {
-            crate::core::trim_core_log();
-            next_log_trim = Instant::now() + Duration::from_secs(120);
-        }
-
-        next_poll = Instant::now() + Duration::from_millis(200);
     });
 }
 

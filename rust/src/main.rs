@@ -246,9 +246,33 @@ fn attach_console() {
 #[cfg(not(windows))]
 fn attach_console() {}
 
+/// 把恐慌现场写到日志文件。
+///
+/// 界面是 GUI 子系统程序，没有控制台，panic 信息默认随进程一起消失。落盘一份
+/// （含 backtrace）后面才查得到「程序为什么自己没了」。
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let mut line = format!("[{stamp}] {info}\n");
+        line.push_str(&format!("{}\n", std::backtrace::Backtrace::force_capture()));
+        let path = crate::paths::logs_dir().join("app-crash.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write;
+            let _ = file.write_all(line.as_bytes());
+        }
+        previous(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = Options::parse();
+    install_panic_hook();
     if options.headless {
         attach_console();
     }
@@ -323,7 +347,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         start_hidden: options.start_hidden,
     };
     if let Err(err) = crate::gui::run(shell, shared.clone()) {
-        eprintln!("界面启动失败：{err}");
+        eprintln!("界面退出：{err}");
+        if err == crate::gui::LOOP_CRASHED {
+            // 事件循环崩了：收掉内核再退出，不要挂着一个没有界面的进程。
+            let mut state = shared.lock().await;
+            let _ = state.core.stop();
+            return Err(err.into());
+        }
+        // 其他情况（比如窗口创建失败）退回浏览器兜底。
         if options.open_browser {
             open_in_browser(&url);
         }

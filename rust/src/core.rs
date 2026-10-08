@@ -131,7 +131,7 @@ impl CoreProcess {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.creation_flags(CREATE_NO_WINDOW);
         }
-        let mut child = command
+        let child = command
             .spawn()
             .map_err(|err| format!("启动内核失败：{err}"))?;
         #[cfg(windows)]
@@ -170,7 +170,6 @@ impl CoreProcess {
 /// 创建一个「句柄全部关闭即终止组内进程」的作业对象。
 #[cfg(windows)]
 fn create_kill_on_close_job() -> Option<isize> {
-    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::JobObjects::{
         CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,

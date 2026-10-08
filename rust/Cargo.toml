@@ -1,6 +1,6 @@
 [package]
 name = "network-manager-rs"
-version = "0.6.8"
+version = "0.6.9"
 edition = "2021"
 description = "Rust rewrite of the Network Manager control backend"
 build = "build.rs"
@@ -65,5 +65,8 @@ embed-resource = "3.0"
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
+# 不用 panic = "abort"：abort 会让任何一次恐慌直接杀死进程，既来不及摘掉托盘图标
+# （留下点了没反应的死图标），也没法记下崩溃现场。改成 unwind 后，界面事件循环里
+# 的恐慌可以被 catch_unwind 收住，程序能收拾干净再退出。
+panic = "unwind"
 strip = true

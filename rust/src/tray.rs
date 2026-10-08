@@ -26,7 +26,6 @@ pub enum TrayCommand {
 mod windows_impl {
     use super::TrayCommand;
     use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-    use std::sync::mpsc::Sender;
     use std::time::Duration;
 
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -59,12 +58,12 @@ mod windows_impl {
     /// RegisterWindowMessageW("TaskbarCreated") 的消息号。
     static TASKBAR_CREATED: AtomicUsize = AtomicUsize::new(0);
 
-    pub fn spawn(icon_path: &str, sender: Sender<TrayCommand>) -> Result<(), String> {
+    pub fn spawn(icon_path: &str) -> Result<(), String> {
         let icon_path = icon_path.to_string();
         std::thread::Builder::new()
             .name("network-manager-tray".into())
             .spawn(move || {
-                if let Err(err) = run(&icon_path, &sender) {
+                if let Err(err) = run(&icon_path) {
                     eprintln!("托盘启动失败：{err}");
                 }
             })
@@ -93,10 +92,12 @@ mod windows_impl {
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
+            // 窗口已经销毁：清掉句柄，避免之后拿到失效句柄重复投递。
+            TRAY_WINDOW.store(0, Ordering::SeqCst);
         }
     }
 
-    fn run(icon_path: &str, sender: &Sender<TrayCommand>) -> Result<(), String> {
+    fn run(icon_path: &str) -> Result<(), String> {
         unsafe {
             let module = GetModuleHandleW(None).map_err(|err| err.to_string())?;
             let instance = HINSTANCE(module.0);
@@ -172,7 +173,7 @@ mod windows_impl {
             let mut message: MSG = std::mem::zeroed();
             while GetMessageW(&mut message, None, 0, 0).as_bool() {
                 if message.message == TRAY_MESSAGE {
-                    handle_tray_event(message.lParam, sender);
+                    handle_tray_event(message.lParam);
                     continue;
                 }
                 if TASKBAR_CREATED.load(Ordering::SeqCst) != 0
@@ -197,24 +198,33 @@ mod windows_impl {
     ///
     /// 左键单击/双击都打开窗口（此前只认双击，单击毫无反应，体验像「摆设」）；
     /// 右键弹菜单，同时兼容新版 explorer 的 WM_CONTEXTMENU。
-    fn handle_tray_event(lparam: LPARAM, sender: &Sender<TrayCommand>) {
+    /// 把命令交给界面线程。
+    ///
+    /// 走 tao 的 EventLoopProxy（内部是 PostMessage 到事件循环的消息窗口），
+    /// 界面线程会被立刻唤醒；以前用 mpsc 通道 + 每 200ms 轮询一次，既费电
+    /// 也让点击有明显延迟。
+    fn dispatch(command: TrayCommand) {
+        crate::gui::send(crate::gui::AppEvent::Tray(command));
+    }
+
+    fn handle_tray_event(lparam: LPARAM) {
         let event = lparam.0 as u32;
         match event {
             // 按下也响应：某些 explorer 版本/主题下抬起消息可能不到达，
             // 而 Open 是幂等的（窗口已经可见时不会重复重建 WebView）。
             WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
-                let _ = sender.send(TrayCommand::Open);
+                dispatch(TrayCommand::Open);
             }
             WM_RBUTTONUP => {
                 unsafe {
-                    show_menu(sender);
+                    show_menu();
                 }
             }
             _ => {}
         }
     }
 
-    unsafe fn show_menu(sender: &Sender<TrayCommand>) {
+    unsafe fn show_menu() {
         // 菜单挂在托盘消息窗口上，需要它的句柄来 SetForegroundWindow /
         // TrackPopupMenu，托盘线程里读一次即可。
         let window = HWND(TRAY_WINDOW.load(Ordering::SeqCst) as *mut _);
@@ -259,15 +269,9 @@ mod windows_impl {
         );
         if chosen.as_bool() {
             match chosen.0 as usize {
-                MENU_OPEN => {
-                    let _ = sender.send(TrayCommand::Open);
-                }
-                MENU_TOGGLE => {
-                    let _ = sender.send(TrayCommand::ToggleCore);
-                }
-                MENU_QUIT => {
-                    let _ = sender.send(TrayCommand::Quit);
-                }
+                MENU_OPEN => dispatch(TrayCommand::Open),
+                MENU_TOGGLE => dispatch(TrayCommand::ToggleCore),
+                MENU_QUIT => dispatch(TrayCommand::Quit),
                 _ => {}
             }
         }
@@ -282,7 +286,7 @@ mod windows_impl {
     ) -> LRESULT {
         match message {
             WM_CLOSE => {
-                DestroyWindow(window);
+                let _ = DestroyWindow(window);
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -300,10 +304,7 @@ mod windows_impl {
 
 #[cfg(not(windows))]
 mod stub {
-    use super::TrayCommand;
-    use std::sync::mpsc::Sender;
-
-    pub fn spawn(_icon_path: &str, _sender: Sender<TrayCommand>) -> Result<(), String> {
+    pub fn spawn(_icon_path: &str) -> Result<(), String> {
         Ok(())
     }
 
