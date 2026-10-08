@@ -101,6 +101,7 @@ pub struct AppState {
     pub importing: bool,
     pub headless: bool,
     pub exit_ip: String,
+    pub local_ip: String,
     pub toasts: Vec<Value>,
 }
 
@@ -117,6 +118,7 @@ impl AppState {
             importing: false,
             headless: false,
             exit_ip: "尚未检测".into(),
+            local_ip: "尚未检测".into(),
             toasts: Vec::new(),
         }
     }

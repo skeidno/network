@@ -51,8 +51,191 @@ fn node_endpoint(node: &ImportedNode) -> (String, u16) {
     (host, port.clamp(0, 65535) as u16)
 }
 
-async fn measure_delay(host: &str, port: u16) -> Result<i64, String> {
-    if host.is_empty() || port == 0 {
+/// 出口 IP 检测端点。全部并发发起，谁先返回就用谁。
+///
+/// 前三个是国内**不走代理也能访问**的站点：应用自身进程被内核规则
+/// `PROCESS-NAME,NetworkManager.exe,DIRECT` 强制直连，如果只用 ipify /
+/// Cloudflare 这类境外端点，国内网络下会被直接重置（`tls handshake eof`），
+/// 直连出口就永远测不出来。后两个保留给境外环境和代理路径使用。
+const IP_CHECKS: &[&str] = &[
+    "https://myip.ipip.net",
+    "http://ip.3322.net",
+    "https://1.1.1.1/cdn-cgi/trace",
+    "https://api.ipify.org?format=json",
+    "http://api.ipify.org?format=json",
+];
+
+/// 直连检测本机出口 IP（明确禁用环境变量代理，避免被系统代理干扰）。
+async fn exit_ip_direct() -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .no_proxy()
+        .build()
+        .map_err(|err| format!("创建 HTTP 客户端失败：{err}"))?;
+    fetch_exit_ip(&client).await
+}
+
+/// 通过本地混合代理端口检测出口 IP —— 测的是「经过代理后的出口」。
+async fn exit_ip_through_proxy(proxy_url: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .proxy(reqwest::Proxy::all(proxy_url).map_err(|err| format!("代理地址无效：{err}"))?)
+        .build()
+        .map_err(|err| format!("创建 HTTP 客户端失败：{err}"))?;
+    fetch_exit_ip(&client).await
+}
+
+/// 所有端点同时发起，谁先拿到 IP 就用谁。
+/// 串行轮询时每个端点都要等满超时，最坏要 60 秒；并发后最坏 12 秒。
+async fn fetch_exit_ip(client: &reqwest::Client) -> Result<String, String> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(IP_CHECKS.len());
+    for endpoint in IP_CHECKS {
+        let tx = tx.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let outcome = probe_exit_endpoint(&client, endpoint).await;
+            let _ = tx.send((endpoint, outcome)).await;
+        });
+    }
+    drop(tx);
+
+    let mut failures: Vec<String> = Vec::new();
+    while let Some((endpoint, outcome)) = rx.recv().await {
+        match outcome {
+            Ok(address) => return Ok(address),
+            Err(err) => failures.push(format!("{endpoint}: {err}")),
+        }
+    }
+    let detail = failures.last().cloned().unwrap_or_else(|| "检测端点没有返回 IP".into());
+    Err(format!("所有出口检测端点均失败：{detail}"))
+}
+
+async fn probe_exit_endpoint(client: &reqwest::Client, endpoint: &str) -> Result<String, String> {
+    let response = client
+        .get(endpoint)
+        .send()
+        .await
+        .map_err(|err| {
+            // reqwest 的错误外壳不带细节，展开整个 source 链才能看到
+            // 是 DNS、连接超时还是 TLS 问题。
+            let mut chain = vec![err.to_string()];
+            let mut source = std::error::Error::source(&err);
+            while let Some(cause) = source {
+                chain.push(cause.to_string());
+                source = cause.source();
+            }
+            chain.join(" ← ")
+        })?
+        .error_for_status()
+        .map_err(|err| err.to_string())?;
+    let text = response.text().await.map_err(|err| err.to_string())?;
+    extract_ip(&text).ok_or_else(|| "响应中没有 IP".to_string())
+}
+
+/// 各端点返回格式五花八门，统一按三种形态解析：
+/// JSON（`{"ip":"1.2.3.4"}` / 搜狐的 `{"cip":"1.2.3.4"}`）、
+/// Cloudflare trace（`ip=1.2.3.4`）、
+/// 纯文本（ipip.net 的「当前 IP：1.2.3.4 来自于…」、淘宝的 `ipCallback({ip:"1.2.3.4"})`）。
+fn extract_ip(text: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        for key in ["ip", "cip"] {
+            if let Some(ip) = value.get(key).and_then(|v| v.as_str()) {
+                if is_public_ip(ip.trim()) {
+                    return Some(ip.trim().to_string());
+                }
+            }
+        }
+    }
+    for line in text.lines() {
+        if let Some(ip) = line.strip_prefix("ip=") {
+            if is_public_ip(ip.trim()) {
+                return Some(ip.trim().to_string());
+            }
+        }
+    }
+    first_ipv4(text)
+}
+
+/// 在文本里找第一个公网 IPv4 地址。
+fn first_ipv4(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    for start in 0..bytes.len() {
+        if let Some((ip, _)) = parse_ipv4_at(bytes, start) {
+            if is_public_ip(&ip) {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
+
+/// 排除不可能代表出口身份的地址：
+/// 私有网段、回环、链路本地、CGNAT，以及文档保留段。
+/// 198.18/15 是 mihomo 的 fake-ip 段，尤其不能当成出口 IP 显示出来。
+fn is_public_ip(ip: &str) -> bool {
+    let octets: Vec<u8> = ip
+        .split('.')
+        .map(|part| part.parse::<u8>().ok())
+        .collect::<Option<Vec<u8>>>()
+        .unwrap_or_default();
+    if octets.len() != 4 {
+        return false;
+    }
+    let [a, b, _, _] = [octets[0], octets[1], octets[2], octets[3]];
+    !matches!(
+        (a, b),
+        (0, _)
+            | (10, _)
+            | (127, _)
+            | (169, 254)
+            | (172, 16..=31)
+            | (192, 168)
+            | (100, 64..=127)
+            | (198, 18..=19)
+            | (192, 0)
+            | (198, 51)
+            | (203, 0)
+            | (224..=255, _)
+    )
+}
+
+/// 从 `start` 起尝试解析一个 IPv4；不符合就返回 None。
+/// 前后若还是数字或点则不认，避免把更长数字串的片段当成地址。
+fn parse_ipv4_at(bytes: &[u8], start: usize) -> Option<(String, usize)> {
+    if start > 0 && (bytes[start - 1].is_ascii_digit() || bytes[start - 1] == b'.') {
+        return None;
+    }
+    let mut pos = start;
+    let mut octets = [0u16; 4];
+    for index in 0..4 {
+        let digit_start = pos;
+        let mut value: u16 = 0;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() && value <= 255 {
+            value = value * 10 + (bytes[pos] - b'0') as u16;
+            pos += 1;
+        }
+        let digits = pos - digit_start;
+        if digits == 0 || digits > 3 || value > 255 {
+            return None;
+        }
+        octets[index] = value;
+        if index < 3 {
+            if pos >= bytes.len() || bytes[pos] != b'.' {
+                return None;
+            }
+            pos += 1;
+        }
+    }
+    if pos < bytes.len() && (bytes[pos].is_ascii_digit() || bytes[pos] == b'.') {
+        return None;
+    }
+    Some((
+        format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]),
+        pos,
+    ))
+}
+
+async fn measure_delay(host: &str, port: u16) -> Result<i64, String> {    if host.is_empty() || port == 0 {
         return Err("节点缺少地址或端口".into());
     }
     let address = format!("{host}:{port}");
@@ -924,18 +1107,57 @@ pub async fn dispatch(state: &mut AppState, method: &str, args: Vec<Value>) -> R
             Ok(node)
         }
         "testExit" => {
-            match tokio::time::timeout(
-                Duration::from_secs(6),
-                reqwest::get("https://api.ipify.org?format=json"),
-            )
-            .await
-            {
-                Ok(Ok(response)) => {
-                    let text = response.text().await.unwrap_or_default();
-                    Ok(Value::String(text))
+            // 一次测两个出口：直连（本机真实 IP）与代理（经过内置节点的出口）。
+            // 代理检测沿用 Python 语义：必须先启动内核，通过本地混合端口出站。
+            let core_running = state.core.is_running();
+            let (local, proxy_result) = tokio::join!(
+                exit_ip_direct(),
+                async {
+                    if !core_running {
+                        return Err("内核未运行".to_string());
+                    }
+                    let proxy = format!("http://127.0.0.1:{}", state.config.mixed_port);
+                    exit_ip_through_proxy(&proxy).await
                 }
-                _ => Err("出口 IP 检测失败".to_string()),
+            );
+            let (local_ip, local_error) = match local {
+                Ok(address) => (address, None),
+                Err(err) => {
+                    // 直连失败也要可见，不能静默吞掉，否则卡片一直停在「尚未检测」。
+                    state.notify("warning", format!("直连出口检测失败：{err}"));
+                    ("检测失败".to_string(), Some(err))
+                }
+            };
+            state.local_ip = local_ip.clone();
+            match proxy_result {
+                Ok(address) => {
+                    state.exit_ip = address.clone();
+                    if local_error.is_some() {
+                        state.notify("warning", format!("代理出口：{address}（直连出口检测失败）"));
+                    } else {
+                        state.notify("success", format!("直连 {local_ip} · 代理出口 {address}"));
+                        if local_ip == address {
+                            // TUN 接管会把「直连」流量也送进内核，两个 IP 相同是
+                            // 预期结果，说明接管生效；不是检测出错。
+                            state.notify(
+                                "info",
+                                "直连与代理出口相同：当前处于接管状态，直连流量也走了内核".to_string(),
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    // 内核没跑就别留着上一次的代理出口，避免误以为代理还生效。
+                    state.exit_ip = if core_running {
+                        "检测失败".to_string()
+                    } else {
+                        "内核未运行".to_string()
+                    };
+                    let detail = if core_running { err } else { "请先启动接管核心".to_string() };
+                    state.notify("error", format!("代理出口检测失败：{detail}"));
+                }
             }
+            apply(state)
         }
         other => Err(format!("不支持的操作：{other}")),
     }
