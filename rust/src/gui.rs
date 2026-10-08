@@ -5,6 +5,9 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use wry::WebViewBuilderExtWindows;
+
 use tao::dpi::LogicalSize;
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
@@ -91,8 +94,19 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
         .map_err(|err| format!("创建窗口失败：{err}"))?;
     set_window_visible(!shell.start_hidden);
 
+    // --disable-gpu-sandbox：本机（火绒 HIPS 驱动 + WebView2 Runtime 154 组合）
+    // 会拦截 GPU 子进程的沙箱令牌创建，GPU 进程在 ~40ms 内静默退出（exit_code=7，
+    // 无任何日志），连续失败 6 次后浏览器主进程自杀：
+    //   FATAL:content\browser\gpu\gpu_data_manager_impl_private.cc:436]
+    //   GPU process isn't usable. Goodbye.
+    // 整个 WebView2 死掉，窗口呈现整块白屏/黑屏。只关 GPU 进程的沙箱即可绕过
+    // （渲染进程沙箱保留），--no-sandbox 能修但影响面更大，不采用。
+    // 佐证：--enable-logging 日志显示 GPU 进程连续 exit_code=7；--disable-gpu
+    // 无效（GPU 信息收集进程仍会启动并失败）；Windows SearchHost 等系统宿主
+    // 不受影响。
     let webview = wry::WebViewBuilder::new()
         .with_url(&shell.url)
+        .with_additional_browser_args("--disable-gpu-sandbox")
         .build(&window)
         .map_err(|err| format!("创建 WebView 失败：{err}"))?;
 
