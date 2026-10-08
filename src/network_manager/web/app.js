@@ -1544,6 +1544,7 @@ function bindEvents() {
   document.querySelectorAll(".tab").forEach((item) => item.addEventListener("click", () => setNodeTab(item.dataset.nodeTab)));
   byId("header-refresh").addEventListener("click", () => scheduleStateRefresh(0));
   byId("core-toggle").addEventListener("click", toggleCoreFromUi);
+  byId("restart-admin").addEventListener("click", () => invoke("restartAsAdmin"));
   byId("mode-switch").addEventListener("click", (event) => {
     const button = event.target.closest("[data-mode]");
     if (button && !button.disabled) invoke("setMode", button.dataset.mode);
