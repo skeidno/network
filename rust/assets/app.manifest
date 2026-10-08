@@ -3,7 +3,7 @@
   <assemblyIdentity
     type="win32"
     name="skeidno.NetworkManager"
-    version="0.6.9.0"
+    version="0.6.10.0"
     processorArchitecture="amd64"
   />
   <!-- 默认不强制 UAC：只有创建 TUN 虚拟网卡才需要管理员令牌，
