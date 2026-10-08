@@ -450,7 +450,9 @@ pub fn build(state: &mut AppState) -> Value {
             "memoryMb": memory_mb().round() as i64,
         },
         "exitIp": state.exit_ip,
+        "exitIpLocation": state.exit_ip_location,
         "localIp": state.local_ip,
+        "localIpLocation": state.local_ip_location,
         "rules": rule_states(config),
         "fallbackRule": {
             "target": config.default_target,

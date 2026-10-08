@@ -51,66 +51,108 @@ fn node_endpoint(node: &ImportedNode) -> (String, u16) {
     (host, port.clamp(0, 65535) as u16)
 }
 
-/// 出口 IP 检测端点。全部并发发起，谁先返回就用谁。
+/// 一次检测的结果：出口 IP，以及能查到的归属地（查不到就为空，不编造）。
+struct ExitIdentity {
+    ip: String,
+    location: String,
+}
+
+/// 用于提示语：「1.2.3.4（美国 芝加哥）」，没有归属地就只显示 IP。
+fn describe(identity: &ExitIdentity) -> String {
+    if identity.location.is_empty() {
+        identity.ip.clone()
+    } else {
+        format!("{}（{}）", identity.ip, identity.location)
+    }
+}
+
+/// 出口检测端点及其响应格式。全部并发发起。
 ///
-/// 前三个是国内**不走代理也能访问**的站点：应用自身进程被内核规则
-/// `PROCESS-NAME,NetworkManager.exe,DIRECT` 强制直连，如果只用 ipify /
-/// Cloudflare 这类境外端点，国内网络下会被直接重置（`tls handshake eof`），
-/// 直连出口就永远测不出来。后两个保留给境外环境和代理路径使用。
-const IP_CHECKS: &[&str] = &[
-    "https://myip.ipip.net",
-    "http://ip.3322.net",
-    "https://1.1.1.1/cdn-cgi/trace",
-    "https://api.ipify.org?format=json",
-    "http://api.ipify.org?format=json",
+/// 前三个国内**不走代理也能访问**：应用自身进程被内核规则
+/// `PROCESS-NAME,NetworkManager.exe,DIRECT` 强制直连，只用 ipify /
+/// Cloudflare 这类境外端点的话，国内网络下会被直接重置
+/// （`tls handshake eof`），直连出口就永远测不出来。
+/// ipip.net 会连归属地一起给（中文），但偶尔返 521，所以 http/https 两个都放上。
+const IP_CHECKS: &[(&str, &str)] = &[
+    ("http://myip.ipip.net", "ipip"),
+    ("https://myip.ipip.net", "ipip"),
+    ("http://ip.3322.net", "plain"),
+    ("http://ip-api.com/json/", "ip-api"),
+    ("https://ipapi.co/json/", "ipapi"),
+    ("https://1.1.1.1/cdn-cgi/trace", "trace"),
+    ("https://api.ipify.org?format=json", "json"),
+    ("http://api.ipify.org?format=json", "json"),
 ];
 
 /// 直连检测本机出口 IP（明确禁用环境变量代理，避免被系统代理干扰）。
-async fn exit_ip_direct() -> Result<String, String> {
+async fn exit_ip_direct() -> Result<ExitIdentity, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(12))
         .no_proxy()
         .build()
         .map_err(|err| format!("创建 HTTP 客户端失败：{err}"))?;
-    fetch_exit_ip(&client).await
+    fetch_exit_identity(&client).await
 }
 
 /// 通过本地混合代理端口检测出口 IP —— 测的是「经过代理后的出口」。
-async fn exit_ip_through_proxy(proxy_url: &str) -> Result<String, String> {
+async fn exit_ip_through_proxy(proxy_url: &str) -> Result<ExitIdentity, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(12))
         .proxy(reqwest::Proxy::all(proxy_url).map_err(|err| format!("代理地址无效：{err}"))?)
         .build()
         .map_err(|err| format!("创建 HTTP 客户端失败：{err}"))?;
-    fetch_exit_ip(&client).await
+    fetch_exit_identity(&client).await
 }
 
-/// 所有端点同时发起，谁先拿到 IP 就用谁。
-/// 串行轮询时每个端点都要等满超时，最坏要 60 秒；并发后最坏 12 秒。
-async fn fetch_exit_ip(client: &reqwest::Client) -> Result<String, String> {
+/// 所有端点同时发起。先拿到「带归属地」的结果就直接返回；
+/// 只拿到裸 IP 时，再宽限 3 秒等一个带归属地的响应，实在没有就用裸 IP。
+async fn fetch_exit_identity(client: &reqwest::Client) -> Result<ExitIdentity, String> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(IP_CHECKS.len());
-    for endpoint in IP_CHECKS {
+    for (endpoint, kind) in IP_CHECKS {
         let tx = tx.clone();
         let client = client.clone();
         tokio::spawn(async move {
-            let outcome = probe_exit_endpoint(&client, endpoint).await;
+            let outcome = probe_exit_endpoint(&client, endpoint, kind).await;
             let _ = tx.send((endpoint, outcome)).await;
         });
     }
     drop(tx);
 
+    let mut fallback: Option<ExitIdentity> = None;
     let mut failures: Vec<String> = Vec::new();
-    while let Some((endpoint, outcome)) = rx.recv().await {
-        match outcome {
-            Ok(address) => return Ok(address),
-            Err(err) => failures.push(format!("{endpoint}: {err}")),
+    let mut deadline: Option<tokio::time::Instant> = None;
+    loop {
+        let next = match deadline {
+            Some(until) => tokio::time::timeout_at(until, rx.recv()).await.ok().flatten(),
+            None => rx.recv().await,
+        };
+        match next {
+            Some((_, Ok(identity))) => {
+                if identity.location.is_empty() {
+                    // 先兜底记着，同时开始计时等更好的结果
+                    if fallback.is_none() {
+                        fallback = Some(identity);
+                        deadline = Some(tokio::time::Instant::now() + Duration::from_secs(3));
+                    }
+                } else {
+                    return Ok(identity);
+                }
+            }
+            Some((endpoint, Err(err))) => failures.push(format!("{endpoint}: {err}")),
+            None => break,
         }
     }
-    let detail = failures.last().cloned().unwrap_or_else(|| "检测端点没有返回 IP".into());
-    Err(format!("所有出口检测端点均失败：{detail}"))
+    fallback.ok_or_else(|| {
+        let detail = failures.last().cloned().unwrap_or_else(|| "检测端点没有返回 IP".into());
+        format!("所有出口检测端点均失败：{detail}")
+    })
 }
 
-async fn probe_exit_endpoint(client: &reqwest::Client, endpoint: &str) -> Result<String, String> {
+async fn probe_exit_endpoint(
+    client: &reqwest::Client,
+    endpoint: &str,
+    kind: &str,
+) -> Result<ExitIdentity, String> {
     let response = client
         .get(endpoint)
         .send()
@@ -129,31 +171,196 @@ async fn probe_exit_endpoint(client: &reqwest::Client, endpoint: &str) -> Result
         .error_for_status()
         .map_err(|err| err.to_string())?;
     let text = response.text().await.map_err(|err| err.to_string())?;
-    extract_ip(&text).ok_or_else(|| "响应中没有 IP".to_string())
+    parse_exit_identity(&text, kind).ok_or_else(|| "响应中没有 IP".to_string())
 }
 
-/// 各端点返回格式五花八门，统一按三种形态解析：
-/// JSON（`{"ip":"1.2.3.4"}` / 搜狐的 `{"cip":"1.2.3.4"}`）、
-/// Cloudflare trace（`ip=1.2.3.4`）、
-/// 纯文本（ipip.net 的「当前 IP：1.2.3.4 来自于…」、淘宝的 `ipCallback({ip:"1.2.3.4"})`）。
-fn extract_ip(text: &str) -> Option<String> {
-    if let Ok(value) = serde_json::from_str::<Value>(text) {
-        for key in ["ip", "cip"] {
-            if let Some(ip) = value.get(key).and_then(|v| v.as_str()) {
-                if is_public_ip(ip.trim()) {
-                    return Some(ip.trim().to_string());
-                }
-            }
-        }
+/// 按端点各自的响应格式解析出 IP 与归属地。
+fn parse_exit_identity(text: &str, kind: &str) -> Option<ExitIdentity> {
+    let ip = match kind {
+        "ip-api" => json_str(text, &["query"]),
+        "ipapi" => json_str(text, &["ip"]),
+        "json" | "ipip" | "plain" => first_ipv4(text),
+        _ => trace_value(text, "ip").or_else(|| first_ipv4(text)),
+    }?;
+    if !is_public_ip(&ip) {
+        return None;
     }
-    for line in text.lines() {
-        if let Some(ip) = line.strip_prefix("ip=") {
-            if is_public_ip(ip.trim()) {
-                return Some(ip.trim().to_string());
-            }
+    let location = match kind {
+        // 「当前 IP：1.2.3.4  来自于：美国 伊利诺伊州 芝加哥  colocrossing.com」
+        "ipip" => ipip_location(text),
+        "ip-api" => geo_location(
+            country_name(&json_str(text, &["countryCode"]).unwrap_or_default()),
+            &[json_str(text, &["city"]), json_str(text, &["regionName"])],
+        ),
+        "ipapi" => geo_location(
+            country_name(&json_str(text, &["country_code"]).unwrap_or_default()),
+            &[json_str(text, &["city"]), json_str(text, &["region"])],
+        ),
+        // Cloudflare trace 只给国家码 + 机房三字码，机房码要翻成城市才看得懂
+        "trace" => geo_location(
+            country_name(&trace_value(text, "loc").unwrap_or_default()),
+            &[trace_value(text, "colo").map(|colo| colo_name(&colo))],
+        ),
+        _ => String::new(),
+    };
+    Some(ExitIdentity { ip, location })
+}
+
+/// ipip.net 的归属地直接是中文，形如「中国 浙江 杭州 电信」。
+/// 末尾的运营商域名（纯 ASCII，如 colocrossing.com）丢掉，只留中文地名。
+fn ipip_location(text: &str) -> String {
+    let tail = match text.split_once("来自于：") {
+        Some((_, tail)) => tail,
+        None => return String::new(),
+    };
+    tail.split_whitespace()
+        .take_while(|token| token.chars().any(|ch| !ch.is_ascii()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 国家用中文名，城市/机房保留原始写法，拼成「美国 芝加哥」这样的短串。
+fn geo_location(country: String, parts: &[Option<String>]) -> String {
+    let mut location = country.clone();
+    for part in parts.iter().flatten() {
+        let part = part.trim();
+        if part.is_empty() || part == country {
+            continue;
         }
+        location.push(' ');
+        location.push_str(part);
+        break;
     }
-    first_ipv4(text)
+    location
+}
+
+/// Cloudflare trace 里的机房三字码转城市名（常见的那些），查不到就原样返回。
+fn colo_name(code: &str) -> String {
+    match code.to_ascii_uppercase().as_str() {
+        "LAX" => "洛杉矶",
+        "SJC" => "圣何塞",
+        "SFO" => "旧金山",
+        "SEA" => "西雅图",
+        "ORD" => "芝加哥",
+        "DFW" => "达拉斯",
+        "IAD" => "华盛顿",
+        "EWR" => "纽瓦克",
+        "ATL" => "亚特兰大",
+        "MIA" => "迈阿密",
+        "DEN" => "丹佛",
+        "PHX" => "凤凰城",
+        "YYZ" => "多伦多",
+        "YVR" => "温哥华",
+        "LHR" => "伦敦",
+        "CDG" => "巴黎",
+        "AMS" => "阿姆斯特丹",
+        "FRA" => "法兰克福",
+        "MAD" => "马德里",
+        "FCO" => "罗马",
+        "ZRH" => "苏黎世",
+        "ARN" => "斯德哥尔摩",
+        "DUB" => "都柏林",
+        "IST" => "伊斯坦布尔",
+        "MOW" => "莫斯科",
+        "DXB" => "迪拜",
+        "DOH" => "多哈",
+        "TLV" => "特拉维夫",
+        "NRT" => "东京",
+        "KIX" => "大阪",
+        "ICN" => "首尔",
+        "HKG" => "中国香港",
+        "TPE" => "中国台湾",
+        "SIN" => "新加坡",
+        "KUL" => "吉隆坡",
+        "BKK" => "曼谷",
+        "CGK" => "雅加达",
+        "MNL" => "马尼拉",
+        "SGN" => "胡志明市",
+        "DEL" => "德里",
+        "BOM" => "孟买",
+        "SYD" => "悉尼",
+        "MEL" => "墨尔本",
+        "AKL" => "奥克兰",
+        "JNB" => "约翰内斯堡",
+        "LOS" => "拉各斯",
+        "GRU" => "圣保罗",
+        "SCL" => "圣地亚哥",
+        other => return other.to_string(),
+    }
+    .to_string()
+}
+
+/// Cloudflare trace 是一行行的 `key=value`。
+fn trace_value(text: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    text.lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(|value| value.trim().to_string())
+}
+
+fn json_str(text: &str, keys: &[&str]) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    keys.iter()
+        .find_map(|key| value.get(*key)?.as_str())
+        .map(|value| value.trim().to_string())
+}
+
+/// 常见的 ISO 国家码转中文名。只在端点只给国家码时用，查不到就原样返回。
+fn country_name(code: &str) -> String {
+    let upper = code.to_ascii_uppercase();
+    match upper.as_str() {
+        "CN" => "中国",
+        "HK" => "中国香港",
+        "MO" => "中国澳门",
+        "TW" => "中国台湾",
+        "US" => "美国",
+        "JP" => "日本",
+        "KR" => "韩国",
+        "SG" => "新加坡",
+        "MY" => "马来西亚",
+        "TH" => "泰国",
+        "VN" => "越南",
+        "IN" => "印度",
+        "ID" => "印度尼西亚",
+        "PH" => "菲律宾",
+        "AU" => "澳大利亚",
+        "NZ" => "新西兰",
+        "GB" | "UK" => "英国",
+        "DE" => "德国",
+        "FR" => "法国",
+        "NL" => "荷兰",
+        "CH" => "瑞士",
+        "SE" => "瑞典",
+        "NO" => "挪威",
+        "FI" => "芬兰",
+        "DK" => "丹麦",
+        "PL" => "波兰",
+        "ES" => "西班牙",
+        "IT" => "意大利",
+        "RU" => "俄罗斯",
+        "TR" => "土耳其",
+        "CA" => "加拿大",
+        "MX" => "墨西哥",
+        "BR" => "巴西",
+        "AR" => "阿根廷",
+        "CL" => "智利",
+        "ZA" => "南非",
+        "EG" => "埃及",
+        "AE" => "阿联酋",
+        "SA" => "沙特阿拉伯",
+        "IL" => "以色列",
+        "UA" => "乌克兰",
+        "CZ" => "捷克",
+        "AT" => "奥地利",
+        "BE" => "比利时",
+        "IE" => "爱尔兰",
+        "PT" => "葡萄牙",
+        "GR" => "希腊",
+        "RO" => "罗马尼亚",
+        "HU" => "匈牙利",
+        other => return other.to_string(),
+    }
+    .to_string()
 }
 
 /// 在文本里找第一个公网 IPv4 地址。
@@ -1121,22 +1328,30 @@ pub async fn dispatch(state: &mut AppState, method: &str, args: Vec<Value>) -> R
                 }
             );
             let (local_ip, local_error) = match local {
-                Ok(address) => (address, None),
+                Ok(identity) => (identity, None),
                 Err(err) => {
                     // 直连失败也要可见，不能静默吞掉，否则卡片一直停在「尚未检测」。
                     state.notify("warning", format!("直连出口检测失败：{err}"));
-                    ("检测失败".to_string(), Some(err))
+                    (
+                        ExitIdentity { ip: "检测失败".to_string(), location: String::new() },
+                        Some(err),
+                    )
                 }
             };
-            state.local_ip = local_ip.clone();
+            state.local_ip = local_ip.ip.clone();
+            state.local_ip_location = local_ip.location.clone();
             match proxy_result {
-                Ok(address) => {
-                    state.exit_ip = address.clone();
+                Ok(identity) => {
+                    state.exit_ip = identity.ip.clone();
+                    state.exit_ip_location = identity.location.clone();
                     if local_error.is_some() {
-                        state.notify("warning", format!("代理出口：{address}（直连出口检测失败）"));
+                        state.notify("warning", format!("代理出口：{}", describe(&identity)));
                     } else {
-                        state.notify("success", format!("直连 {local_ip} · 代理出口 {address}"));
-                        if local_ip == address {
+                        state.notify(
+                            "success",
+                            format!("直连 {} · 代理出口 {}", describe(&local_ip), describe(&identity)),
+                        );
+                        if local_ip.ip == identity.ip {
                             // TUN 接管会把「直连」流量也送进内核，两个 IP 相同是
                             // 预期结果，说明接管生效；不是检测出错。
                             state.notify(
@@ -1153,6 +1368,7 @@ pub async fn dispatch(state: &mut AppState, method: &str, args: Vec<Value>) -> R
                     } else {
                         "内核未运行".to_string()
                     };
+                    state.exit_ip_location.clear();
                     let detail = if core_running { err } else { "请先启动接管核心".to_string() };
                     state.notify("error", format!("代理出口检测失败：{detail}"));
                 }
