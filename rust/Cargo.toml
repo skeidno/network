@@ -1,6 +1,6 @@
 [package]
 name = "network-manager-rs"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2021"
 description = "Rust rewrite of the Network Manager control backend"
 build = "build.rs"
