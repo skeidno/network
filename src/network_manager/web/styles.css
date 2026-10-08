@@ -631,6 +631,24 @@ td.actions { text-align: right; overflow: visible; }
 .deployment-detail { min-height: 16px; margin: -4px 0 10px !important; color: var(--text-3) !important; }
 .ssh-server-actions { display: flex; justify-content: flex-end; gap: 7px; }
 .ssh-server-actions .button { min-height: 32px; padding: 0 10px; gap: 5px; font-size: 12px; }
+
+/* 服务器表格（原卡片视图）：多选 + 批量操作 */
+.select-column { width: 46px; }
+.auth-column { width: 92px; }
+.status-column { width: 122px; }
+td.cell-select { padding-right: 0; }
+.cell-select input[type="checkbox"], th.select-column input[type="checkbox"] {
+  width: 15px; height: 15px; margin: 0; accent-color: var(--blue); cursor: pointer;
+}
+tbody tr.is-selected { background: var(--blue-soft); }
+tbody tr.is-selected:hover { background: var(--blue-soft); }
+#ssh-server-body td strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+#ssh-server-body td small { display: block; overflow: hidden; color: var(--text-3); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+#ssh-server-body td.actions { white-space: nowrap; }
+/* 表格里按钮较多（部署 + 复制/编辑/凭据/删除），操作列比其他表格宽一些 */
+#page-servers .actions-column { width: 252px; }
+#page-servers td.actions .button { min-height: 30px; padding: 0 9px; gap: 5px; font-size: 12px; }
+#page-servers td.actions .icon-button { width: 30px; height: 30px; }
 .ssh-server-actions .button .icon { width: 16px; height: 16px; }
 .ssh-server-actions .icon-button { width: 32px; min-height: 32px; }
 .ssh-server-actions .button:first-child { margin-right: auto; }

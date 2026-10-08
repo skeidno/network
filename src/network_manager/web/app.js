@@ -18,6 +18,8 @@ let requestedPage = currentPage;
 let pageSwitchFrame = 0;
 let initialFailureCount = 0;
 let statePollTimer = 0;
+// 服务器部署页的多选集合（表格视图下用于批量操作）
+const sshSelection = new Set();
 const renderSignatures = new Map();
 const COLLAPSED_NODE_GROUPS_KEY = "network-manager.collapsed-node-groups";
 const DEFAULT_SERVER_PROXY_PORT = 24443;
@@ -322,6 +324,25 @@ function downloadTextFile(name, content, contentType = "application/json") {
   link.click();
   link.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function copyText(content) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(content);
+      return;
+    }
+  } catch (_error) { /* 回落到下面的临时文本框 */ }
+  const area = document.createElement("textarea");
+  area.value = content;
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  try {
+    document.execCommand("copy");
+  } catch (_error) { /* 复制失败时静默处理 */ }
+  area.remove();
 }
 
 function renderSidebarRate(direction, rate) {
@@ -746,7 +767,10 @@ function syncSubscriptionGroupSelect() {
 
 function renderSshServers() {
   const servers = appState.sshServers || [];
-  if (!shouldRender("ssh-servers", servers)) return;
+  // 选中项只保留仍然存在的服务器，避免删除后残留
+  const alive = new Set(servers.map((server) => server.profileId));
+  sshSelection.forEach((id) => { if (!alive.has(id)) sshSelection.delete(id); });
+  if (!shouldRender("ssh-servers", servers)) { updateSshSelectionUi(); return; }
   byId("ssh-servers-empty").classList.toggle("is-hidden", servers.length > 0);
   const deploying = servers.find((server) => server.deployment?.status === "deploying");
   const deployedCount = servers.filter((server) => server.deployed).length;
@@ -755,7 +779,7 @@ function renderSshServers() {
     ? deploying.deployment.stage || "正在执行远端配置"
     : `${deployedCount} 个服务器节点已就绪；SSH 无需保持连接`;
   const authLabels = { password: "密码", key: "私钥", agent: "SSH Agent" };
-  byId("ssh-server-grid").innerHTML = servers.map((server) => {
+  byId("ssh-server-body").innerHTML = servers.map((server) => {
     const task = server.deployment || { status: "idle", stage: "", error: "" };
     const isDeploying = task.status === "deploying";
     const hasError = task.status === "error";
@@ -764,25 +788,53 @@ function renderSshServers() {
     const statusText = isDeploying ? "部署中" : hasError ? "部署失败" : portWarning ? "端口需调整" : hasWarning ? "外端口未开放" : server.deployed ? "已部署" : "未部署";
     const statusClass = hasError ? " is-error" : hasWarning ? " is-warning" : server.deployed ? " is-running" : "";
     const detail = portWarning || (isDeploying ? task.stage : hasError || hasWarning ? task.error || task.stage : server.deployedVersion || "等待部署");
-    return `<article class="ssh-server-card${server.deployed ? " is-active" : ""}${hasWarning ? " is-warning" : ""}">
-      <div class="ssh-server-card-head">
-        <div><h3 title="${escapeHtml(server.name)}">${escapeHtml(server.name)}</h3><p>${server.region ? `${escapeHtml(server.region)} · ` : ""}${escapeHtml(server.username)}@${escapeHtml(server.host)}:${server.port}</p></div>
-        <span class="small-status${statusClass}">${statusText}</span>
-      </div>
-      <div class="ssh-server-meta">
-        <span><small>认证</small><strong>${authLabels[server.authMethod] || server.authMethod}</strong></span>
-        <span><small>代理节点</small><strong>${escapeHtml(server.host)}:${server.proxyPort}</strong></span>
-      </div>
-      <p class="deployment-detail" title="${escapeHtml(detail)}">${escapeHtml(detail)}</p>
-      <div class="ssh-server-actions">
-        <button class="button primary" data-ssh-action="deploy" data-profile-id="${server.profileId}"${isDeploying || Boolean(deploying) ? " disabled" : ""}>${icon(isDeploying || server.deployed ? "refresh-cw" : "hard-drive-download")}<span>${server.deployed ? "检查服务" : "部署代理"}</span></button>
-        <button class="button secondary compact-button" data-ssh-action="copy" data-profile-id="${server.profileId}"${server.shareLink ? "" : " disabled"}>${icon("link")}<span>复制节点</span></button>
+    const selected = sshSelection.has(server.profileId) ? " checked" : "";
+    return `<tr data-profile-id="${server.profileId}"${sshSelection.has(server.profileId) ? ' class="is-selected"' : ""}>
+      <td class="cell-select"><input type="checkbox" data-ssh-select="${server.profileId}" aria-label="选择 ${escapeHtml(server.name)}"${selected}></td>
+      <td title="${escapeHtml(server.name)}"><strong>${escapeHtml(server.name)}</strong>${server.region ? `<small>${escapeHtml(server.region)}</small>` : ""}</td>
+      <td title="${escapeHtml(server.username)}@${escapeHtml(server.host)}:${server.port}">${escapeHtml(server.username)}@${escapeHtml(server.host)}:${server.port}</td>
+      <td>${authLabels[server.authMethod] || server.authMethod}</td>
+      <td title="${escapeHtml(server.host)}:${server.proxyPort}">${escapeHtml(server.host)}:${server.proxyPort}</td>
+      <td><span class="small-status${statusClass}" title="${escapeHtml(detail)}">${statusText}</span></td>
+      <td class="actions">
+        <button class="button primary compact-button" data-ssh-action="deploy" data-profile-id="${server.profileId}"${isDeploying || Boolean(deploying) ? " disabled" : ""}>${icon(isDeploying || server.deployed ? "refresh-cw" : "hard-drive-download")}<span>${server.deployed ? "检查服务" : "部署代理"}</span></button>
+        <button class="icon-button" data-ssh-action="copy" data-profile-id="${server.profileId}"${server.shareLink ? "" : " disabled"} title="复制节点链接" aria-label="复制节点">${icon("link")}</button>
         <button class="icon-button" data-ssh-action="edit" data-profile-id="${server.profileId}" title="编辑" aria-label="编辑">${icon("square-pen")}</button>
         ${server.hasCredential ? `<button class="icon-button" data-ssh-action="forget" data-profile-id="${server.profileId}" title="清除已保存的密码" aria-label="清除已保存的密码">${icon("key-round")}</button>` : ""}
         <button class="icon-button danger" data-ssh-action="delete" data-profile-id="${server.profileId}" title="删除" aria-label="删除">${icon("trash-2")}</button>
-      </div>
-    </article>`;
+      </td>
+    </tr>`;
   }).join("");
+  updateSshSelectionUi();
+}
+
+function selectedSshServers() {
+  const servers = appState.sshServers || [];
+  return servers.filter((server) => sshSelection.has(server.profileId));
+}
+
+function updateSshSelectionUi() {
+  const servers = appState.sshServers || [];
+  const picked = selectedSshServers();
+  const count = picked.length;
+  const label = byId("ssh-selection-count");
+  if (label) label.textContent = count ? `已选择 ${count} / ${servers.length} 台服务器` : "未选择服务器";
+  byId("batch-deploy-ssh").disabled = count === 0;
+  byId("batch-copy-ssh").disabled = count === 0 || !picked.some((server) => server.shareLink);
+  byId("batch-delete-ssh").disabled = count === 0;
+  const all = byId("ssh-select-all");
+  if (all) {
+    all.checked = servers.length > 0 && count === servers.length;
+    all.indeterminate = count > 0 && count < servers.length;
+    all.disabled = servers.length === 0;
+  }
+  byId("ssh-server-body")
+    .querySelectorAll("tr[data-profile-id]")
+    .forEach((row) => row.classList.toggle("is-selected", sshSelection.has(row.dataset.profileId)));
+}
+
+function renderSshSelectionOnly() {
+  updateSshSelectionUi();
 }
 
 function renderSettings() {
@@ -1690,7 +1742,46 @@ function bindEvents() {
     else confirmAction("删除订阅", "订阅及由它导入的节点将一并删除。", () => invoke("deleteSubscription", index));
   });
   byId("add-ssh-server").addEventListener("click", () => openSshServerDialog());
-  byId("ssh-server-grid").addEventListener("click", (event) => {
+  byId("ssh-select-all").addEventListener("change", (event) => {
+    sshSelection.clear();
+    if (event.target.checked) (appState.sshServers || []).forEach((server) => sshSelection.add(server.profileId));
+    renderSshSelectionOnly();
+  });
+  byId("ssh-server-body").addEventListener("change", (event) => {
+    const box = event.target.closest("[data-ssh-select]");
+    if (!box) return;
+    const id = box.dataset.sshSelect;
+    if (box.checked) sshSelection.add(id);
+    else sshSelection.delete(id);
+    renderSshSelectionOnly();
+  });
+  byId("batch-deploy-ssh").addEventListener("click", () => {
+    const picked = selectedSshServers();
+    if (!picked.length) return;
+    openModal(`批量部署 ${picked.length} 台服务器`, `
+      <div class="group-dialog-summary"><strong>将依次连接并部署选中的服务器</strong><span>部署在后台串行执行，可切到运行日志查看进度；未保存凭据的服务器会单独报错</span></div>
+      <div class="group-dialog-summary"><strong>本次选中的服务器</strong><span>${escapeHtml(picked.map((server) => server.name).join("、"))}</span></div>`,
+      [
+        { label: "取消", kind: "secondary", action: () => {} },
+        { label: `开始部署 ${picked.length} 台`, kind: "primary", action: () => {
+          picked.forEach((server) => invoke("deploySshServer", server.profileId, "", false));
+        } },
+      ]);
+  });
+  byId("batch-copy-ssh").addEventListener("click", () => {
+    const links = selectedSshServers().map((server) => server.shareLink).filter(Boolean);
+    if (!links.length) return;
+    copyText(links.join("\n"));
+  });
+  byId("batch-delete-ssh").addEventListener("click", () => {
+    const picked = selectedSshServers();
+    if (!picked.length) return;
+    confirmAction(`删除 ${picked.length} 台服务器`, `将删除所选服务器记录和对应内置节点，已保存的 SSH 密码也会一并清除，但不会卸载远端服务。确定继续？`, () => {
+      picked.forEach((server) => invoke("deleteSshServer", server.profileId));
+      sshSelection.clear();
+    });
+  });
+  byId("ssh-server-body").addEventListener("click", (event) => {
     const button = event.target.closest("[data-ssh-action]");
     if (!button) return;
     const server = appState.sshServers.find((item) => item.profileId === button.dataset.profileId);
