@@ -19,11 +19,53 @@ pub struct NodeDelay {
 
 pub struct CoreProcess {
     child: Option<Child>,
+    /// Windows 作业对象句柄：把内核进程挂进来，父进程无论正常退出、崩溃还是被
+    /// 强杀，系统都会连同作业里的内核一起终止（JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE）。
+    // 存原始句柄值而不是 HANDLE：HANDLE 内含裸指针，不满足 Send，
+    // 会让整个 AppState 无法跨线程共享。
+    #[cfg(windows)]
+    job: Option<isize>,
 }
 
 impl Default for CoreProcess {
     fn default() -> Self {
-        Self { child: None }
+        Self {
+            child: None,
+            #[cfg(windows)]
+            job: None,
+        }
+    }
+}
+
+/// 清理上次异常退出残留的内核进程。
+///
+/// 内核以 TUN + auto-route 运行：只要进程还活着，它就接管本机路由表和 DNS。
+/// 一旦管理进程崩溃或被强杀（release 配置是 panic = "abort"，没有任何清理机会），
+/// 内核会变成孤儿继续占用 TUN 设备；再启动一次就会多一个实例，几个实例互相踩
+/// 路由表，表现就是「关掉界面后整台机器上不了网，只能手动杀进程重启」。
+/// 这里按可执行文件路径精确匹配我们自己的内核，避免误伤用户另外跑的 mihomo。
+pub fn kill_orphan_cores(exclude_pid: Option<u32>) {
+    let target = core_binary();
+    let mut system = sysinfo::System::new_all();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All);
+    let self_pid = sysinfo::Pid::from_u32(std::process::id());
+    for (pid, process) in system.processes() {
+        let Some(path) = process.exe() else {
+            continue;
+        };
+        if path != target {
+            continue;
+        }
+        if *pid == self_pid || process.parent() == Some(self_pid) {
+            continue;
+        }
+        if let Some(keep) = exclude_pid {
+            if pid.as_u32() == keep {
+                continue;
+            }
+        }
+        process.kill();
+        eprintln!("清理残留内核进程：{pid}");
     }
 }
 
@@ -47,6 +89,8 @@ impl CoreProcess {
             return Ok(());
         }
         self.write_config(config)?;
+        // 先把上一次异常退出留下的内核清掉：多个内核实例会同时抢 TUN 设备与路由表。
+        kill_orphan_cores(None);
         // 启动前先裁剪一次：此时还没有句柄持有日志文件，重写最安全。
         trim_core_log();
         let binary = core_binary();
@@ -78,9 +122,21 @@ impl CoreProcess {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.creation_flags(CREATE_NO_WINDOW);
         }
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|err| format!("启动内核失败：{err}"))?;
+        #[cfg(windows)]
+        {
+            // 挂进「进程随父进程一起终止」的作业对象，避免父进程崩溃/被杀后内核变孤儿。
+            if let Some(job) = create_kill_on_close_job() {
+                if !assign_to_job(job, &child) {
+                    eprintln!("内核未能加入作业对象，退出时可能需要手动清理");
+                }
+                self.job = Some(job);
+            } else {
+                eprintln!("创建作业对象失败，内核将不随程序退出");
+            }
+        }
         self.child = Some(child);
         Ok(())
     }
@@ -90,8 +146,55 @@ impl CoreProcess {
             let _ = child.kill();
             let _ = child.wait();
         }
+        #[cfg(windows)]
+        if let Some(job) = self.job.take() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(
+                    windows::Win32::Foundation::HANDLE(job as *mut std::ffi::c_void),
+                );
+            }
+        }
         Ok(())
     }
+}
+
+/// 创建一个「句柄全部关闭即终止组内进程」的作业对象。
+#[cfg(windows)]
+fn create_kill_on_close_job() -> Option<isize> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    unsafe {
+        let job = CreateJobObjectW(None, None).ok()?;
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .is_ok();
+        if !ok {
+            let _ = windows::Win32::Foundation::CloseHandle(job);
+            return None;
+        }
+        Some(job.0 as isize)
+    }
+}
+
+#[cfg(windows)]
+fn assign_to_job(job: isize, child: &Child) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+
+    let job = HANDLE(job as *mut std::ffi::c_void);
+    let process = HANDLE(child.as_raw_handle());
+    unsafe { AssignProcessToJobObject(job, process).is_ok() }
 }
 
 pub struct AppState {

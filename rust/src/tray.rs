@@ -2,6 +2,12 @@
 //!
 //! The icon owns a message-only window on a dedicated thread so its clicks never
 //! block the WebGUI event loop.
+//!
+//! 交互约定：
+//! - 左键单击（或双击）→ 打开主窗口；
+//! - 右键 → 弹出菜单（打开界面 / 启停内核 / 退出）；
+//! - 程序退出前必须调用 [`request_close`]，让托盘线程走 `NIM_DELETE`，
+//!   否则托盘会留下一个点了没反应的「死图标」。
 
 #[cfg(windows)]
 pub use windows_impl::*;
@@ -19,7 +25,9 @@ pub enum TrayCommand {
 #[cfg(windows)]
 mod windows_impl {
     use super::TrayCommand;
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
     use std::sync::mpsc::Sender;
+    use std::time::Duration;
 
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -27,11 +35,12 @@ mod windows_impl {
         Shell_NotifyIconW, NOTIFYICONDATAW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-        DispatchMessageW, GetCursorPos, GetMessageW, LoadImageW, PostQuitMessage, RegisterClassW,
-        SetForegroundWindow, TrackPopupMenu, TranslateMessage, HICON, IMAGE_ICON, LR_DEFAULTSIZE,
-        LR_LOADFROMFILE, MSG, TRACK_POPUP_MENU_FLAGS, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP,
-        WNDCLASSW,
+        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+        DispatchMessageW, GetCursorPos, GetMessageW, LoadImageW, PostMessageW, PostQuitMessage,
+        RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu,
+        TranslateMessage, HICON, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MSG,
+        TRACK_POPUP_MENU_FLAGS, WM_CLOSE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+        WM_RBUTTONUP, WNDCLASSW,
     };
 
     const TRAY_MESSAGE: u32 = 0x0400 + 1; // WM_USER + 1
@@ -40,6 +49,15 @@ mod windows_impl {
     const MENU_QUIT: usize = 1003;
     const TPM_RIGHTBUTTON: u32 = 0x0002;
     const TPM_RETURNCMD: u32 = 0x0100;
+
+    /// 托盘消息窗口句柄，供退出时投递 WM_CLOSE。
+    static TRAY_WINDOW: AtomicUsize = AtomicUsize::new(0);
+    /// 托盘线程是否已经完成 NIM_DELETE（优雅退出等待用）。
+    static TRAY_REMOVED: AtomicBool = AtomicBool::new(false);
+    /// NOTIFYICONDATA 常驻副本，explorer 重启（TaskbarCreated）后重新挂图标用。
+    static TRAY_DATA: AtomicPtr<NOTIFYICONDATAW> = AtomicPtr::new(std::ptr::null_mut());
+    /// RegisterWindowMessageW("TaskbarCreated") 的消息号。
+    static TASKBAR_CREATED: AtomicUsize = AtomicUsize::new(0);
 
     pub fn spawn(icon_path: &str, sender: Sender<TrayCommand>) -> Result<(), String> {
         let icon_path = icon_path.to_string();
@@ -52,6 +70,30 @@ mod windows_impl {
             })
             .map_err(|err| format!("创建托盘线程失败：{err}"))?;
         Ok(())
+    }
+
+    /// 请求托盘线程清理图标并退出，最多等待 ~600ms。
+    ///
+    /// 进程退出时若直接杀掉线程，Shell_NotifyIconW(NIM_DELETE) 没机会执行，
+    /// 托盘区就会残留一个点了没反应的死图标，只能等鼠标划过才被系统回收。
+    pub fn request_close() {
+        let hwnd = TRAY_WINDOW.load(Ordering::SeqCst);
+        if hwnd != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut _)),
+                    WM_CLOSE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+            for _ in 0..60 {
+                if TRAY_REMOVED.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     fn run(icon_path: &str, sender: &Sender<TrayCommand>) -> Result<(), String> {
@@ -83,6 +125,17 @@ mod windows_impl {
                 None,
             )
             .map_err(|err| format!("创建托盘窗口失败：{err}"))?;
+            TRAY_WINDOW.store(window.0 as usize, Ordering::SeqCst);
+
+            // explorer 重启后托盘会被整体清空，系统会广播 TaskbarCreated，
+            // 收到后用保存的 NOTIFYICONDATA 重新挂一次即可。
+            let taskbar_name = wide("TaskbarCreated");
+            let taskbar = RegisterWindowMessageW(windows::core::PCWSTR::from_raw(
+                taskbar_name.as_ptr(),
+            ));
+            if taskbar != 0 {
+                TASKBAR_CREATED.store(taskbar as usize, Ordering::SeqCst);
+            }
 
             let icon_path_wide = wide(icon_path);
             let icon = LoadImageW(
@@ -113,15 +166,21 @@ mod windows_impl {
             if !Shell_NotifyIconW(NIM_ADD, &data).as_bool() {
                 return Err("添加托盘图标失败".into());
             }
+            // 常驻副本供 TaskbarCreated 重挂；窗口销毁前一直有效。
+            TRAY_DATA.store(Box::into_raw(Box::new(data)), Ordering::SeqCst);
 
             let mut message: MSG = std::mem::zeroed();
             while GetMessageW(&mut message, None, 0, 0).as_bool() {
                 if message.message == TRAY_MESSAGE {
-                    let event = message.lParam.0 as u32;
-                    if event == WM_LBUTTONDBLCLK {
-                        let _ = sender.send(TrayCommand::Open);
-                    } else if event == WM_RBUTTONUP {
-                        show_menu(window, sender);
+                    handle_tray_event(message.lParam, sender);
+                    continue;
+                }
+                if TASKBAR_CREATED.load(Ordering::SeqCst) != 0
+                    && message.message == TASKBAR_CREATED.load(Ordering::SeqCst) as u32
+                {
+                    let data = TRAY_DATA.load(Ordering::SeqCst);
+                    if !data.is_null() {
+                        let _ = Shell_NotifyIconW(NIM_ADD, &*data);
                     }
                     continue;
                 }
@@ -129,11 +188,37 @@ mod windows_impl {
                 DispatchMessageW(&message);
             }
             let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+            TRAY_REMOVED.store(true, Ordering::SeqCst);
         }
         Ok(())
     }
 
-    unsafe fn show_menu(window: HWND, sender: &Sender<TrayCommand>) {
+    /// 托盘回调：lParam 是鼠标消息。
+    ///
+    /// 左键单击/双击都打开窗口（此前只认双击，单击毫无反应，体验像「摆设」）；
+    /// 右键弹菜单，同时兼容新版 explorer 的 WM_CONTEXTMENU。
+    fn handle_tray_event(lparam: LPARAM, sender: &Sender<TrayCommand>) {
+        let event = lparam.0 as u32;
+        match event {
+            WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
+                let _ = sender.send(TrayCommand::Open);
+            }
+            WM_RBUTTONUP => {
+                unsafe {
+                    show_menu(sender);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    unsafe fn show_menu(sender: &Sender<TrayCommand>) {
+        // 菜单挂在托盘消息窗口上，需要它的句柄来 SetForegroundWindow /
+        // TrackPopupMenu，托盘线程里读一次即可。
+        let window = HWND(TRAY_WINDOW.load(Ordering::SeqCst) as *mut _);
+        if window.is_invalid() {
+            return;
+        }
         let Ok(menu) = CreatePopupMenu() else {
             return;
         };
@@ -194,6 +279,10 @@ mod windows_impl {
         lparam: LPARAM,
     ) -> LRESULT {
         match message {
+            WM_CLOSE => {
+                DestroyWindow(window);
+                LRESULT(0)
+            }
             WM_DESTROY => {
                 PostQuitMessage(0);
                 LRESULT(0)
@@ -215,4 +304,6 @@ mod stub {
     pub fn spawn(_icon_path: &str, _sender: Sender<TrayCommand>) -> Result<(), String> {
         Ok(())
     }
+
+    pub fn request_close() {}
 }

@@ -184,6 +184,8 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => {
                     if quitting || !close_to_tray {
+                        // 真正退出：先让托盘线程摘掉图标，避免留下点了没反应的死图标。
+                        crate::tray::request_close();
                         *control = ControlFlow::Exit;
                     } else {
                         window.set_visible(false);
@@ -191,7 +193,10 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
                         window_hidden = true;
                     }
                 }
-                WindowEvent::Destroyed => *control = ControlFlow::Exit,
+                WindowEvent::Destroyed => {
+                    crate::tray::request_close();
+                    *control = ControlFlow::Exit;
+                }
                 _ => {}
             },
             Event::UserEvent(action) => match action {
@@ -210,6 +215,7 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
                 }
                 AppEvent::Quit => {
                     quitting = true;
+                    crate::tray::request_close();
                     *control = ControlFlow::Exit;
                 }
                 AppEvent::ToggleCore => {
@@ -244,6 +250,7 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
                     }
                     TrayCommand::Quit => {
                         quitting = true;
+                        crate::tray::request_close();
                         *control = ControlFlow::Exit;
                     }
                 }
