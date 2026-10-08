@@ -1,6 +1,6 @@
 [package]
 name = "network-manager-rs"
-version = "0.6.7"
+version = "0.6.8"
 edition = "2021"
 description = "Rust rewrite of the Network Manager control backend"
 build = "build.rs"
@@ -47,6 +47,7 @@ windows = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_System_JobObjects",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
