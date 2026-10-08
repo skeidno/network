@@ -389,9 +389,12 @@ body.page-scrolled .topbar { box-shadow: var(--shadow-1); }
 .exit-list { display: flex; flex-direction: column; gap: 8px; }
 .exit-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .exit-row small { color: var(--text-3); font-size: 11px; }
+.exit-value { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
 .exit-row strong { font-size: 15px; letter-spacing: .02em; }
 .exit-row strong.pending { color: var(--text-3); font-weight: 500; }
 .exit-row strong.failed { color: var(--danger-text); font-weight: 500; }
+.exit-row em { font-style: normal; font-size: 11px; color: var(--text-3); }
+.exit-row em:empty { display: none; }
 
 /* ==========================================================================
    Buttons
