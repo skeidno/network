@@ -1,0 +1,214 @@
+// 桌面应用不应该弹出黑色控制台窗口（Python 版靠 PyInstaller 的 --windowed
+// 做到这一点）。GUI 子系统下 stdout 无处可去，所以 headless 调试模式会显式
+// 挂回父进程的控制台，详见 attach_console()。
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod core;
+mod credentials;
+mod deploy;
+mod gui;
+mod importers;
+mod methods;
+mod mihomo;
+mod models;
+mod paths;
+mod platform;
+mod portable;
+mod server;
+mod sshclient;
+mod ssh;
+mod startup;
+mod state;
+mod store;
+mod tray;
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+use crate::core::AppState;
+use crate::server::{display_url, serve, Shared};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Clone)]
+struct Options {
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    start_core: bool,
+    open_browser: bool,
+    headless: bool,
+    start_hidden: bool,
+}
+
+impl Options {
+    fn parse() -> Self {
+        let mut options = Options {
+            host: std::env::var("NETWORK_MANAGER_WEB_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+            port: std::env::var("NETWORK_MANAGER_WEB_PORT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(9091),
+            username: std::env::var("NETWORK_MANAGER_WEB_USERNAME")
+                .unwrap_or_else(|_| "admin".into()),
+            password: std::env::var("NETWORK_MANAGER_WEB_PASSWORD").unwrap_or_default(),
+            start_core: false,
+            open_browser: true,
+            headless: false,
+            start_hidden: false,
+        };
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--listen" => options.host = args.next().unwrap_or_default(),
+                "--port" => {
+                    options.port = args
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(options.port)
+                }
+                "--username" => options.username = args.next().unwrap_or_default(),
+                "--password" => options.password = args.next().unwrap_or_default(),
+                "--start-core" => options.start_core = true,
+                "--no-browser" => options.open_browser = false,
+                "--headless" => options.headless = true,
+                "--startup" => options.start_hidden = true,
+                "--help" | "-h" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                _ => {}
+            }
+        }
+        if options.host.is_empty() {
+            options.host = "127.0.0.1".into();
+        }
+        if options.username.is_empty() {
+            options.username = "admin".into();
+        }
+        options
+    }
+}
+
+fn print_help() {
+    println!(
+        "Network Manager {VERSION} (Rust WebGUI)\n\
+         \n\
+         用法：\n\
+         \x20 --listen <host>     监听地址（默认 127.0.0.1，环境变量 NETWORK_MANAGER_WEB_HOST）\n\
+         \x20 --port <port>       监听端口（默认 9091，环境变量 NETWORK_MANAGER_WEB_PORT）\n\
+         \x20 --username <name>   Basic 认证用户名（默认 admin）\n\
+         \x20 --password <secret> Basic 认证密码（环境变量 NETWORK_MANAGER_WEB_PASSWORD）\n\
+         \x20 --start-core        启动 WebGUI 时自动拉起内核\n\
+         \x20 --headless          仅运行 HTTP 服务，不创建原生窗口\n\
+         \x20 --startup           随系统启动：隐藏窗口，仅驻留托盘\n"
+    );
+}
+
+fn is_loopback(host: &str) -> bool {
+    matches!(host.to_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1")
+}
+
+fn open_in_browser(url: &str) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+/// GUI 子系统启动时没有控制台，`println!` 会被丢弃。
+/// 显式以 `--headless` 运行时挂回父进程控制台，方便排查问题。
+#[cfg(windows)]
+fn attach_console() {
+    use windows::Win32::System::Console::{AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS};
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+            let _ = AllocConsole();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_console() {}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let options = Options::parse();
+    if options.headless {
+        attach_console();
+    }
+    if !is_loopback(&options.host) && options.password.is_empty() {
+        return Err("远程监听必须设置 WebGUI 管理密码（--password）".into());
+    }
+
+    let mut app = AppState::new();
+    app.access_username = options.username.clone();
+    app.access_password = options.password.clone();
+    app.session_token = crate::server::random_session_token();
+    app.headless = options.headless;
+
+    let should_start = options.start_core || app.config.start_on_launch;
+    if should_start && !app.core.is_running() {
+        match app.core.start(&app.config.clone()) {
+            Ok(()) => println!("内核已启动"),
+            Err(err) => eprintln!("内核启动失败：{err}"),
+        }
+    }
+    let close_to_tray = app.config.close_to_tray;
+
+    let shared: Shared = Arc::new(Mutex::new(app));
+    let bound = serve(shared.clone(), &options.host, options.port).await?;
+    let url = display_url(&options.host, bound.port());
+    println!("Network Manager {VERSION} WebGUI: {url}");
+
+    if options.headless {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = signal(SignalKind::terminate())?;
+            let mut int = signal(SignalKind::interrupt())?;
+            tokio::select! {
+                _ = term.recv() => {},
+                _ = int.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await?;
+        }
+        let mut state = shared.lock().await;
+        let _ = state.core.stop();
+        return Ok(());
+    }
+
+    let shell = crate::gui::Shell {
+        url: url.clone(),
+        title: format!("Network Manager {VERSION}"),
+        width: 1280.0,
+        height: 860.0,
+        close_to_tray,
+        start_hidden: options.start_hidden,
+    };
+    if let Err(err) = crate::gui::run(shell, shared.clone()) {
+        eprintln!("界面启动失败：{err}");
+        if options.open_browser {
+            open_in_browser(&url);
+        }
+        tokio::signal::ctrl_c().await?;
+    }
+
+    let mut state = shared.lock().await;
+    let _ = state.core.stop();
+    Ok(())
+}
