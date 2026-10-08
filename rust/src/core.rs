@@ -59,6 +59,15 @@ pub fn kill_orphan_cores(exclude_pid: Option<u32>) {
         if *pid == self_pid || process.parent() == Some(self_pid) {
             continue;
         }
+        // 只清理真正的孤儿：父进程已经不存在的内核。父进程还活着说明它属于
+        // 另一个正在运行的实例，杀了会把人家的代理直接打掉。
+        let parent_alive = process
+            .parent()
+            .map(|parent| system.process(parent).is_some())
+            .unwrap_or(false);
+        if parent_alive {
+            continue;
+        }
         if let Some(keep) = exclude_pid {
             if pid.as_u32() == keep {
                 continue;

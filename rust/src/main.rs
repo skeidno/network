@@ -106,6 +106,22 @@ fn print_help() {
     );
 }
 
+/// 端口上已经有服务在响应，说明另一个实例正在运行。
+async fn existing_instance_running(options: &Options) -> bool {
+    let Ok(client) = reqwest::Client::builder().no_proxy().build() else {
+        return false;
+    };
+    let Ok(response) = client
+        .get(format!("http://{}:{}/", options.host, options.port))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    // 200/401/403 都说明有服务在监听；连接被拒才是没有。
+    response.status().as_u16() != 404
+}
+
 /// 唤醒已经在运行的实例：先让它自己走一遍显示逻辑（会按需重建 WebView），
 /// 失败再退回到直接显示它的窗口。
 async fn wake_existing_instance(options: &Options) -> bool {
@@ -245,6 +261,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.access_password = options.password.clone();
     app.session_token = crate::server::random_session_token();
     app.headless = options.headless;
+
+    // 先确认没有别的实例在跑：否则这一趟也会去启动/清理内核，
+    // 把已经在跑的那个实例的内核打掉（表现为代理突然失效）。
+    if existing_instance_running(&options).await {
+        wake_existing_instance(&options).await;
+        return Ok(());
+    }
 
     let should_start = options.start_core || app.config.start_on_launch;
     if should_start && !app.core.is_running() {
