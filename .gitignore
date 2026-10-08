@@ -40,3 +40,9 @@ apps/android/app/libs/*.aar
 apps/android/captures/
 apps/android/signing.properties
 apps/android/*.keystore
+
+# Rust 实现：构建缓存体积巨大（约 3.6 GB），只提交源码
+rust/target/
+
+# 本地工作记录，不随仓库分发
+.workbuddy/
