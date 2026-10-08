@@ -1468,11 +1468,12 @@ class WebBridge(QObject):
             lambda completed: self._finish_server_deploy_future(
                 profile.profile_id,
                 completed,
-                # A typed credential is an override: once it authenticates the stored
-                # one is stale, so persist it instead of silently reusing it next time.
+                # 手动输入的密码是一次覆盖：一旦认证成功，说明已保存的那个已经失效，
+                # 因此写回新密码，避免下次继续静默复用旧凭据。
                 password if (remember_credential or override) else "",
                 repair_from_port,
                 force_redeploy,
+                not override,
             )
         )
 
@@ -1679,6 +1680,7 @@ class WebBridge(QObject):
         credential: str = "",
         repair_from_port: int = 0,
         rotated: bool = False,
+        used_stored_credential: bool = False,
     ) -> None:
         if self._bridge_closed:
             return
@@ -1714,6 +1716,11 @@ class WebBridge(QObject):
             message = str(exc) or "服务器代理部署失败"
             if repair_from_port:
                 message = f"旧端口 {repair_from_port} 自动调整失败：{message}"
+            elif used_stored_credential and "认证失败" in message:
+                message = (
+                    f"{message}；本次使用的是已保存的旧密码，若服务器密码已变更，"
+                    "请在弹窗中输入新密码并勾选覆盖"
+                )
             result_json = ""
         self.server_deploy_completed.emit(
             profile_id,
@@ -1801,14 +1808,21 @@ class WebBridge(QObject):
         )
         profile.proxy_reachability_error = str(payload.get("publicError", ""))
         if credential:
-            replaced = profile.remember_password
             try:
-                self.window.credential_store.set(profile_id, credential)
+                existing_credential = self.window.credential_store.get(profile_id)
+            except CredentialStoreError:
+                existing_credential = ""
+            if credential != existing_credential:
+                replaced = profile.remember_password
+                try:
+                    self.window.credential_store.set(profile_id, credential)
+                    profile.remember_password = True
+                    getattr(self, "_credential_presence_cache", {}).pop(profile_id, None)
+                    message += "，SSH 凭据已覆盖更新" if replaced else "，SSH 凭据已安全保存"
+                except CredentialStoreError as exc:
+                    message += f"；凭据保存失败：{exc}"
+            elif not profile.remember_password:
                 profile.remember_password = True
-                getattr(self, "_credential_presence_cache", {}).pop(profile_id, None)
-                message += "，SSH 凭据已覆盖更新" if replaced else "，SSH 凭据已安全保存"
-            except CredentialStoreError as exc:
-                message += f"；凭据保存失败：{exc}"
         apply_automatic_node_dialers(self.window.config.imported_nodes)
         self.window.store.save(self.window.config)
         if self.window.core.is_running and not self.window._save_and_apply(

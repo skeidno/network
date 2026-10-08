@@ -34,6 +34,30 @@ class ServerDeploymentError(RuntimeError):
     pass
 
 
+_CONNECTION_DROP_MARKERS = (
+    "连接失败",
+    "连接中断",
+    "连接已断开",
+    "connection dropped",
+    "connection reset",
+    "connection refused",
+    "connection timed out",
+    "connection is closed",
+    "socket exception",
+    "socket is closed",
+    "broken pipe",
+    "eof",
+    "10054",
+    "远程主机强迫关闭",
+    "ssh session",
+)
+
+
+def looks_like_connection_drop(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _CONNECTION_DROP_MARKERS)
+
+
 @dataclass(frozen=True, slots=True)
 class DeploymentResult:
     node_config: dict[str, object]
@@ -88,8 +112,27 @@ class ServerProxyDeployer:
         if port_error:
             raise ServerDeploymentError(port_error)
         report = progress or (lambda _stage: None)
+        last_exc: ServerDeploymentError | None = None
+        for attempt in range(2):
+            try:
+                return self._deploy_once(profile, credential, report)
+            except ServerDeploymentError as exc:
+                last_exc = exc
+                if attempt == 0 and looks_like_connection_drop(str(exc)):
+                    report("SSH 连接被中断，正在重新连接并重试部署")
+                    time.sleep(1.5)
+                    continue
+                raise
+        raise last_exc  # pragma: no cover - 循环内必然 return 或 raise
+
+    def _deploy_once(
+        self,
+        profile: SshServerProfile,
+        credential: str,
+        report: Callable[[str], None],
+    ) -> DeploymentResult:
         report("正在连接 SSH")
-        client = self._connect(profile, credential)
+        client = self._connect(profile, credential, progress=report)
         temporary_paths: list[str] = []
         try:
             report("正在检查服务器环境")
@@ -157,7 +200,22 @@ class ServerProxyDeployer:
             client.close()
 
     def inspect(self, profile: SshServerProfile, credential: str = "") -> dict[str, object]:
-        client = self._connect(profile, credential)
+        last_exc: ServerDeploymentError | None = None
+        for attempt in range(2):
+            try:
+                return self._inspect_once(profile, credential)
+            except ServerDeploymentError as exc:
+                last_exc = exc
+                if attempt == 0 and looks_like_connection_drop(str(exc)):
+                    time.sleep(1.5)
+                    continue
+                raise
+        raise last_exc  # pragma: no cover - 循环内必然 return 或 raise
+
+    def _inspect_once(
+        self, profile: SshServerProfile, credential: str
+    ) -> dict[str, object]:
+        client = self._connect(profile, credential, progress=lambda _s: None)
         try:
             status = self._run(
                 client,
@@ -210,7 +268,13 @@ class ServerProxyDeployer:
                 return build_shadowsocks_node(profile, password)
         return None
 
-    def _connect(self, profile: SshServerProfile, credential: str) -> paramiko.SSHClient:
+    def _connect(
+        self,
+        profile: SshServerProfile,
+        credential: str,
+        progress: Callable[[str], None] | None = None,
+    ) -> paramiko.SSHClient:
+        report = progress or (lambda _stage: None)
         options: dict[str, object] = {
             "hostname": profile.host,
             "port": profile.port,
@@ -232,10 +296,11 @@ class ServerProxyDeployer:
             )
         else:
             options.update(allow_agent=True, look_for_keys=True)
+        host_key_reset = False
         last_error: Exception | None = None
         for attempt in range(3):
             client = paramiko.SSHClient()
-            client.load_system_host_keys()
+            # 只信任应用自管的 known_hosts，避免系统 ~/.ssh/known_hosts 中的旧记录干扰
             if self.known_hosts_path.is_file():
                 client.load_host_keys(str(self.known_hosts_path))
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -257,13 +322,31 @@ class ServerProxyDeployer:
                 raise ServerDeploymentError("SSH 认证失败，请检查用户名、密码或私钥") from exc
             except paramiko.BadHostKeyException as exc:
                 client.close()
-                raise ServerDeploymentError("SSH 主机密钥与已保存记录不一致") from exc
+                if not host_key_reset:
+                    host_key_reset = True
+                    report("检测到服务器主机密钥已更新，正在刷新本地记录并重连")
+                    self._purge_host_key(profile.host)
+                    continue
+                raise ServerDeploymentError(
+                    "SSH 主机密钥与已保存记录不一致，请确认服务器未被重装或中间人劫持"
+                ) from exc
             except (EOFError, OSError, paramiko.SSHException) as exc:
                 client.close()
                 last_error = exc
                 if attempt < 2:
                     time.sleep(0.8 * (attempt + 1))
         raise ServerDeploymentError(f"SSH 连接失败：{last_error}") from last_error
+
+    def _purge_host_key(self, hostname: str) -> None:
+        """清除本地 known_hosts 中该主机的旧密钥记录（尽力而为）。"""
+        if not self.known_hosts_path.is_file():
+            return
+        try:
+            host_keys = paramiko.HostKeys(str(self.known_hosts_path))
+            host_keys.pop(hostname, None)
+            host_keys.save(str(self.known_hosts_path))
+        except Exception:  # noqa: BLE001 - 清理旧密钥失败不应阻塞连接重试
+            pass
 
     def _preflight(self, client: paramiko.SSHClient) -> tuple[str, str, str]:
         output = self._run(
@@ -384,14 +467,43 @@ fi
 """
         return self._run(client, command).strip() or "unmanaged"
 
-    @staticmethod
-    def _upload(client: paramiko.SSHClient, path: str, content: str, mode: int) -> None:
+    def _upload(self, client: paramiko.SSHClient, path: str, content: str, mode: int) -> None:
+        payload = content.encode("utf-8")
         try:
             with client.open_sftp() as sftp:
-                sftp.putfo(BytesIO(content.encode("utf-8")), path)
+                sftp.putfo(BytesIO(payload), path)
                 sftp.chmod(path, mode)
-        except (OSError, paramiko.SSHException) as exc:
-            raise ServerDeploymentError(f"上传远端配置失败：{exc}") from exc
+            return
+        except (EOFError, OSError, paramiko.SSHException) as exc:
+            sftp_error = exc
+            transport = client.get_transport()
+            if transport is None or not transport.is_active():
+                raise ServerDeploymentError(f"上传远端配置失败：{exc}") from exc
+        # SFTP 会话中断但 SSH 连接仍在（跨境链路常见 RST）：降级为 shell 通道直写。
+        try:
+            self._upload_via_shell(client, path, payload, mode)
+        except ServerDeploymentError as exc:
+            raise ServerDeploymentError(f"上传远端配置失败：{sftp_error}；{exc}") from exc
+
+    @staticmethod
+    def _upload_via_shell(
+        client: paramiko.SSHClient, path: str, payload: bytes, mode: int
+    ) -> None:
+        try:
+            stdin, stdout, stderr = client.exec_command(
+                f"cat > {shlex.quote(path)} && chmod {mode:o} {shlex.quote(path)}",
+                timeout=30,
+            )
+            stdin.write(payload)
+            stdin.channel.shutdown_write()
+            status = stdout.channel.recv_exit_status()
+            error = stderr.read().decode("utf-8", "replace").strip()
+        except (EOFError, OSError, paramiko.SSHException) as exc:
+            raise ServerDeploymentError(f"备用通道上传失败：{exc}") from exc
+        if status != 0:
+            detail = (error or f"退出码 {status}").strip().splitlines()
+            message = detail[-1] if detail else f"退出码 {status}"
+            raise ServerDeploymentError(f"备用通道上传失败：{message[:300]}")
 
     @staticmethod
     def _run(client: paramiko.SSHClient, command: str, timeout: int = 30) -> str:
