@@ -1,7 +1,10 @@
 //! Native desktop shell: a tao window hosting a wry WebView pointed at the
 //! embedded WebGUI, plus the Win32 tray icon.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(windows)]
+use tao::platform::windows::WindowExtWindows;
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
@@ -102,6 +105,8 @@ fn show_window(
     window.set_minimized(false);
     window.set_visible(true);
     window.set_focus();
+    #[cfg(windows)]
+    ensure_on_screen(window);
     if *hidden {
         // 只有重建成功才清掉标记：失败时保留 hidden，下一次再试，避免窗口
         // 永远停在「看得见但点不动」的状态。
@@ -111,6 +116,52 @@ fn show_window(
         }
     }
     set_window_visible(true);
+}
+
+/// 窗口跑到屏幕外时把它拉回主屏中心。
+///
+/// 典型场景：上次退出时接的是外接显示器，这次只剩笔记本屏，窗口坐标还留在
+/// 已经不存在的那块屏上，唤回来后窗口「存在但看不见」，用户以为点了没反应。
+#[cfg(windows)]
+fn ensure_on_screen(window: &tao::window::Window) {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, GetWindowRect, SetWindowPos, SM_CXSCREEN, SM_CYSCREEN, SWP_NOZORDER,
+    };
+
+    let hwnd = window.hwnd();
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let handle = windows::Win32::Foundation::HWND(hwnd as *mut _);
+        let mut rect = RECT::default();
+        if GetWindowRect(handle, &mut rect).is_err() {
+            return;
+        }
+        let screen_w = GetSystemMetrics(SM_CXSCREEN);
+        let screen_h = GetSystemMetrics(SM_CYSCREEN);
+        let off = rect.right <= 0
+            || rect.bottom <= 0
+            || rect.left >= screen_w
+            || rect.top >= screen_h;
+        if !off {
+            return;
+        }
+        let width = (rect.right - rect.left).max(960).min(screen_w);
+        let height = (rect.bottom - rect.top).max(640).min(screen_h);
+        let left = ((screen_w - width) / 2).max(0);
+        let top = ((screen_h - height) / 2).max(0);
+        let _ = SetWindowPos(
+            handle,
+            None,
+            left,
+            top,
+            width,
+            height,
+            SWP_NOZORDER,
+        );
+    }
 }
 
 fn set_window_visible(visible: bool) {
@@ -164,6 +215,8 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
     set_window_visible(!shell.start_hidden);
 
     let url = shell.url.clone();
+    #[cfg(windows)]
+    crate::tray::set_main_window(window.hwnd());
     let mut webview = Some(build_webview(&window, &url)?);
 
     if let Some(path) = icon_path.as_deref() {
@@ -176,6 +229,12 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
     let runtime = tokio::runtime::Handle::current();
     let mut quitting = false;
     let mut window_hidden = shell.start_hidden;
+    // 托盘「强制退出」的标记：闭包是 move 进去的，外层要靠它知道该不该硬退出。
+    let force_quit = Arc::new(AtomicBool::new(false));
+    // 事件循环闭包会把捕获的变量整个 move 走，这里先备一份给循环外的收尾用。
+    let force_quit_flag = Arc::clone(&force_quit);
+    let loop_shared = Arc::clone(&shared);
+    let loop_runtime = runtime.clone();
     // 运行期每 2 分钟检查一次日志体积，超过上限就只保留最新的部分。
     // 这是事件循环唯一的定时唤醒源：托盘命令改走 EventLoopProxy 即时唤醒，
     // 不再需要每 200ms 轮询一次（既耗电，又会被 tao 的定时器反复唤醒）。
@@ -229,10 +288,16 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
                         TrayCommand::Open => {
                             show_window(&window, &mut webview, &url, &mut window_hidden)
                         }
-                        TrayCommand::ToggleCore => toggle_core(&runtime, &shared),
+                        TrayCommand::ToggleCore => toggle_core(&loop_runtime, &loop_shared),
                         TrayCommand::Quit => {
                             quitting = true;
                             request_exit(control);
+                        }
+                        // 只是打个标记：真正的收尾在事件循环外面做，
+                        // 在事件处理函数里停内核 / 摘图标会阻塞消息泵，造成处理器重入。
+                        TrayCommand::ForceQuit => {
+                            force_quit_flag.store(true, Ordering::SeqCst);
+                            *control = ControlFlow::Exit;
                         }
                     },
                 },
@@ -250,6 +315,21 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
     crate::tray::request_close();
     if result.is_err() {
         return Err(LOOP_CRASHED.into());
+    }
+
+    // 强制退出：界面可能已经卡住，不再指望事件循环能正常收尾，直接结束进程。
+    // 内核即使这里没停掉，也会被作业对象（KILL_ON_JOB_CLOSE）连带终止。
+    if force_quit.load(Ordering::SeqCst) {
+        let state = Arc::clone(&shared);
+        let handle = runtime.clone();
+        let _ = std::thread::spawn(move || {
+            handle.block_on(async move {
+                let mut guard = state.lock().await;
+                let _ = guard.core.stop();
+            });
+            std::process::exit(0);
+        })
+        .join();
     }
     Ok(())
 }
