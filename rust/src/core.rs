@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 use crate::mihomo::render_yaml;
@@ -45,6 +47,8 @@ impl CoreProcess {
             return Ok(());
         }
         self.write_config(config)?;
+        // 启动前先裁剪一次：此时还没有句柄持有日志文件，重写最安全。
+        trim_core_log();
         let binary = core_binary();
         if !binary.exists() {
             return Err(format!(
@@ -141,6 +145,75 @@ impl AppState {
         }
         Ok(())
     }
+}
+
+/// 本地内核日志的体积上限（3 MB）。超过后只保留最新的一段，旧内容直接丢弃，
+/// 避免长期运行把日志堆到几十上百 MB。
+pub const MAX_LOG_BYTES: u64 = 3 * 1024 * 1024;
+/// 触发裁剪后保留的字节数，留出余量，避免频繁重写文件。
+const LOG_KEEP_BYTES: u64 = MAX_LOG_BYTES - 384 * 1024;
+
+/// 只读取日志尾部（最多 max_bytes 字节），并按行对齐后返回最后 max_lines 行。
+///
+/// 解码一律走「UTF-8 宽松」：内核日志里常出现中文节点名（海外服务器 等），
+/// 只要文件中出现一个被截断的字节，严格的 read_to_string 就会整段失败并返回空，
+/// 界面上表现为空白或乱码。宽松解码只会把个别坏字节替换成占位符，不会整段丢失。
+pub fn read_log_tail(path: &Path, max_bytes: u64, max_lines: usize) -> String {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return String::new(),
+    };
+    let size = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let start = size.saturating_sub(max_bytes);
+    let mut buffer = Vec::new();
+    if file
+        .seek(SeekFrom::Start(start))
+        .and_then(|_| file.read_to_end(&mut buffer))
+        .is_err()
+    {
+        return String::new();
+    }
+    // 从文件中间开始读时，第一行通常是被截断的半行，直接丢掉。
+    let skip = if start > 0 {
+        match buffer.iter().position(|byte| *byte == b'\n') {
+            Some(index) => index + 1,
+            None => 0,
+        }
+    } else {
+        0
+    };
+    let text = String::from_utf8_lossy(&buffer[skip..]).replace('\r', "");
+    let lines: Vec<&str> = text.lines().collect();
+    let from = lines.len().saturating_sub(max_lines);
+    lines[from..].join("\n")
+}
+
+/// 日志超过上限时，只保留最新的内容，多出来的部分删除。
+pub fn trim_core_log() {
+    let path = core_log_path();
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return;
+    };
+    if meta.len() <= MAX_LOG_BYTES {
+        return;
+    }
+    let keep = read_log_tail(&path, LOG_KEEP_BYTES, usize::MAX);
+    let Ok(mut file) = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    else {
+        return;
+    };
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return;
+    }
+    if file.write_all(keep.as_bytes()).is_err() {
+        return;
+    }
+    let _ = file.set_len(keep.len() as u64);
+    let _ = file.flush();
 }
 
 pub fn memory_mb() -> f64 {

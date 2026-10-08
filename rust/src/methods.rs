@@ -659,19 +659,14 @@ pub async fn dispatch(state: &mut AppState, method: &str, args: Vec<Value>) -> R
     match method {
         "getState" => Ok(crate::state::build(state)),
         "getLogs" => {
+            // 只读尾部 512 KB，再做宽松 UTF-8 解码：既避免每次读取几 MB 文件，
+            // 也保证日志里出现个别坏字节时不会整段变成空白/乱码。
             let path = core_log_path();
-            let raw = std::fs::read_to_string(path).unwrap_or_default();
-            let lines: Vec<&str> = raw.lines().collect();
-            let tail = lines
-                .iter()
-                .rev()
-                .take(300)
-                .cloned()
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>();
-            Ok(Value::String(tail.join("\n")))
+            Ok(Value::String(crate::core::read_log_tail(
+                &path,
+                512 * 1024,
+                300,
+            )))
         }
         "clearLogs" => {
             let _ = std::fs::write(core_log_path(), "");
