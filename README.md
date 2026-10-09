@@ -94,10 +94,12 @@ cd apps/android
 ## 测试
 
 ```powershell
-python -m ruff check src tests scripts
-python -m pytest -q
+cargo test --manifest-path rust/Cargo.toml
 node --check src/network_manager/web/app.js
 ```
+
+`cargo test` 里包含 Linux 发布包的契约测试（`rust/tests/linux_packaging.rs`）：内核版本与校验值、
+install.sh / systemd 单元的关键内容、以及被嵌进二进制的前端资源是否还在。
 
 启动程序后还可以对本地 WebGUI 执行浏览器冒烟测试：
 
@@ -105,7 +107,9 @@ node --check src/network_manager/web/app.js
 python scripts/smoke_webgui.py http://127.0.0.1:<port>/ --poll-seconds 10
 ```
 
-测试覆盖配置迁移、订阅格式、Mihomo 配置、实时流量计算、本地 API 鉴权、Windows 凭据加密和服务器部署配置。Windows 桌面 GUI 的 Python 测试随那套界面一起删除，其行为由 Rust 侧的构建校验代替。
+产品代码已全部是 Rust（Windows 桌面端 + Linux 常驻服务），原先覆盖配置迁移、订阅格式、
+Mihomo 配置、流量统计、API 鉴权、凭据加密、服务器部署的那批 Python 测试随实现一起删除。
+Python 只剩 `scripts/` 下几个构建/校验脚本。
 
 ## 数据与安全
 

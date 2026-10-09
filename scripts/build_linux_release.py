@@ -24,10 +24,16 @@ def sha256(path: Path) -> str:
 
 
 def project_version() -> str:
-    for line in (ROOT / "pyproject.toml").read_text(encoding="utf-8").splitlines():
-        if line.startswith("version = "):
-            return line.split('"', 2)[1]
-    raise RuntimeError("Project version not found")
+    """版本号以 rust/Cargo.toml 为准：Python 包已经删掉，Rust 是唯一的产品代码。"""
+    in_package = False
+    for line in (ROOT / "rust" / "Cargo.toml").read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_package = stripped == "[package]"
+            continue
+        if in_package and stripped.startswith("version = "):
+            return stripped.split('"', 2)[1]
+    raise RuntimeError("Version not found in rust/Cargo.toml")
 
 
 def verified_core(asset: dict[str, str], core_dir: Path, version: str) -> Path:
