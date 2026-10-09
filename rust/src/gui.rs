@@ -164,18 +164,23 @@ fn ensure_on_screen(window: &tao::window::Window) {
     }
 }
 
-/// 「关闭到后台」：把窗口最小化而不是隐藏。
+/// 实时取「关闭后继续在后台运行」的开关状态（返回 false 表示关闭即退出）。
 ///
-/// 之前这里是 `window.set_visible(false)`，窗口会连任务栏按钮一起消失，只能靠托盘
-/// 图标唤回。实测这台机器上是唤不回来的：Windows 11 默认把首次出现的托盘图标收进
-/// 「隐藏的图标」溢出区，`Shell_NotifyIconGetRect` 给回来的坐标永远是通知区最左边
-/// 那个溢出槽（拿另一个进程新注册的图标对比，坐标一模一样），也就是说用户根本看不到
-/// 我们的图标 —— 他点到的往往是旧进程被强杀后留下的死图标，于是「图标在、点了没反应、
-/// 右键也没菜单」。
+/// 这个开关不能只在启动时读一次：用户在设置页勾上「后台运行」，转头点关闭程序却
+/// 照样退出，他会认定设置页是坏的。事件回调里借不到 async 上下文，用 `try_lock`
+/// 取当前值即可；万一此刻正好被线程占着，退回启动时的快照，差一次点击不会错。
+fn background_mode_enabled(shared: &Shared, fallback: bool) -> bool {
+    match shared.try_lock() {
+        Ok(state) => state.config.close_to_tray,
+        Err(_) => fallback,
+    }
+}
+
+/// 退到后台：窗口最小化，代理内核继续跑，托盘图标留着给用户一个入口。
 ///
-/// 最小化之后任务栏按钮一直在，点一下就能回来，不依赖托盘在水面还是溢出区。顺带也绕
-/// 开了 WebView 的坑：隐藏窗口会让 WebView2 销毁承载画面和鼠标输入的渲染窗口并且不
-/// 会自己重建，每次显示都得整块重建 WebView；最小化没有这个问题。
+/// Windows 11 会把首次注册的托盘图标收进「隐藏的图标」溢出区，鼠标点不到
+/// （见 [`crate::tray`] 的排查记录），所以用最小化而不是 `set_visible(false)`：
+/// 任务栏按钮一直在，点一下就回来，不依赖托盘在水面还是溢出区。
 fn minimize_to_tray(window: &tao::window::Window) {
     window.set_minimized(true);
     set_window_visible(true);
@@ -186,7 +191,7 @@ fn minimize_to_tray(window: &tao::window::Window) {
 ///
 /// 「程序自己退了」这类问题最难查的地方是没有控制台，什么痕迹都不留。这里把
 /// 事件循环的关键分支记一笔，出问题时能直接看出是哪条退出路径被走到了。
-fn trace(text: &str) {
+pub fn trace(text: &str) {
     use std::io::Write;
     let path = crate::paths::logs_dir().join("gui.log");
     if let Ok(meta) = std::fs::metadata(&path) {
@@ -218,7 +223,8 @@ fn notify_hidden_once() {
     }
     crate::tray::notify(
         "Network Manager 仍在后台运行",
-        "点击任务栏图标恢复窗口；托盘图标若在「隐藏的图标」里，可按 Ctrl+Alt+N 唤回。",
+        "点任务栏图标即可恢复。Windows 11 会把托盘图标收进「隐藏的图标」溢出区（鼠标点不到），\
+         也可以按 Ctrl+Alt+N 或重新双击快捷方式唤回。",
     );
 }
 
@@ -307,10 +313,13 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
                 }
                 Event::WindowEvent { event, window_id, .. } => match event {
                     WindowEvent::CloseRequested => {
+                        let tray = background_mode_enabled(&loop_shared, close_to_tray);
                         trace(&format!(
-                            "CloseRequested id={window_id:?} quitting={quitting} close_to_tray={close_to_tray}"
+                            "CloseRequested quitting={quitting} 后台运行={tray}"
                         ));
-                        if quitting || !close_to_tray {
+                        // 默认（tray=false）就是正常程序该有的行为：关了就退，
+                        // 任务栏按钮和托盘图标一起消失，不用去任务管理器收尸。
+                        if quitting || !tray {
                             request_exit(control);
                         } else {
                             minimize_to_tray(&window);
@@ -343,11 +352,19 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
                         trace("UserEvent::Show");
                         show_window(&window, &mut webview, &url, &mut window_hidden)
                     }
-                    // 自定义标题栏的关闭按钮和窗口的 X 走同一条路径：
-                    // 最小化而不是隐藏，理由见 minimize_to_tray 的注释。
+                    // 自定义标题栏的关闭按钮和窗口的 X 走同一条路径：默认真的退出，
+                    // 用户显式打开「关闭后继续在后台运行」时才收进后台。
                     AppEvent::Hide | AppEvent::Close => {
-                        trace("UserEvent::Hide/Close -> 最小化");
-                        minimize_to_tray(&window)
+                        // 和标题栏的 X 完全一致：默认真的退出，用户显式开了
+                        // 「后台运行」才收进后台。
+                        let tray = background_mode_enabled(&loop_shared, close_to_tray);
+                        trace(&format!("UserEvent::Hide/Close 后台运行={tray}"));
+                        if !tray {
+                            quitting = true;
+                            request_exit(control);
+                        } else {
+                            minimize_to_tray(&window);
+                        }
                     }
                     AppEvent::Minimize => window.set_minimized(true),
                     AppEvent::Maximize => window.set_maximized(!window.is_maximized()),

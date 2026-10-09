@@ -346,7 +346,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         close_to_tray,
         start_hidden: options.start_hidden,
     };
-    if let Err(err) = crate::gui::run(shell, shared.clone()) {
+    let result = crate::gui::run(shell, shared.clone());
+    crate::gui::trace(&format!("main: gui::run 返回 ok={}", result.is_ok()));
+    if let Err(err) = result {
         eprintln!("界面退出：{err}");
         if err == crate::gui::LOOP_CRASHED {
             // 事件循环崩了：收掉内核再退出，不要挂着一个没有界面的进程。
@@ -362,6 +364,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut state = shared.lock().await;
+    crate::gui::trace("main: 拿到 state 锁，准备停内核");
     let _ = state.core.stop();
+    crate::gui::trace("main: 内核已停，准备返回");
     Ok(())
 }

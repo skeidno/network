@@ -1802,7 +1802,7 @@ function bindEvents() {
       serverProxyPort: Number(byId("setting-server-proxy-port").value),
       strictRoute: byId("setting-strict-route").checked,
       startOnLaunch: byId("setting-start-on-launch").checked,
-      closeToTray: true,
+      closeToTray: byId("setting-close-to-tray").checked,
       startWithWindows: byId("setting-start-with-windows").checked,
     }));
     settingsInitialized = false;
