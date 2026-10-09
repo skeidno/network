@@ -64,6 +64,8 @@ mod windows_impl {
     const TRAY_MESSAGE: u32 = 0x8000 + 1; // WM_APP + 1
     /// 请求托盘线程弹一条气泡提示（界面线程 → 托盘线程）。
     const TRAY_TIP_MESSAGE: u32 = 0x8000 + 2; // WM_APP + 2
+    /// 右键菜单：由窗口过程转投给消息泵，见 procedure 里的说明。
+    const TRAY_MENU_MESSAGE: u32 = 0x8000 + 3; // WM_APP + 3
     const MENU_OPEN: usize = 1001;
     const MENU_TOGGLE: usize = 1002;
     const MENU_QUIT: usize = 1003;
@@ -71,9 +73,17 @@ mod windows_impl {
     const TPM_RIGHTBUTTON: u32 = 0x0002;
     const TPM_RETURNCMD: u32 = 0x0100;
     /// NOTIFYICON_VERSION_4 风格的通知码（explorer 版本/主题不同会走这套）。
-    const NIN_SELECT: u32 = 0x0400;
-    const NIN_KEYSELECT: u32 = 0x0401;
-    const NIN_DOUBLECLK: u32 = 0x0403;
+    /// WM_USER + n：winuser.h 里就这几个，官方并没有 NIN_DOUBLECLK
+    /// （0x0403 实际上是 NIN_BALLOONHIDE，拿它当双击会误判成气泡消失事件）。
+    const NIN_SELECT: u32 = 0x0400;          // WM_USER + 0
+    const NIN_KEYSELECT: u32 = 0x0401;       // WM_USER + 1
+    const NIN_BALLOONSHOW: u32 = 0x0402;     // WM_USER + 2
+    const NIN_BALLOONHIDE: u32 = 0x0403;     // WM_USER + 3
+    const NIN_BALLOONTIMEOUT: u32 = 0x0404;  // WM_USER + 4
+    const NIN_BALLOONUSERCLICK: u32 = 0x0405; // WM_USER + 5
+    /// 溢出面板（「隐藏的图标」）展开：收到它说明图标确实被系统收进了面板。
+    const NIN_POPUP_OPEN: u32 = 0x0406;      // WM_USER + 6
+    const NIN_POPUP_CLOSE: u32 = 0x0407;     // WM_USER + 7
     /// 通知图标的稳定身份（见 TRAY_GUID 的说明）。
     const TRAY_GUID: GUID = GUID {
         data1: 0x2f6a91c4,
@@ -232,7 +242,12 @@ mod windows_impl {
                 WM_CONTEXTMENU => "WM_CONTEXTMENU",
                 NIN_SELECT => "NIN_SELECT",
                 NIN_KEYSELECT => "NIN_KEYSELECT",
-                NIN_DOUBLECLK => "NIN_DOUBLECLK",
+                NIN_BALLOONSHOW => "NIN_BALLOONSHOW",
+                NIN_BALLOONHIDE => "NIN_BALLOONHIDE",
+                NIN_BALLOONTIMEOUT => "NIN_BALLOONTIMEOUT",
+                NIN_BALLOONUSERCLICK => "NIN_BALLOONUSERCLICK",
+                NIN_POPUP_OPEN => "NIN_POPUP_OPEN",
+                NIN_POPUP_CLOSE => "NIN_POPUP_CLOSE",
                 _ => "unknown",
             };
             let _ = writeln!(file, "{now} 0x{event:04x} {name}");
@@ -350,6 +365,12 @@ mod windows_impl {
             data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID;
             data.guidItem = TRAY_GUID;
             let mut added = Shell_NotifyIconW(NIM_ADD, &data).as_bool();
+            log_line(&format!(
+                "注册托盘图标 hWnd={:?} 带GUID={} {}",
+                window.0,
+                true,
+                if added { "成功" } else { "失败" }
+            ));
             if !added {
                 // 极少数机器上同 GUID 的旧条目没被系统清干净，NIM_ADD 会直接失败。
                 // 丢掉 GUID 再试一次：宁可少一个「记住偏好」的好处，也不能连图标都没有。
@@ -366,7 +387,8 @@ mod windows_impl {
             // （表现就是「图标在，点了没反应」）。V4 下左键是 NIN_SELECT、
             // 右键是 WM_CONTEXTMENU，两者上面都已处理。
             data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-            let _ = Shell_NotifyIconW(NIM_SETVERSION, &data);
+            let versioned = Shell_NotifyIconW(NIM_SETVERSION, &data).as_bool();
+            log_line(&format!("切到 NOTIFYICON_VERSION_4：{}", if versioned { "成功" } else { "失败" }));
 
             // 热键注册失败（被别的软件占用）不致命：只是少一条唤回通道。
             for vk in HOTKEY_VKS {
@@ -391,6 +413,12 @@ mod windows_impl {
                 }
                 if message.message == TRAY_TIP_MESSAGE {
                     show_balloon();
+                    continue;
+                }
+                // 右键菜单：由 handle_tray_event 转投过来，出了 explorer 的
+                // SendMessage 调用栈之后再弹，见那里的说明。
+                if message.message == TRAY_MENU_MESSAGE {
+                    show_menu();
                     continue;
                 }
                 if TASKBAR_CREATED.load(Ordering::SeqCst) != 0
@@ -454,7 +482,11 @@ mod windows_impl {
     }
 
     fn handle_tray_event(lparam: LPARAM) {
-        let event = lparam.0 as u32;
+        // 通知码在 lParam 的**低位字**：高位字还带着坐标和标志位。
+        // 实测 explorer 发来的是 0x00010202（WM_LBUTTONUP）、0x00010400（NIN_SELECT）
+        // 这样的值，如果拿完整的 lParam 去比 0x0202，永远匹配不上 —— 表现就是
+        // 「日志里明明有消息，界面却毫无反应」。
+        let event = (lparam.0 & 0xFFFF) as u32;
         log_event(event);
         match event {
             // 两套通知码都认：
@@ -462,16 +494,27 @@ mod windows_impl {
             // - NOTIFYICON_VERSION_4 风格：转发 NIN_SELECT / NIN_KEYSELECT。
             // 不同 Windows 版本、不同 explorer 主题会走不同的一套，只认一套时
             // 表现就是「图标在，点了没反应」。
-            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | NIN_SELECT | NIN_KEYSELECT
-            | NIN_DOUBLECLK => {
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | NIN_SELECT | NIN_KEYSELECT => {
                 // 抢前台必须在托盘线程做，见 bring_main_to_front 的说明。
                 bring_main_to_front();
                 dispatch(TrayCommand::Open);
             }
             // 右键只认抬起和 WM_CONTEXTMENU：都认 WM_RBUTTONDOWN 的话一次点击会弹两次菜单。
+            //
+            // 菜单不在这里直接弹：此刻正处在 explorer 的 SendMessage 调用栈里，
+            // TrackPopupMenu 是模态循环，会把 explorer 的托盘线程一起卡到菜单关掉为止
+            // （表现为托盘整体失去响应）。转投一条消息给消息泵，出了这个栈再弹。
             WM_RBUTTONUP | WM_CONTEXTMENU => {
-                unsafe {
-                    show_menu();
+                let hwnd = TRAY_WINDOW.load(Ordering::SeqCst);
+                if hwnd != 0 {
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(HWND(hwnd as *mut _)),
+                            TRAY_MENU_MESSAGE,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
                 }
             }
             _ => {}
@@ -549,6 +592,28 @@ mod windows_impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        // 托盘通知是 explorer 用 **SendMessage** 直接投递到窗口过程的，不进消息队列，
+        // 因此下面的 GetMessageW 循环根本看不到它。必须在这里接住 —— 漏了这段的表现
+        // 就是「图标在、点了毫无反应、右键也没菜单」，而自己 PostMessage 伪造的消息
+        // 反而能收到（因为那条走了队列），极容易把排查带到完全错误的方向。
+        if message == TRAY_MESSAGE {
+            handle_tray_event(lparam);
+            return LRESULT(0);
+        }
+        if message == TRAY_TIP_MESSAGE {
+            show_balloon();
+            return LRESULT(0);
+        }
+        // explorer 重启后广播 TaskbarCreated 也是 SendMessage，同样只能在这里接。
+        let taskbar = TASKBAR_CREATED.load(Ordering::SeqCst);
+        if taskbar != 0 && message == taskbar as u32 {
+            let data = TRAY_DATA.load(Ordering::SeqCst);
+            if !data.is_null() {
+                let _ = Shell_NotifyIconW(NIM_ADD, &*data);
+                log_line("收到 TaskbarCreated，已重新挂图标");
+            }
+            return LRESULT(0);
+        }
         match message {
             WM_CLOSE => {
                 let _ = DestroyWindow(window);
