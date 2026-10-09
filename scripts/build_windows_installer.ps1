@@ -2,7 +2,10 @@ param(
   [string]$Version = "",
   [string]$IsccPath = "",
   [string]$OutputDir = "",
-  [switch]$SkipBuild
+  [switch]$SkipBuild,
+  # Offline builds only work when the crates are already vendored locally.
+  # CI starts from an empty cargo registry cache, so this stays opt-in.
+  [switch]$Offline
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,7 +82,10 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
 $sourceDir = Join-Path $ProjectRoot "dist-rs\NetworkManager"
 
 if (-not $SkipBuild) {
-  & cargo build --release --offline --manifest-path (Join-Path $ProjectRoot "rust\Cargo.toml")
+  $buildArgs = @("build", "--release")
+  if ($Offline) { $buildArgs += "--offline" }
+  $buildArgs += @("--manifest-path", (Join-Path $ProjectRoot "rust\Cargo.toml"))
+  & cargo @buildArgs
   if ($LASTEXITCODE -ne 0) {
     throw "cargo build failed with exit code $LASTEXITCODE"
   }
