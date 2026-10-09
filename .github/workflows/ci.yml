@@ -20,6 +20,21 @@ jobs:
       - run: node --check src/network_manager/web/app.js
       - run: bash -n apps/linux/install.sh
 
+  build-rust-desktop:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # 桌面端只面向 Windows（依赖 windows crate / tao / wry），所以放 windows-latest。
+      # 用 check 而不是 build：链接这一步很慢，而这里要挡的是「编译不过照样 merge」，
+      # 类型检查和 clippy 已经够；产物由本地发版流程出。
+      - run: cargo check --release --manifest-path rust/Cargo.toml
+      # 只做静态检查，警告不阻断（历史代码有一批 clippy 警告，一次性修不完）。
+      - run: cargo clippy --release --manifest-path rust/Cargo.toml
+
   test-windows:
     runs-on: windows-latest
     steps:
