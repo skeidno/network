@@ -16,6 +16,30 @@ fn text(args: &[Value], index: usize) -> String {
         .to_string()
 }
 
+/// 把设置界面的 camelCase 键名翻成 AppConfig 的 snake_case 字段名。
+///
+/// 两边命名不一致，而 `serde_json::from_value` 会把不匹配 Snake 约定的键当成未知
+/// 字段忽略掉 —— 于是出现「接口返回 200、什么都没保存」。这里做一层显式转换，而不是
+/// 去给 AppConfig 加 `rename_all`：那样会连带改变 settings.json 的写法，已经落盘的
+/// 用户配置就读不回来了。
+fn setting_key(key: &str) -> String {
+    const MAPPED: &[(&str, &str)] = &[
+        ("mixedPort", "mixed_port"),
+        ("controllerPort", "controller_port"),
+        ("dnsPort", "dns_port"),
+        ("serverProxyPort", "server_proxy_port"),
+        ("strictRoute", "strict_route"),
+        ("startOnLaunch", "start_on_launch"),
+        ("closeToTray", "close_to_tray"),
+        ("startWithWindows", "start_with_windows"),
+    ];
+    MAPPED
+        .iter()
+        .find(|(camel, _)| *camel == key)
+        .map(|(_, snake)| (*snake).to_string())
+        .unwrap_or_else(|| key.to_string())
+}
+
 fn number(args: &[Value], index: usize) -> i64 {
     args.get(index).and_then(|value| value.as_i64()).unwrap_or(0)
 }
@@ -739,7 +763,11 @@ pub async fn dispatch(state: &mut AppState, method: &str, args: Vec<Value>) -> R
             let mut merged = serde_json::to_value(&state.config).unwrap_or(json!({}));
             if let (Value::Object(target), Value::Object(source)) = (&mut merged, &patch) {
                 for (key, value) in source {
-                    target.insert(key.clone(), value.clone());
+                    // 设置界面提交 camelCase，AppConfig 的字段名是 snake_case。
+                    // 不转换的话这些键会被当成未知字段忽略：接口照常返回 200，
+                    // 什么都没保存 —— 用户改了开关刷新后又变回去。
+                    let normalized = setting_key(&key);
+                    target.insert(normalized, value.clone());
                 }
             }
             if let Ok(config) = serde_json::from_value::<AppConfig>(merged) {
