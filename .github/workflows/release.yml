@@ -101,13 +101,25 @@ jobs:
           if (-not $found) { throw "找不到 Inno Setup 编译器 ISCC.exe" }
           Write-Host "使用编译器：$found"
           "path=$found" >> $env:GITHUB_OUTPUT
+      # 单独一步：和打包脚本分开，失败时能一眼看出是编译还是打包的问题。
+      - name: 编译 Rust 桌面端
+        run: cargo build --release --manifest-path rust/Cargo.toml
       - name: 构建 Windows 安装包
         shell: pwsh
         run: |
           ./scripts/build_windows_installer.ps1 `
             -Version "${{ needs.verify-version.outputs.version }}" `
             -IsccPath "${{ steps.iscc.outputs.path }}" `
-            -OutputDir "release-assets"
+            -OutputDir "release-assets" -SkipBuild *>&1 | Tee-Object -FilePath windows-package.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # CI 日志要管理员权限才下载得到，失败时把脚本输出单独存一份方便排查。
+      - name: 上传打包日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-log
+          path: windows-package.log
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: asset-windows
