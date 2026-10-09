@@ -305,7 +305,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.access_username = options.username.clone();
     app.access_password = options.password.clone();
     app.session_token = crate::server::random_session_token();
-    app.headless = options.headless;
+    // Linux 上永远是常驻服务，没有界面可谈，等价于 headless。
+    app.headless = options.headless || !cfg!(windows);
 
     // 先确认没有别的实例在跑：否则这一趟也会去启动/清理内核，
     // 把已经在跑的那个实例的内核打掉（表现为代理突然失效）。

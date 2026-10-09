@@ -406,9 +406,15 @@ pub fn build(state: &mut AppState) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "capabilities": {
             "platform": std::env::consts::OS,
-            "headless": state.headless,
+            // Linux 上没有原生窗口：即便没带 --headless 启动，界面也应当按
+            // 「Linux WebGUI」渲染（隐藏开机自启、关闭到托盘这类只有桌面端
+            // 才有意义的设置）。
+            "headless": state.headless || !cfg!(windows),
             "sshDeployment": cfg!(windows),
-            "browserFiles": false,
+            // Rust 侧只有 importFileText / *PortableConfigText 这类「浏览器读文件、
+            // 把内容发回来」的接口，没有原生文件对话框。非 Windows 必须让前端走
+            // 浏览器选文件，否则它会去调不存在的 importFile。
+            "browserFiles": !cfg!(windows),
         },
         "core": {
             "running": running,
