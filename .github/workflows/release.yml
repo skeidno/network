@@ -1,0 +1,272 @@
+name: Release
+
+# 打 tag 就发布；也可以从 Actions 页面手动指定一个已存在的 tag 重跑。
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的标签，例如 v0.6.10"
+        required: true
+        type: string
+
+# 创建 Release 需要写 contents 权限；用 Actions 自带的 GITHUB_TOKEN，
+# 不需要额外配置任何密钥。
+permissions:
+  contents: write
+
+jobs:
+  # 规范（docs/RELEASE_POLICY.md）：标签、Cargo.toml、Android 包元数据、文件名、
+  # 发布标题必须用同一个版本号。这里先卡住，避免发出来一套对不上的产物。
+  verify-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - id: check
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::标签必须是 vX.Y.Z 形式，实际是 $tag"
+            exit 1
+          fi
+
+          cargo_version="$(awk '
+            /^\[package\]/ { in_pkg = 1; next }
+            in_pkg && /^version[[:space:]]*=/ {
+              line = $0
+              gsub(/["[:space:]]/, "", line)
+              sub(/^version=/, "", line)
+              print line
+              exit
+            }' rust/Cargo.toml)"
+          if [[ "$version" != "$cargo_version" ]]; then
+            echo "::error::标签 $tag 与 rust/Cargo.toml 的 $cargo_version 不一致"
+            exit 1
+          fi
+
+          android_version="$(awk '
+            /versionName[[:space:]]*=/ {
+              line = $0
+              sub(/.*versionName[[:space:]]*=[[:space:]]*/, "", line)
+              gsub(/["[:space:]]/, "", line)
+              print line
+              exit
+            }' apps/android/app/build.gradle.kts)"
+          if [[ "$version" != "$android_version" ]]; then
+            echo "::error::标签 $tag 与 Android versionName 的 $android_version 不一致"
+            exit 1
+          fi
+
+          echo "版本号一致：$version"
+
+  windows:
+    needs: verify-version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: 定位 Inno Setup 编译器
+        id: iscc
+        shell: pwsh
+        run: |
+          $candidates = @(
+            (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+            (Join-Path ${env:ProgramFiles} "Inno Setup 6\ISCC.exe"),
+            (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 7\ISCC.exe"),
+            (Join-Path ${env:ProgramFiles} "Inno Setup 7\ISCC.exe")
+          )
+          $found = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+          if (-not $found) {
+            Write-Host "未找到 Inno Setup，改用 Chocolatey 安装"
+            choco install innosetup --no-progress -y
+            $found = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+          }
+          if (-not $found) { throw "找不到 Inno Setup 编译器 ISCC.exe" }
+          Write-Host "使用编译器：$found"
+          "path=$found" >> $env:GITHUB_OUTPUT
+      - name: 构建 Windows 安装包
+        shell: pwsh
+        run: |
+          ./scripts/build_windows_installer.ps1 `
+            -Version "${{ needs.verify-version.outputs.version }}" `
+            -IsccPath "${{ steps.iscc.outputs.path }}" `
+            -OutputDir "release-assets"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-windows
+          path: release-assets/v${{ needs.verify-version.outputs.version }}/NetworkManager-Setup-x64-v${{ needs.verify-version.outputs.version }}.exe
+          if-no-files-found: error
+
+  linux-amd64:
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - run: cargo build --release --manifest-path rust/Cargo.toml
+      - run: bash scripts/build_linux_release.sh --output release --arch amd64 --binary rust/target/release/network-manager-rs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-linux-amd64
+          path: release/NetworkManager-Linux-amd64-*.tar.gz
+          if-no-files-found: error
+
+  # 二进制是按架构编的，arm64 只能在 arm64 机器上出。
+  linux-arm64:
+    needs: verify-version
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - run: cargo build --release --manifest-path rust/Cargo.toml
+      - run: bash scripts/build_linux_release.sh --output release --arch arm64 --binary rust/target/release/network-manager-rs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-linux-arm64
+          path: release/NetworkManager-Linux-arm64-*.tar.gz
+          if-no-files-found: error
+
+  # 正式签名 APK 需要密钥。密钥不在仓库里（.gitignore 已排除 keystore），
+  # 走 secrets 注入；没配置就整体跳过，绝不用 debug APK 顶替。
+  android:
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: 判断是否有签名密钥
+        id: keycheck
+        run: |
+          if [[ -z "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]]; then
+            echo "::warning::未配置 ANDROID_KEYSTORE_BASE64，跳过 Android 正式签名 APK"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-java@v5
+        if: steps.keycheck.outputs.available == 'true'
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+        if: steps.keycheck.outputs.available == 'true'
+      - name: 从 secrets 还原签名配置
+        if: steps.keycheck.outputs.available == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$KEYSTORE_BASE64" | base64 --decode > apps/android/network-manager-release.keystore
+          cat > apps/android/signing.properties <<EOF
+          storeFile=network-manager-release.keystore
+          storePassword=$STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+      - name: 构建正式签名 APK
+        if: steps.keycheck.outputs.available == 'true'
+        run: |
+          cd apps/android
+          chmod +x gradlew
+          ./gradlew assembleRelease \
+            -PappVersionName="${{ needs.verify-version.outputs.version }}" \
+            -PappVersionCode="${{ github.run_number }}"
+      - name: 重命名为发布用文件名
+        if: steps.keycheck.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          apk="$(find apps/android/app/build/outputs/apk/release -name '*.apk' -not -name '*unsigned*' | head -1)"
+          [[ -n "$apk" ]] || { echo "::error::没有找到签名 APK"; exit 1; }
+          mkdir -p dist
+          cp "$apk" "dist/NetworkManager-Android-v${{ needs.verify-version.outputs.version }}.apk"
+      - uses: actions/upload-artifact@v4
+        if: steps.keycheck.outputs.available == 'true'
+        with:
+          name: asset-android
+          path: dist/NetworkManager-Android-v${{ needs.verify-version.outputs.version }}.apk
+          if-no-files-found: error
+
+  publish:
+    needs: [verify-version, windows, linux-amd64, linux-arm64, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.verify-version.outputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: asset-*
+          path: dist
+          merge-multiple: true
+      - name: 生成校验值并组装发布说明
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -la
+          sha256sum ./* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cd ..
+          if [[ -f "docs/releases/v${VERSION}.md" ]]; then
+            cp "docs/releases/v${VERSION}.md" release-notes.md
+          else
+            {
+              echo "# Network Manager v${VERSION}"
+              echo
+              echo "由发布流水线自动构建。"
+            } > release-notes.md
+          fi
+          {
+            echo
+            echo "## SHA-256"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } >> release-notes.md
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.verify-version.outputs.version }}
+          TAG: ${{ needs.verify-version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # 幂等：重跑同一个 tag 时先清掉旧 Release，避免 create 失败。
+          # 注意不要加 --cleanup-tag：那会把远端 tag 一起删掉。
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          args=(--title "Network Manager v${VERSION}" --notes-file release-notes.md)
+          # 规范：必需产物缺任何一件都不得标为正式发布。
+          if [[ ! -f "dist/NetworkManager-Android-v${VERSION}.apk" ]]; then
+            echo "::warning::缺少 Android 正式签名 APK，本次标为预发布"
+            args+=(--prerelease)
+          fi
+          if [[ ! -f "dist/NetworkManager-Linux-arm64-v${VERSION}.tar.gz" ]]; then
+            echo "::warning::缺少 Linux arm64 包，本次标为预发布"
+            args+=(--prerelease)
+          fi
+          # dist/ 里已包含 SHA256SUMS.txt，直接整体上传。
+          gh release create "$TAG" "${args[@]}" dist/*

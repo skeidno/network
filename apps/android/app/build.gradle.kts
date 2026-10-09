@@ -12,6 +12,12 @@ if (signingPropertiesFile.isFile) {
     signingPropertiesFile.inputStream().use(signingProperties::load)
 }
 
+// The release pipeline pins the version so the APK metadata, the Windows
+// installer, the Linux tarballs and the git tag all carry the same X.Y.Z.
+// Local builds fall back to the values below.
+val appVersionName = (project.findProperty("appVersionName") as String?) ?: "0.6.10"
+val appVersionCode = ((project.findProperty("appVersionCode") as String?) ?: "8").toInt()
+
 android {
     namespace = "com.skeidno.networkmanager"
     compileSdk = 36
@@ -20,8 +26,8 @@ android {
         applicationId = "com.skeidno.networkmanager"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.6.3"
+        versionCode = appVersionCode
+        versionName = appVersionName
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
     }
