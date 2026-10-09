@@ -225,6 +225,9 @@ jobs:
 
   publish:
     needs: [verify-version, windows, linux-amd64, linux-arm64, android]
+    # 构建不一定全绿。仍然跑：至少把产物发出去，并把失败侧的日志带进发布说明，
+    # 否则 CI 日志只有仓库管理员能下载，排查全靠猜。
+    if: always() && needs.verify-version.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -235,11 +238,23 @@ jobs:
           pattern: asset-*
           path: dist
           merge-multiple: true
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-build-log"
+          path: logs
+          merge-multiple: true
+        continue-on-error: true
       - name: 生成校验值并组装发布说明
         env:
           VERSION: ${{ needs.verify-version.outputs.version }}
         run: |
           set -euo pipefail
+          mkdir -p dist logs
+          if [[ -z "$(ls -A dist 2>/dev/null)" ]]; then
+            echo "::error::一件产物都没有，无法发布"
+            exit 1
+          fi
           cd dist
           ls -la
           sha256sum ./* > SHA256SUMS.txt
@@ -262,6 +277,19 @@ jobs:
             cat dist/SHA256SUMS.txt
             echo '```'
           } >> release-notes.md
+          # 构建失败时把脚本输出带进发布说明：CI 日志只有仓库管理员能下载，
+          # 不放这里就只能靠猜。必须追加在最后，否则会被前面的 cp 覆盖。
+          for log in logs/*; do
+            [[ -f "$log" ]] || continue
+            {
+              echo
+              echo "## 构建诊断（$(basename "$log")）"
+              echo
+              echo '```'
+              tail -n 120 "$log"
+              echo '```'
+            } >> release-notes.md
+          done
       - name: 创建 GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
