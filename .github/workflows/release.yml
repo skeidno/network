@@ -120,10 +120,13 @@ jobs:
           name: windows-build-log
           path: windows-package.log
           if-no-files-found: ignore
+      # 打包脚本传了 -OutputDir release-assets，安装包就落在该目录根下
+      # （只有不指定 OutputDir 时才会在里面再建 vX.Y.Z 子目录）。用 glob 兜住，
+      # 免得目录层级一变就找不到文件。
       - uses: actions/upload-artifact@v4
         with:
           name: asset-windows
-          path: release-assets/v${{ needs.verify-version.outputs.version }}/NetworkManager-Setup-x64-v${{ needs.verify-version.outputs.version }}.exe
+          path: release-assets/NetworkManager-Setup-x64-v*.exe
           if-no-files-found: error
 
   linux-amd64:
@@ -257,7 +260,10 @@ jobs:
           fi
           cd dist
           ls -la
-          sha256sum ./* > SHA256SUMS.txt
+          # 先写到上级目录再挪回来：直接 `sha256sum ./* > SHA256SUMS.txt` 时
+          # 重定向会先创建空文件，glob 就会把它自己也扫进去。
+          sha256sum ./* > ../SHA256SUMS.txt
+          mv ../SHA256SUMS.txt ./SHA256SUMS.txt
           cat SHA256SUMS.txt
           cd ..
           if [[ -f "docs/releases/v${VERSION}.md" ]]; then
