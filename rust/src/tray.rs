@@ -15,6 +15,13 @@ pub use windows_impl::*;
 #[cfg(not(windows))]
 pub use stub::*;
 
+/// 托盘线程还不够「可靠」的兜底手段：向用户提示程序还在哪里。
+///
+/// Windows 11 默认把首次出现的托盘图标收进「隐藏的图标」溢出区，用户很可能找不到它。
+/// 非 Windows 平台没有这套托盘实现，提示也就无从谈起，统一在这里留出空实现。
+#[cfg(not(windows))]
+pub fn notify(_title: &str, _body: &str) {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayCommand {
     Open,
@@ -29,20 +36,22 @@ pub enum TrayCommand {
 mod windows_impl {
     use super::TrayCommand;
     use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use std::time::Duration;
 
+    use windows::core::GUID;
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Shell::{
-        Shell_NotifyIconW, NOTIFYICONDATAW, NOTIFYICON_VERSION_4, NIF_ICON, NIF_MESSAGE, NIF_TIP,
-        NIM_ADD, NIM_DELETE, NIM_SETVERSION,
+        Shell_NotifyIconW, NOTIFYICONDATAW, NOTIFYICON_VERSION_4, NIF_GUID, NIF_ICON, NIF_INFO,
+        NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-        DispatchMessageW, GetCursorPos, GetMessageW, IsIconic, LoadImageW, PostMessageW,
-        PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-        SetForegroundWindow, ShowWindow, TrackPopupMenu, TranslateMessage,
-        HICON, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MSG, SW_RESTORE,
+        AppendMenuW, ChangeWindowMessageFilterEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+        DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, IsIconic,
+        LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW,
+        RegisterWindowMessageW, SetForegroundWindow, ShowWindow, TrackPopupMenu, TranslateMessage,
+        HICON, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MSG, MSGFLT_ALLOW, SW_RESTORE,
         TRACK_POPUP_MENU_FLAGS, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY,
         WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_LBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW,
     };
@@ -50,9 +59,11 @@ mod windows_impl {
         RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL,
     };
 
-    /// 回调消息号用 WM_APP 段：WM_USER 段会和窗口自身的消息号打架，
+    /// 托盘回调消息号用 WM_APP 段：WM_USER 段会和窗口自身的消息号打架，
     /// 而且 0x401 恰好等于 NIN_KEYSELECT 的数值，排查时极易混淆。
     const TRAY_MESSAGE: u32 = 0x8000 + 1; // WM_APP + 1
+    /// 请求托盘线程弹一条气泡提示（界面线程 → 托盘线程）。
+    const TRAY_TIP_MESSAGE: u32 = 0x8000 + 2; // WM_APP + 2
     const MENU_OPEN: usize = 1001;
     const MENU_TOGGLE: usize = 1002;
     const MENU_QUIT: usize = 1003;
@@ -63,6 +74,13 @@ mod windows_impl {
     const NIN_SELECT: u32 = 0x0400;
     const NIN_KEYSELECT: u32 = 0x0401;
     const NIN_DOUBLECLK: u32 = 0x0403;
+    /// 通知图标的稳定身份（见 TRAY_GUID 的说明）。
+    const TRAY_GUID: GUID = GUID {
+        data1: 0x2f6a91c4,
+        data2: 0x51b8,
+        data3: 0x4d27,
+        data4: [0x9a, 0x0e, 0x3c, 0x7b, 0x64, 0x51, 0x8d, 0x92],
+    };
     /// 全局热键 Ctrl+Alt+?：唤回界面的兜底通道。
     ///
     /// Windows 11 会把新托盘图标默认收进「隐藏的图标」溢出区，用户很可能
@@ -87,6 +105,32 @@ mod windows_impl {
     /// 托盘线程此刻刚处理完 explorer 的输入，具备抢夺前台的资格；
     /// 交给界面线程去做则经常因为前台锁而失败（窗口显示了但在别的窗口后面）。
     static MAIN_WINDOW: AtomicIsize = AtomicIsize::new(0);
+    /// 待弹出的气泡提示（标题, 正文）。
+    ///
+    /// 托盘窗口属于托盘线程，界面线程只能把内容放在这里再投递 TRAY_TIP_MESSAGE，
+    /// 由托盘线程自己去调 Shell_NotifyIconW(NIM_MODIFY)。
+    static PENDING_TIP: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+    /// 弹一条气泡提示，告诉用户「程序还在、从哪里能叫回来」。
+    ///
+    /// Windows 11 会把首次出现的托盘图标收进「隐藏的图标」溢出区，用户很可能
+    /// 压根找不到；不知道程序在哪儿的时候，最容易的判断就是「它坏了」。
+    pub fn notify(title: &str, body: &str) {
+        if let Ok(mut guard) = PENDING_TIP.lock() {
+            *guard = Some((title.to_string(), body.to_string()));
+        }
+        let hwnd = TRAY_WINDOW.load(Ordering::SeqCst);
+        if hwnd != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut _)),
+                    TRAY_TIP_MESSAGE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
 
     pub fn spawn(icon_path: &str) -> Result<(), String> {
         let icon_path = icon_path.to_string();
@@ -248,6 +292,21 @@ mod windows_impl {
             .map_err(|err| format!("创建托盘窗口失败：{err}"))?;
             TRAY_WINDOW.store(window.0 as usize, Ordering::SeqCst);
 
+            // 放开 UIPI：允许完整性级别更低的进程往这个窗口投递消息。
+            //
+            // 托盘通知是 explorer（更准确说是 Win11 里托管通知区的 XAML 宿主）主动
+            // SendMessage 过来的，一旦本程序是管理员权限运行（界面里有「以管理员重启」
+            // 的入口，TUN 模式下用户常走这条路），那边的完整性级别比我们低，消息会被
+            // UIPI 直接丢掉：图标照常显示，单击右键全都石沉大海 —— 看起来就是
+            // 「托盘点了没反应」。这里针对回调消息单独放行，既是修管理员场景，
+            // 也不至于把整个窗口对低权限进程敞开。
+            for message in [TRAY_MESSAGE, TRAY_TIP_MESSAGE] {
+                let allowed = ChangeWindowMessageFilterEx(window, message, MSGFLT_ALLOW, None);
+                if allowed.is_err() {
+                    log_line(&format!("UIPI 放行 0x{message:04x} 失败：{:?}", allowed.err()));
+                }
+            }
+
             // explorer 重启后托盘会被整体清空，系统会广播 TaskbarCreated，
             // 收到后用保存的 NOTIFYICONDATA 重新挂一次即可。
             let taskbar_name = wide("TaskbarCreated");
@@ -271,20 +330,35 @@ mod windows_impl {
             let icon = HICON(icon.0);
 
             let mut tip = [0u16; 128];
-            let label = wide("Network Manager");
-            let copy = label.len().min(tip.len());
-            tip[..copy].copy_from_slice(&label[..copy]);
+            fill(&mut tip, "Network Manager");
 
             let mut data: NOTIFYICONDATAW = std::mem::zeroed();
             data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
             data.hWnd = window;
             data.uID = 1;
-            data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
             data.uCallbackMessage = TRAY_MESSAGE;
             data.hIcon = icon;
             data.szTip = tip;
 
-            if !Shell_NotifyIconW(NIM_ADD, &data).as_bool() {
+            // 先带上 GUID 注册：同一个身份系统要认得出来。
+            //
+            // Windows 11 默认把「第一次出现」的图标收进「隐藏的图标」溢出区，用户很可能
+            // 根本没看到它，于是点了边上旧进程被强杀留下的死图标 —— 那就是
+            // 「图标在、点了没反应、右键也没菜单」的全部来源。带 GUID 注册后，
+            // 用户把它拖出来（或在系统设置里改成「始终显示」）的选择会被系统记住，
+            // 后续版本不会再被当成新图标塞回去。
+            data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID;
+            data.guidItem = TRAY_GUID;
+            let mut added = Shell_NotifyIconW(NIM_ADD, &data).as_bool();
+            if !added {
+                // 极少数机器上同 GUID 的旧条目没被系统清干净，NIM_ADD 会直接失败。
+                // 丢掉 GUID 再试一次：宁可少一个「记住偏好」的好处，也不能连图标都没有。
+                log_line("带 GUID 注册失败，回退为普通注册");
+                data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+                data.guidItem = GUID::zeroed();
+                added = Shell_NotifyIconW(NIM_ADD, &data).as_bool();
+            }
+            if !added {
                 return Err("添加托盘图标失败".into());
             }
             // 必须切到 NOTIFYICON_VERSION_4：Windows 11 的 XAML 托盘只对 V4 图标
@@ -315,6 +389,10 @@ mod windows_impl {
                     handle_tray_event(message.lParam);
                     continue;
                 }
+                if message.message == TRAY_TIP_MESSAGE {
+                    show_balloon();
+                    continue;
+                }
                 if TASKBAR_CREATED.load(Ordering::SeqCst) != 0
                     && message.message == TASKBAR_CREATED.load(Ordering::SeqCst) as u32
                 {
@@ -331,6 +409,35 @@ mod windows_impl {
             TRAY_REMOVED.store(true, Ordering::SeqCst);
         }
         Ok(())
+    }
+
+    /// 弹出 PENDING_TIP 里排队的气泡提示。
+    ///
+    /// 只能在托盘线程调用：NOTIFYICONDATA 的常驻副本在那边，而且 NIM_MODIFY
+    /// 必须由拥有图标的线程发出才有意义。
+    fn show_balloon() {
+        let pending = PENDING_TIP.lock().ok().and_then(|mut guard| guard.take());
+        let Some((title, body)) = pending else {
+            return;
+        };
+        let raw = TRAY_DATA.load(Ordering::SeqCst);
+        if raw.is_null() {
+            return;
+        }
+        unsafe {
+            // 从常驻副本出发，只改气泡相关的字段：身份（hWnd/uID/guidItem）必须
+            // 和注册时完全一致，否则系统会认为这是另一个图标而不理。
+            let mut data = *raw;
+            data.uFlags = windows::Win32::UI::Shell::NOTIFY_ICON_DATA_FLAGS(
+                data.uFlags.0 | NIF_INFO.0,
+            );
+            data.dwInfoFlags = NIIF_INFO;
+            fill(&mut data.szInfoTitle, &title);
+            fill(&mut data.szInfo, &body);
+            if !Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() {
+                log_line("气泡提示弹出失败");
+            }
+        }
     }
 
     /// 托盘回调：lParam 是鼠标消息。
@@ -460,6 +567,16 @@ mod windows_impl {
                 LRESULT(0)
             }
             _ => DefWindowProcW(window, message, wparam, lparam),
+        }
+    }
+
+    /// 把 UTF-8 文本写进固定长度的 UTF-16 数组（自动留结尾的 0）。
+    fn fill(destination: &mut [u16], text: &str) {
+        let encoded = wide(text);
+        let count = encoded.len().min(destination.len());
+        destination[..count].copy_from_slice(&encoded[..count]);
+        if count == destination.len() {
+            destination[destination.len() - 1] = 0;
         }
     }
 

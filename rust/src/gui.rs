@@ -164,6 +164,64 @@ fn ensure_on_screen(window: &tao::window::Window) {
     }
 }
 
+/// 「关闭到后台」：把窗口最小化而不是隐藏。
+///
+/// 之前这里是 `window.set_visible(false)`，窗口会连任务栏按钮一起消失，只能靠托盘
+/// 图标唤回。实测这台机器上是唤不回来的：Windows 11 默认把首次出现的托盘图标收进
+/// 「隐藏的图标」溢出区，`Shell_NotifyIconGetRect` 给回来的坐标永远是通知区最左边
+/// 那个溢出槽（拿另一个进程新注册的图标对比，坐标一模一样），也就是说用户根本看不到
+/// 我们的图标 —— 他点到的往往是旧进程被强杀后留下的死图标，于是「图标在、点了没反应、
+/// 右键也没菜单」。
+///
+/// 最小化之后任务栏按钮一直在，点一下就能回来，不依赖托盘在水面还是溢出区。顺带也绕
+/// 开了 WebView 的坑：隐藏窗口会让 WebView2 销毁承载画面和鼠标输入的渲染窗口并且不
+/// 会自己重建，每次显示都得整块重建 WebView；最小化没有这个问题。
+fn minimize_to_tray(window: &tao::window::Window) {
+    window.set_minimized(true);
+    set_window_visible(true);
+    notify_hidden_once();
+}
+
+/// 界面事件流水账（logs/gui.log）。
+///
+/// 「程序自己退了」这类问题最难查的地方是没有控制台，什么痕迹都不留。这里把
+/// 事件循环的关键分支记一笔，出问题时能直接看出是哪条退出路径被走到了。
+fn trace(text: &str) {
+    use std::io::Write;
+    let path = crate::paths::logs_dir().join("gui.log");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 64 * 1024 {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(file, "{now} {text}");
+    }
+}
+
+/// 第一次退到后台时弹一条气泡，告诉用户程序在哪儿、怎么叫回来。
+///
+/// 用户判断「程序坏了」往往只是因为不知道它在后台。这条提示把三条唤回通道一次性说清。
+static HIDDEN_NOTICE_SHOWN: AtomicBool = AtomicBool::new(false);
+
+fn notify_hidden_once() {
+    if HIDDEN_NOTICE_SHOWN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    crate::tray::notify(
+        "Network Manager 仍在后台运行",
+        "点击任务栏图标恢复窗口；托盘图标若在「隐藏的图标」里，可按 Ctrl+Alt+N 唤回。",
+    );
+}
+
 fn set_window_visible(visible: bool) {
     if let Ok(mut guard) = WINDOW_VISIBLE.get_or_init(|| Mutex::new(true)).lock() {
         *guard = visible;
@@ -247,17 +305,23 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
                 Event::NewEvents(StartCause::Init) => {
                     let _ = &webview;
                 }
-                Event::WindowEvent { event, .. } => match event {
+                Event::WindowEvent { event, window_id, .. } => match event {
                     WindowEvent::CloseRequested => {
+                        trace(&format!(
+                            "CloseRequested id={window_id:?} quitting={quitting} close_to_tray={close_to_tray}"
+                        ));
                         if quitting || !close_to_tray {
                             request_exit(control);
                         } else {
-                            window.set_visible(false);
-                            set_window_visible(false);
-                            window_hidden = true;
+                            minimize_to_tray(&window);
                         }
                     }
-                    WindowEvent::Destroyed => request_exit(control),
+                    WindowEvent::Destroyed => {
+                        trace(&format!(
+                            "WindowEvent::Destroyed id={window_id:?} -> 退出事件循环"
+                        ));
+                        request_exit(control);
+                    }
                     _ => {}
                 },
                 // tao 收到 WM_ENDSESSION（注销 / 关机 / 重启）时会把内部状态直接置为
@@ -270,17 +334,25 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
                 // 注意处理函数里绝不能做阻塞操作（比如等托盘线程摘图标）：
                 // 那会让消息泵在处理函数执行期间继续派发事件，造成事件处理器重入，
                 // 触发 "either event handler is re-entrant" 恐慌。
-                Event::LoopDestroyed => stop_message_pump(),
+                Event::LoopDestroyed => {
+                    trace("LoopDestroyed -> 停消息泵");
+                    stop_message_pump();
+                }
                 Event::UserEvent(action) => match action {
-                    AppEvent::Show => show_window(&window, &mut webview, &url, &mut window_hidden),
+                    AppEvent::Show => {
+                        trace("UserEvent::Show");
+                        show_window(&window, &mut webview, &url, &mut window_hidden)
+                    }
+                    // 自定义标题栏的关闭按钮和窗口的 X 走同一条路径：
+                    // 最小化而不是隐藏，理由见 minimize_to_tray 的注释。
                     AppEvent::Hide | AppEvent::Close => {
-                        window.set_visible(false);
-                        set_window_visible(false);
-                        window_hidden = true;
+                        trace("UserEvent::Hide/Close -> 最小化");
+                        minimize_to_tray(&window)
                     }
                     AppEvent::Minimize => window.set_minimized(true),
                     AppEvent::Maximize => window.set_maximized(!window.is_maximized()),
                     AppEvent::Quit => {
+                        trace("UserEvent::Quit -> 退出");
                         quitting = true;
                         request_exit(control);
                     }
@@ -290,6 +362,7 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
                         }
                         TrayCommand::ToggleCore => toggle_core(&loop_runtime, &loop_shared),
                         TrayCommand::Quit => {
+                            trace("Tray::Quit -> 退出");
                             quitting = true;
                             request_exit(control);
                         }
@@ -313,6 +386,7 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
 
     // 消息泵已经停了，这里做阻塞清理才是安全的（不会造成事件处理器重入）。
     crate::tray::request_close();
+    trace(&format!("事件循环结束 loop_crashed={} -> 收尾退出", result.is_err()));
     if result.is_err() {
         return Err(LOOP_CRASHED.into());
     }
