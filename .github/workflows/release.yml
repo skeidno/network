@@ -56,10 +56,12 @@ jobs:
             exit 1
           fi
 
+          # versionName 的默认值写在 `?: "X.Y.Z"` 里（构建时可用 -PappVersionName 覆盖），
+          # 所以要取 `?:` 之后那个字面量，而不是变量名本身。
           android_version="$(awk '
-            /versionName[[:space:]]*=/ {
+            /^val appVersionName[[:space:]]*=/ {
               line = $0
-              sub(/.*versionName[[:space:]]*=[[:space:]]*/, "", line)
+              sub(/.*[?]:[[:space:]]*/, "", line)
               gsub(/["[:space:]]/, "", line)
               print line
               exit
