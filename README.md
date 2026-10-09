@@ -38,11 +38,12 @@ sudo bash apps/linux/install.sh
 Windows 桌面端是 Rust 实现的（`rust/`），需要 Rust 工具链。TUN 启动需要管理员权限。
 
 ```powershell
-python scripts/download_mihomo.py
 cargo build --release --manifest-path rust/Cargo.toml
 ```
 
 产物是 `rust/target/release/network-manager-rs.exe` 单个文件；`mihomo.exe` 放在它旁边。
+打包安装包时如果 `vendor\mihomo.exe` 不存在，`scripts/build_windows_installer.ps1`
+会按 `vendor/mihomo.version.json` 钉住的版本自动下载、校验 SHA-256 并解压。
 需要管理员权限时从已提权的终端启动，或由安装包配置的清单触发 UAC。
 
 无界面调试可以直接跑 HTTP 服务而不创建窗口：
@@ -101,15 +102,10 @@ node --check src/network_manager/web/app.js
 `cargo test` 里包含 Linux 发布包的契约测试（`rust/tests/linux_packaging.rs`）：内核版本与校验值、
 install.sh / systemd 单元的关键内容、以及被嵌进二进制的前端资源是否还在。
 
-启动程序后还可以对本地 WebGUI 执行浏览器冒烟测试：
-
-```powershell
-python scripts/smoke_webgui.py http://127.0.0.1:<port>/ --poll-seconds 10
-```
-
 产品代码已全部是 Rust（Windows 桌面端 + Linux 常驻服务），原先覆盖配置迁移、订阅格式、
 Mihomo 配置、流量统计、API 鉴权、凭据加密、服务器部署的那批 Python 测试随实现一起删除。
-Python 只剩 `scripts/` 下几个构建/校验脚本。
+仓库里没有 Python：发布与安装脚本是 bash（`scripts/build_linux_release.sh`、
+`apps/linux/install.sh`）和 PowerShell（`scripts/build_windows_installer.ps1`）。
 
 ## 数据与安全
 

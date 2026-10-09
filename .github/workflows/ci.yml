@@ -5,21 +5,17 @@ on:
   pull_request:
 
 jobs:
-  # Python 只剩 scripts/ 下几个构建/校验脚本了，产品代码全是 Rust，
-  # 所以这里只做静态校验（脚本语法、shell 语法、前端 JS 语法）。
+  # 仓库里的发布/安装脚本是 bash + PowerShell，前端是 JS，产品代码全是 Rust，
+  # 所以这里只做静态校验：shell 语法、PowerShell 语法、前端 JS 语法。
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - run: python -m pip install ruff
-      - run: python -m ruff check scripts
       - run: bash -n apps/linux/install.sh
+      - run: bash -n scripts/build_linux_release.sh
+      # 打包脚本要能正常启动（版本号从 rust/Cargo.toml 读）。
+      - run: bash scripts/build_linux_release.sh --help
       - run: node --check src/network_manager/web/app.js
-      # 发布包打包脚本要能正常加载（版本号从 rust/Cargo.toml 读）。
-      - run: python scripts/build_linux_release.py --help
 
   build-rust-desktop:
     runs-on: windows-latest
@@ -35,6 +31,16 @@ jobs:
       - run: cargo check --release --manifest-path rust/Cargo.toml
       # 只做静态检查，警告不阻断（历史代码有一批 clippy 警告，一次性修不完）。
       - run: cargo clippy --release --manifest-path rust/Cargo.toml
+      # 打包脚本用解析器做语法检查（不执行）：它平时不跑，坏了要等发版才发现。
+      - run: |
+          $errors = $null
+          $tokens = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "scripts/build_windows_installer.ps1"),
+            [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Host "ERROR: $_" }; exit 1 }
+          Write-Host "PowerShell syntax OK"
+        shell: pwsh
 
   # Rust 在 Linux 上的产物：一条常驻服务（systemd 管着），管理页面用浏览器打开。
   # 原生界面（tao + wry）只在 Windows 上编，所以这里不需要 WebKit/GTK 的开发包，
@@ -69,7 +75,7 @@ jobs:
           wait "${pid}"
       # 顺手把可直接安装的发布包打出来：Windows 上交叉编不出 Linux 二进制，
       # 所以 Linux 的发布包只能由这里的 runner 出。
-      - run: python3 scripts/build_linux_release.py --output release --arch amd64
+      - run: bash scripts/build_linux_release.sh --output release --arch amd64 --binary rust/target/release/network-manager-rs
       - uses: actions/upload-artifact@v4
         with:
           name: NetworkManager-Linux-amd64
