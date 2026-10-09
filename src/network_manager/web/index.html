@@ -315,8 +315,12 @@
               <div class="switch-list">
                 <label class="switch-row"><span><strong>严格路由</strong><small>减少 DNS 和流量泄漏</small></span><input id="setting-strict-route" type="checkbox"><i></i></label>
                 <label class="switch-row"><span><strong>打开后自动接管</strong><small>软件启动后自动运行核心</small></span><input id="setting-start-on-launch" type="checkbox"><i></i></label>
-                <label class="switch-row desktop-only-setting"><span><strong>关闭后驻留系统托盘</strong><small>仅通过托盘菜单退出程序</small></span><input id="setting-close-to-tray" type="checkbox" checked disabled><i></i></label>
+                <label class="switch-row desktop-only-setting"><span><strong>关闭后继续在后台运行</strong><small>关闭窗口只是最小化到任务栏，需要时用下面的按钮退出</small></span><input id="setting-close-to-tray" type="checkbox" checked disabled><i></i></label>
                 <label class="switch-row desktop-only-setting"><span><strong>随 Windows 登录启动</strong><small>登录后自动打开网络管理器</small></span><input id="setting-start-with-windows" type="checkbox"><i></i></label>
+              </div>
+              <div class="portable-config-actions desktop-only-setting" style="margin-top:14px">
+                <button id="quit-application" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/power.svg')"></span><span>退出并停止接管</span></button>
+                <small>退出后进程和内核一起结束，不用再去任务管理器里结束。</small>
               </div>
             </section>
             <section class="panel settings-section">

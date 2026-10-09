@@ -1664,6 +1664,7 @@ function bindEvents() {
       openBrowserTextFile(".json", (_file, content) => invoke("importPortableConfigText", content));
     } else invoke("importPortableConfig");
   });
+  byId("quit-application")?.addEventListener("click", () => performWindowAction("quit"));
   byId("portable-config-export").addEventListener("click", async () => {
     if (appState?.capabilities?.browserFiles) {
       const content = await invoke("exportPortableConfigText");
