@@ -1,21 +1,18 @@
 # Windows
 
-The production Windows implementation currently lives at the repository root:
+The Windows desktop app is the Rust implementation:
 
-- application: `../../src/network_manager/`
-- tests: `../../tests/`
-- build scripts: `../../scripts/`
-- PyInstaller entry: `../../NetworkManager.spec`
-- Inno Setup entry: `NetworkManager.iss`
-- Desktop shortcut helper: `../../scripts/create_desktop_shortcut.ps1`
+- application: `../../rust/`
+- WebGUI assets (shared with the Linux headless build): `../../src/network_manager/web/`
+- installer entry: `NetworkManager.iss`
 
-`build_windows.ps1` creates a desktop shortcut by default. Pass
-`-SkipDesktopShortcut` when producing a clean CI artifact.
+Install Inno Setup 7, then run `../../scripts/build_windows_installer.ps1` to build the
+application and a per-user installer with Start menu, desktop shortcut, upgrade, and
+uninstall support. Pass `-SkipBuild` to package an already built
+`dist-rs/NetworkManager` directory instead of running cargo again.
 
-Install Inno Setup 7, then run `../../scripts/build_windows_installer.ps1` to build the application and a
-per-user installer with Start menu, desktop shortcut, upgrade, and uninstall
-support. Pass `-SkipWindowsBuild` to package an existing `dist/NetworkManager`
-directory.
+`mihomo.exe` must sit beside `NetworkManager.exe` in `dist-rs/NetworkManager`. The
+script copies it from `../../vendor/mihomo.exe` when it is missing there.
 
-This compatibility layout keeps existing build and release commands working.
-Windows-only code must not be imported by Android, macOS, or iOS projects.
+The Python desktop GUI that used to live in `src/network_manager/ui/` (PySide6, packaged
+with PyInstaller) has been removed — the Rust exe replaces it.

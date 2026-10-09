@@ -2,7 +2,6 @@ param(
   [string]$Version = "",
   [string]$IsccPath = "",
   [string]$OutputDir = "",
-  [switch]$Rust = $true,
   [switch]$SkipBuild
 )
 
@@ -23,43 +22,37 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
   throw "Installer version must use MAJOR.MINOR.PATCH: $Version"
 }
 
-# Desktop app is now built from Rust: a single exe plus mihomo.exe beside it.
-if ($Rust) {
-  $sourceDir = Join-Path $ProjectRoot "dist-rs\NetworkManager"
+# Windows 桌面端只有一个来源：Rust 编出来的单个 exe，旁边放一份 mihomo.exe。
+# 以前这里还有一条 PyInstaller 打包 Python 桌面 GUI 的分支（scripts/build_windows.ps1），
+# 那套 PySide6 界面已经被 Rust 版取代并删除。
+$sourceDir = Join-Path $ProjectRoot "dist-rs\NetworkManager"
 
-  if (-not $SkipBuild) {
-    & cargo build --release --offline --manifest-path (Join-Path $ProjectRoot "rust\Cargo.toml")
-    if ($LASTEXITCODE -ne 0) {
-      throw "cargo build failed with exit code $LASTEXITCODE"
-    }
-  }
-
-  $built = Join-Path $ProjectRoot "rust\target\release\network-manager-rs.exe"
-  if (-not (Test-Path -LiteralPath $built -PathType Leaf)) {
-    throw "Rust build was not found: $built"
-  }
-
-  if (-not (Test-Path -LiteralPath $sourceDir -PathType Container)) {
-    New-Item -ItemType Directory -Path $sourceDir -Force | Out-Null
-  }
-  Copy-Item -LiteralPath $built -Destination (Join-Path $sourceDir "NetworkManager.exe") -Force
-
-  $core = Join-Path $sourceDir "mihomo.exe"
-  if (-not (Test-Path -LiteralPath $core -PathType Leaf)) {
-    $vendored = Join-Path $ProjectRoot "dist\NetworkManager\_internal\vendor\mihomo.exe"
-    if (Test-Path -LiteralPath $vendored -PathType Leaf) {
-      Copy-Item -LiteralPath $vendored -Destination $core -Force
-    }
-    else {
-      throw "mihomo.exe was not found beside the app or under dist\NetworkManager\_internal\vendor"
-    }
+if (-not $SkipBuild) {
+  & cargo build --release --offline --manifest-path (Join-Path $ProjectRoot "rust\Cargo.toml")
+  if ($LASTEXITCODE -ne 0) {
+    throw "cargo build failed with exit code $LASTEXITCODE"
   }
 }
-else {
-  if (-not $SkipBuild) {
-    & (Join-Path $PSScriptRoot "build_windows.ps1") -SkipDesktopShortcut
+
+$built = Join-Path $ProjectRoot "rust\target\release\network-manager-rs.exe"
+if (-not (Test-Path -LiteralPath $built -PathType Leaf)) {
+  throw "Rust build was not found: $built"
+}
+
+if (-not (Test-Path -LiteralPath $sourceDir -PathType Container)) {
+  New-Item -ItemType Directory -Path $sourceDir -Force | Out-Null
+}
+Copy-Item -LiteralPath $built -Destination (Join-Path $sourceDir "NetworkManager.exe") -Force
+
+$core = Join-Path $sourceDir "mihomo.exe"
+if (-not (Test-Path -LiteralPath $core -PathType Leaf)) {
+  $vendored = Join-Path $ProjectRoot "vendor\mihomo.exe"
+  if (Test-Path -LiteralPath $vendored -PathType Leaf) {
+    Copy-Item -LiteralPath $vendored -Destination $core -Force
   }
-  $sourceDir = Join-Path $ProjectRoot "dist\NetworkManager"
+  else {
+    throw "mihomo.exe was not found beside the app or under vendor\"
+  }
 }
 
 $executable = Join-Path $sourceDir "NetworkManager.exe"

@@ -14,24 +14,19 @@ dependencies = [
   "requests[socks]>=2.32",
 ]
 
+# 桌面端（Windows 的 NetworkManager.exe）已经是 Rust 实现的，这里只留 Linux 侧的
+# headless WebGUI 和部署工具链，PySide6 / PyInstaller 那一整套随之去掉。
 [project.optional-dependencies]
-desktop = [
-  "PySide6>=6.10.3,<6.11",
-  "paramiko>=4.0",
-]
 dev = [
-  "PySide6>=6.10.3,<6.11",
   "paramiko>=4.0",
   "pytest>=8.0",
   "ruff>=0.8",
-  "pyinstaller>=6.0",
   "playwright>=1.49",
   "build>=1.2",
   "pillow>=10.0",
 ]
 
 [project.scripts]
-network-manager = "network_manager.app:main"
 network-manager-headless = "network_manager.headless:main"
 
 [tool.setuptools.packages.find]
@@ -39,7 +34,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 network_manager = [
-  "style.qss",
   "web/*.html",
   "web/*.css",
   "web/*.js",

@@ -21,7 +21,7 @@
 - Windows 与 Android 通用配置文件快速导入导出；SSH 凭据、桌面进程规则和本地端口不会跨设备导出
 - 系统托盘、登录启动、桌面快捷方式和配置自动校验
 
-Windows WebGUI 由仅监听 `127.0.0.1` 的会话令牌 API 提供，并通过 Qt WebEngine 直接嵌入 Network Manager 主窗口。界面、托盘和后台管理属于同一个应用实例，不会再打开 Edge 窗口。Linux 复用同一套页面，以无 Qt 的 HTTP 服务提供；远程监听额外强制 HTTP Basic 管理密码。Mihomo 在两端都作为受控子进程独立运行。
+Windows WebGUI 由仅监听 `127.0.0.1` 的会话令牌 API 提供，并通过 WebView2 嵌入主窗口。界面、托盘和后台管理属于同一个应用实例，不会再打开 Edge 窗口。Linux 复用同一套页面，以无 Qt 的 HTTP 服务提供；远程监听额外强制 HTTP Basic 管理密码。Mihomo 在两端都作为受控子进程独立运行。
 
 ## Linux 无界面服务
 
@@ -35,15 +35,21 @@ sudo bash apps/linux/install.sh
 
 ## Windows 开发运行
 
-需要 Python 3.10+。TUN 启动需要管理员权限。
+Windows 桌面端是 Rust 实现的（`rust/`），需要 Rust 工具链。TUN 启动需要管理员权限。
 
 ```powershell
-python -m pip install -e ".[dev]"
 python scripts/download_mihomo.py
-powershell -ExecutionPolicy Bypass -File scripts/run_windows_admin.ps1
+cargo build --release --manifest-path rust/Cargo.toml
 ```
 
-普通权限也可执行 `python -m network_manager` 查看和编辑配置，但不能启动 TUN 接管。
+产物是 `rust/target/release/network-manager-rs.exe` 单个文件；`mihomo.exe` 放在它旁边。
+需要管理员权限时从已提权的终端启动，或由安装包配置的清单触发 UAC。
+
+无界面调试可以直接跑 HTTP 服务而不创建窗口：
+
+```powershell
+cargo run --release --manifest-path rust/Cargo.toml -- --headless --listen 127.0.0.1 --port 9091
+```
 
 ## 界面与主题
 
@@ -62,24 +68,16 @@ Windows 下“记住凭据”使用当前登录用户的 DPAPI 加密，SSH 明�
 ## 构建 Windows 包
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1
-```
-
-输出位于 `dist/NetworkManager/`。构建为稳定的一目录包并带管理员清单；Mihomo 作为独立子进程运行，主程序异常退出时 Windows Job Object 会清理核心。
-
-正式安装包使用 Inno Setup 7 构建，默认安装到当前用户目录并创建开始菜单和桌面快捷方式：
-
-```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build_windows_installer.ps1
 ```
 
+脚本内部先 `cargo build --release`，把产物放到 `dist-rs/NetworkManager/`（并补上
+`mihomo.exe`），再用 Inno Setup 7 打成安装包，默认安装到当前用户目录并创建开始菜单
+和桌面快捷方式。只想打包已有产物时加 `-SkipBuild`。
+
 输出位于 `release-assets/v<版本>/NetworkManager-Setup-x64-v<版本>.exe`，支持覆盖升级和标准卸载。卸载不会删除 `%LOCALAPPDATA%\NetWorkManger` 中的用户配置。
 
-构建脚本会为当前用户创建桌面快捷方式。也可单独执行：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/create_desktop_shortcut.ps1
-```
+Mihomo 作为独立子进程运行，主程序异常退出时 Windows Job Object 会清理核心。
 
 ## Android 开发与测试
 
@@ -107,7 +105,7 @@ node --check src/network_manager/web/app.js
 python scripts/smoke_webgui.py http://127.0.0.1:<port>/ --poll-seconds 10
 ```
 
-测试覆盖配置迁移、订阅格式、Mihomo 配置、实时流量计算、本地 API 鉴权、Windows 凭据加密、服务器部署配置和分享链接回读。
+测试覆盖配置迁移、订阅格式、Mihomo 配置、实时流量计算、本地 API 鉴权、Windows 凭据加密和服务器部署配置。Windows 桌面 GUI 的 Python 测试随那套界面一起删除，其行为由 Rust 侧的构建校验代替。
 
 ## 数据与安全
 

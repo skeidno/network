@@ -1,4 +1,4 @@
-from network_manager.app import main
+from network_manager.headless import main
 
 
 if __name__ == "__main__":
