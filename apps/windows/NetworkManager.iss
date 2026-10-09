@@ -45,7 +45,10 @@ VersionInfoProductName={#MyAppName}
 VersionInfoProductVersion={#MyAppVersion}
 
 [Languages]
-Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+; 中文语言文件随仓库提供（apps\windows\languages\）。不能再用
+; compiler:Languages\ChineseSimplified.isl —— CI 上的 Inno Setup 并不带这个
+; 语言包，编译会直接中止。文件必须带 UTF-8 BOM，否则会被按 ANSI 读成乱码。
+Name: "chinesesimp"; MessagesFile: "languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
