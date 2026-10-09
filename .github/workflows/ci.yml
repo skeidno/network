@@ -51,12 +51,28 @@ jobs:
         with:
           name: network-manager-linux-x86_64
           path: rust/target/release/network-manager-rs
-      # 冒烟：参数解析正常，且能以服务方式起起来（timeout 到点送 SIGTERM，
-      # 正好验证 systemd stop 用的那条退出路径）。
+      # 冒烟：参数解析正常，能起服务并回答一次 HTTP，且收到 SIGTERM 能干净退出
+      # （systemd stop 走的就是这条路径）。
       - run: |
           ./rust/target/release/network-manager-rs --help
-          NETWORK_MANAGER_WEB_PORT=19091 timeout --preserve-status 10 \
-            ./rust/target/release/network-manager-rs --headless || true
+          NETWORK_MANAGER_WEB_PORT=19091 NETWORK_MANAGER_DATA_DIR=/tmp/nm-smoke \
+            ./rust/target/release/network-manager-rs &
+          pid=$!
+          for _ in $(seq 1 30); do
+            if curl -sf -o /tmp/nm-smoke.html http://127.0.0.1:19091/; then break; fi
+            sleep 1
+          done
+          grep -q "Network Manager" /tmp/nm-smoke.html
+          # 严格判定：收到 SIGTERM 后应当正常收尾退出（0）。崩溃或被信号打死会非 0。
+          kill -TERM "${pid}"
+          wait "${pid}"
+      # 顺手把可直接安装的发布包打出来：Windows 上交叉编不出 Linux 二进制，
+      # 所以 Linux 的发布包只能由这里的 runner 出。
+      - run: python3 scripts/build_linux_release.py --output release --arch amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NetworkManager-Linux-amd64
+          path: release/NetworkManager-Linux-amd64-*.tar.gz
 
   test-windows:
     runs-on: windows-latest

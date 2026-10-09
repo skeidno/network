@@ -21,9 +21,12 @@ def test_linux_mihomo_assets_match_installer() -> None:
 
 def test_linux_installer_prefers_bundled_release_files() -> None:
     installer = (ROOT / "apps/linux/install.sh").read_text(encoding="utf-8")
-    assert 'wheel_candidates=("${SCRIPT_ROOT}"/network_manager-*.whl)' in installer
+    # 程序本体是 Rust 单文件二进制，不再有 Python wheel / venv / pip。
+    assert 'binary_candidates=(' in installer
+    assert '"${SCRIPT_ROOT}/network-manager-rs"' in installer
     assert '"${SCRIPT_ROOT}/${MIHOMO_ASSET}"' in installer
     assert 'SERVICE_SOURCE="${SCRIPT_ROOT}/network-manager.service"' in installer
+    assert "venv/bin/python" not in installer
 
 
 def test_linux_release_builder_is_loadable() -> None:
@@ -32,10 +35,10 @@ def test_linux_release_builder_is_loadable() -> None:
     assert namespace["sha256"](ROOT / "pyproject.toml")
 
 
-def test_linux_service_uses_headless_entrypoint_and_tun_capability() -> None:
+def test_linux_service_runs_rust_binary_with_tun_capability() -> None:
     service = (ROOT / "apps/linux/network-manager.service").read_text(encoding="utf-8")
-    assert "ExecStart=/opt/network-manager/venv/bin/network-manager-headless" in service
-    assert "network-manager-headless --start-core" not in service
+    assert "ExecStart=/opt/network-manager/bin/network-manager-rs" in service
+    assert "venv" not in service
     assert "EnvironmentFile=/etc/network-manager/network-manager.env" in service
     assert "CAP_NET_ADMIN" in service
     assert "CAP_SYS_PTRACE" in service

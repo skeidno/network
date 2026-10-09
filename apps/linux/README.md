@@ -6,13 +6,12 @@ Linux 版不创建桌面窗口。它以 systemd 服务运行 Mihomo TUN 核心�
 
 - x86_64 / amd64
 - aarch64 / arm64
-- Python 3.10+
 - systemd
 - `/dev/net/tun`
 
+程序本体是一个 Rust 单文件二进制，不依赖 Python / 运行时环境；安装脚本也不需要联网装依赖。
 安装脚本固定使用 Mihomo `v1.19.30`，安装前必须通过仓库记录的 SHA-256 校验。
-GitHub Release 中按架构提供的安装包已经包含 Mihomo 和 Python wheel，不依赖服务器现场下载核心。
-Ubuntu/Debian 缺少 `python3-venv` 时，安装脚本会通过 `apt-get` 自动补齐。
+GitHub Release 中按架构提供的安装包已经包含 Mihomo 和 `network-manager-rs` 二进制，不依赖服务器现场下载核心。
 
 ## 安装
 
@@ -56,11 +55,9 @@ sudo journalctl -u network-manager -f
 ## 手动开发运行
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e .
+cd rust && cargo build --release
 NETWORK_MANAGER_WEB_PASSWORD='replace-this-password' \
-  network-manager-headless --listen 127.0.0.1 --port 9091
+  ./rust/target/release/network-manager-rs --listen 127.0.0.1 --port 9091
 ```
 
 启动 TUN 需要 root 或等效的 `CAP_NET_ADMIN` / `CAP_NET_RAW` 权限。WebGUI 服务可以普通用户启动，但此时无法启动全流量接管。

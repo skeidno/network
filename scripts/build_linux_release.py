@@ -5,7 +5,6 @@ import hashlib
 import json
 import shutil
 import subprocess
-import sys
 import tarfile
 import tempfile
 import urllib.request
@@ -44,16 +43,23 @@ def verified_core(asset: dict[str, str], core_dir: Path, version: str) -> Path:
     return path
 
 
-def build_wheel(output_dir: Path) -> Path:
+def build_binary(output_dir: Path) -> Path:
+    """编出 Linux 二进制。
+
+    Linux 产物是 Rust 单文件，必须在本机（或 CI 的 ubuntu runner）上用 cargo 编；
+    Windows 上交叉编译缺 glibc 目标，编不出来，所以这里只负责调 cargo，不做交叉编译。
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        [sys.executable, "-m", "build", "--wheel", "--outdir", str(output_dir), str(ROOT)],
+        ["cargo", "build", "--release", "--manifest-path", str(ROOT / "rust" / "Cargo.toml")],
         check=True,
     )
-    wheels = list(output_dir.glob("network_manager-*.whl"))
-    if len(wheels) != 1:
-        raise RuntimeError(f"Expected one wheel, found {len(wheels)}")
-    return wheels[0]
+    built = ROOT / "rust" / "target" / "release" / "network-manager-rs"
+    if not built.is_file():
+        raise RuntimeError(f"cargo 没有产出 {built}")
+    staged = output_dir / "network-manager-rs"
+    shutil.copy2(built, staged)
+    return staged
 
 
 def tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo:
@@ -76,6 +82,19 @@ def main() -> int:
     parser.add_argument(
         "--core-dir", type=Path, default=Path(tempfile.gettempdir()), help="Mihomo cache"
     )
+    parser.add_argument(
+        "--binary",
+        type=Path,
+        default=None,
+        help="已经编好的 network-manager-rs（不给就在这里调 cargo build）",
+    )
+    parser.add_argument(
+        "--arch",
+        action="append",
+        choices=["amd64", "arm64"],
+        help="只打指定架构的包（可重复）；默认全部。二进制是架构相关的，"
+        "在哪个机器上编的就得只打那个架构。",
+    )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
 
@@ -83,9 +102,15 @@ def main() -> int:
     app_version = project_version()
     with tempfile.TemporaryDirectory(prefix="network-manager-linux-build-") as temp_value:
         temp_root = Path(temp_value)
-        wheel = build_wheel(temp_root / "wheel")
+        if args.binary is not None:
+            binary = temp_root / "network-manager-rs"
+            shutil.copy2(args.binary, binary)
+        else:
+            binary = build_binary(temp_root)
         archives: list[Path] = []
         for arch, asset in core_manifest["assets"].items():
+            if args.arch and arch not in args.arch:
+                continue
             core = verified_core(asset, args.core_dir, core_manifest["version"])
             package_name = f"NetworkManager-Linux-{arch}-v{app_version}"
             package_root = temp_root / package_name
@@ -96,14 +121,16 @@ def main() -> int:
                 LINUX_ROOT / "README.md",
             ):
                 copy_release_text(source, package_root / source.name)
-            shutil.copy2(wheel, package_root / wheel.name)
+            # 同一个二进制打进每个架构包：install.sh 按 uname -m 挑 mihomo，
+            # 程序本体则要求包与机器架构匹配（发布时包名已标明 arch）。
+            shutil.copy2(binary, package_root / binary.name)
             shutil.copy2(core, package_root / core.name)
             release_manifest = {
                 "applicationVersion": app_version,
                 "architecture": arch,
                 "mihomoVersion": core_manifest["version"],
                 "files": {
-                    wheel.name: sha256(package_root / wheel.name),
+                    binary.name: sha256(package_root / binary.name),
                     core.name: sha256(package_root / core.name),
                 },
             }

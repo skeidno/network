@@ -15,7 +15,8 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-for command_name in python3 curl sha256sum gzip systemctl; do
+# Python 那套已经换成 Rust 单文件二进制，安装不再需要 python3 / pip / venv。
+for command_name in curl sha256sum gzip systemctl install; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "Missing required command: ${command_name}" >&2
     exit 1
@@ -39,14 +40,29 @@ case "$(uname -m)" in
     ;;
 esac
 
-wheel_candidates=("${SCRIPT_ROOT}"/network_manager-*.whl)
-if [[ -f "${wheel_candidates[0]}" ]]; then
-  PYTHON_PACKAGE="${wheel_candidates[0]}"
-elif [[ -f "${PROJECT_ROOT}/pyproject.toml" ]]; then
-  PYTHON_PACKAGE="${PROJECT_ROOT}"
-else
-  echo "Installer package is incomplete: Python wheel or source checkout not found." >&2
-  exit 1
+# 发布包里带的是已经编译好的二进制（按架构命名或统一命名）。
+binary_candidates=(
+  "${SCRIPT_ROOT}/network-manager-rs"
+  "${SCRIPT_ROOT}/network-manager-rs-linux-${ARCH_KEY}"
+)
+APP_BINARY=""
+for candidate in "${binary_candidates[@]}"; do
+  if [[ -f "${candidate}" ]]; then
+    APP_BINARY="${candidate}"
+    break
+  fi
+done
+if [[ -z "${APP_BINARY}" ]]; then
+  # 从源码目录安装时现场编译：需要 rust 工具链，服务器上一般走发布包而不是这条路。
+  if command -v cargo >/dev/null 2>&1 && [[ -f "${PROJECT_ROOT}/rust/Cargo.toml" ]]; then
+    echo "No bundled binary found; building from source with cargo."
+    (cd "${PROJECT_ROOT}/rust" && cargo build --release)
+    APP_BINARY="${PROJECT_ROOT}/rust/target/release/network-manager-rs"
+  else
+    echo "Installer package is incomplete: network-manager-rs binary not found." >&2
+    echo "Use a release archive, or install a Rust toolchain and run from a source checkout." >&2
+    exit 1
+  fi
 fi
 
 if [[ -f "${SCRIPT_ROOT}/network-manager.service" ]]; then
@@ -61,24 +77,7 @@ fi
 
 install -d -m 0755 "${INSTALL_ROOT}/bin" "${CONFIG_ROOT}" "${DATA_ROOT}"
 
-if [[ ! -x "${INSTALL_ROOT}/venv/bin/python" ]]; then
-  if ! python3 -m venv "${INSTALL_ROOT}/venv"; then
-    if command -v apt-get >/dev/null 2>&1; then
-      echo "Python venv support is missing; installing python3-venv."
-      apt-get update
-      DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv
-      python3 -m venv --clear "${INSTALL_ROOT}/venv"
-    else
-      echo "Python venv support is missing. Install the Python venv package and run again." >&2
-      exit 1
-    fi
-  fi
-fi
-"${INSTALL_ROOT}/venv/bin/python" -m pip install \
-  --disable-pip-version-check \
-  --upgrade \
-  --force-reinstall \
-  "${PYTHON_PACKAGE}"
+install -m 0755 "${APP_BINARY}" "${INSTALL_ROOT}/bin/network-manager-rs"
 
 temp_root="$(mktemp -d)"
 trap 'rm -rf -- "${temp_root}"' EXIT
@@ -105,7 +104,12 @@ env_file="${CONFIG_ROOT}/network-manager.env"
 created_credentials="false"
 if [[ ! -f "${env_file}" ]]; then
   umask 077
-  web_password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+  # 不再依赖 python3 生成口令：优先 openssl，退回 /dev/urandom。
+  if command -v openssl >/dev/null 2>&1; then
+    web_password="$(openssl rand -base64 24 | tr -d '\n')"
+  else
+    web_password="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+  fi
   {
     echo "NETWORK_MANAGER_WEB_HOST=127.0.0.1"
     echo "NETWORK_MANAGER_WEB_PORT=9091"
@@ -114,9 +118,6 @@ if [[ ! -f "${env_file}" ]]; then
   } > "${env_file}"
   created_credentials="true"
 fi
-if ! grep -q '^NETWORK_MANAGER_SSH_PORTS=' "${env_file}"; then
-  echo "NETWORK_MANAGER_SSH_PORTS=22" >> "${env_file}"
-fi
 chmod 0600 "${env_file}"
 
 install -m 0644 "${SERVICE_SOURCE}" "${SERVICE_PATH}"
@@ -124,8 +125,14 @@ systemctl daemon-reload
 systemctl enable network-manager.service >/dev/null
 systemctl restart network-manager.service
 
+# 老版本留下的 Python 虚拟环境已经没人用了，服务起成功后清掉，省几十 MB。
+if [[ -d "${INSTALL_ROOT}/venv" ]]; then
+  rm -rf -- "${INSTALL_ROOT}/venv"
+  echo "Removed the obsolete Python virtualenv at ${INSTALL_ROOT}/venv."
+fi
+
 echo
-echo "Network Manager Linux WebGUI service is installed and running."
+echo "Network Manager Linux service is installed and running (Rust binary)."
 echo "Import and test a proxy configuration before starting TUN interception."
 echo "Local WebGUI: http://127.0.0.1:9091/"
 echo "Remote access (recommended): ssh -L 9091:127.0.0.1:9091 <user>@<server>"

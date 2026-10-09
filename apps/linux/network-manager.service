@@ -11,7 +11,9 @@ Group=root
 EnvironmentFile=/etc/network-manager/network-manager.env
 Environment=NETWORK_MANAGER_DATA_DIR=/var/lib/network-manager
 Environment=NETWORK_MANAGER_CORE=/opt/network-manager/bin/mihomo
-ExecStart=/opt/network-manager/venv/bin/network-manager-headless
+# Linux 上没有原生界面：这条服务就是程序本体，管理页面用浏览器打开上面的端口。
+# 结束用 SIGTERM（systemctl stop），进程收到后先停内核再退出。
+ExecStart=/opt/network-manager/bin/network-manager-rs
 Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=20s
