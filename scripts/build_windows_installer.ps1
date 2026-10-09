@@ -9,11 +9,62 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $ProjectRoot
 
+# Fetch the pinned official Mihomo core: download the zip, verify its SHA-256,
+# then extract the single exe into vendor\. This used to be scripts/download_mihomo.py;
+# folding it in means packaging never stops on a missing core.
+function Ensure-MihomoCore {
+  param([string]$VendorDir)
+
+  $target = Join-Path $VendorDir "mihomo.exe"
+  if (Test-Path -LiteralPath $target -PathType Leaf) {
+    Write-Host "Mihomo is already available: $target"
+    return $target
+  }
+
+  $metadataPath = Join-Path $VendorDir "mihomo.version.json"
+  if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
+    throw "Mihomo metadata was not found: $metadataPath"
+  }
+  $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+  $coreVersion = [string]$metadata.version
+  $asset = [string]$metadata.asset
+  $expected = ([string]$metadata.sha256).ToLower()
+
+  $archive = Join-Path $VendorDir ($asset + ".zip.tmp")
+  $extractDir = Join-Path $VendorDir "mihomo-extract.tmp"
+  $url = "https://github.com/MetaCubeX/mihomo/releases/download/$coreVersion/$asset"
+  Write-Host "Downloading $url"
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $url -OutFile $archive -UserAgent "NetworkManager-Build" -UseBasicParsing
+    $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLower()
+    if ($actual -ne $expected) {
+      throw "Mihomo checksum mismatch: expected $expected, got $actual"
+    }
+    if (Test-Path -LiteralPath $extractDir) {
+      Remove-Item -LiteralPath $extractDir -Recurse -Force
+    }
+    Expand-Archive -LiteralPath $archive -DestinationPath $extractDir -Force
+    $exe = @(Get-ChildItem -LiteralPath $extractDir -Recurse -Filter *.exe -File)
+    if ($exe.Count -ne 1) {
+      throw "Mihomo package did not contain exactly one executable (found $($exe.Count))"
+    }
+    Move-Item -LiteralPath $exe[0].FullName -Destination $target -Force
+  }
+  finally {
+    if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
+    if (Test-Path -LiteralPath $extractDir) { Remove-Item -LiteralPath $extractDir -Recurse -Force }
+  }
+  Write-Host "Installed Mihomo $coreVersion -> $target"
+  return $target
+}
+
 if (-not $Version) {
-  $project = Get-Content -LiteralPath (Join-Path $ProjectRoot "pyproject.toml") -Raw
-  $match = [regex]::Match($project, '(?m)^version\s*=\s*"([^"]+)"')
+  # The version lives in rust\Cargo.toml now: Rust is the only product code.
+  $cargo = Get-Content -LiteralPath (Join-Path $ProjectRoot "rust\Cargo.toml")
+  $match = [regex]::Match(($cargo -join "`n"), '(?m)^version\s*=\s*"([^"]+)"')
   if (-not $match.Success) {
-    throw "Project version was not found in pyproject.toml"
+    throw "Project version was not found in rust\Cargo.toml"
   }
   $Version = $match.Groups[1].Value
 }
@@ -22,9 +73,9 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
   throw "Installer version must use MAJOR.MINOR.PATCH: $Version"
 }
 
-# Windows 桌面端只有一个来源：Rust 编出来的单个 exe，旁边放一份 mihomo.exe。
-# 以前这里还有一条 PyInstaller 打包 Python 桌面 GUI 的分支（scripts/build_windows.ps1），
-# 那套 PySide6 界面已经被 Rust 版取代并删除。
+# The Windows desktop app has a single source: the Rust single-file exe,
+# with mihomo.exe sitting next to it. (The old PyInstaller branch for the
+# PySide6 GUI is gone; that interface was replaced by the Rust build.)
 $sourceDir = Join-Path $ProjectRoot "dist-rs\NetworkManager"
 
 if (-not $SkipBuild) {
@@ -46,13 +97,8 @@ Copy-Item -LiteralPath $built -Destination (Join-Path $sourceDir "NetworkManager
 
 $core = Join-Path $sourceDir "mihomo.exe"
 if (-not (Test-Path -LiteralPath $core -PathType Leaf)) {
-  $vendored = Join-Path $ProjectRoot "vendor\mihomo.exe"
-  if (Test-Path -LiteralPath $vendored -PathType Leaf) {
-    Copy-Item -LiteralPath $vendored -Destination $core -Force
-  }
-  else {
-    throw "mihomo.exe was not found beside the app or under vendor\"
-  }
+  $vendored = Ensure-MihomoCore -VendorDir (Join-Path $ProjectRoot "vendor")
+  Copy-Item -LiteralPath $vendored -Destination $core -Force
 }
 
 $executable = Join-Path $sourceDir "NetworkManager.exe"

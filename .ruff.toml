@@ -1,7 +1,0 @@
-# Python 只在 scripts/ 下还有几个构建/校验脚本（下载内核、打包发布包、WebGUI 冒烟），
-# 产品代码已经是 Rust，所以不再需要 pyproject.toml 描述包，配置单独放这里。
-line-length = 100
-target-version = "py310"
-
-[lint]
-select = ["E4", "E7", "E9", "F"]
