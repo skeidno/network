@@ -16,35 +16,12 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::WindowBuilder;
 
+pub use crate::gui_common::*;
+
 use crate::server::Shared;
 use crate::tray::TrayCommand;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppEvent {
-    Show,
-    Hide,
-    Minimize,
-    Maximize,
-    Close,
-    Quit,
-    /// 托盘线程发来的命令（打开界面 / 启停内核 / 退出）。
-    Tray(TrayCommand),
-}
-
-pub struct Shell {
-    pub url: String,
-    pub title: String,
-    pub width: f64,
-    pub height: f64,
-    pub close_to_tray: bool,
-    pub start_hidden: bool,
-}
-
 static PROXY: OnceLock<Mutex<Option<EventLoopProxy<AppEvent>>>> = OnceLock::new();
-
-/// 事件循环内部出现异常（被 catch_unwind 收住）时的返回标记，
-/// main 据此收掉内核后退出，而不是退回「开浏览器 + 等 Ctrl-C」的兜底路径。
-pub const LOOP_CRASHED: &str = "event-loop-crashed";
 
 /// Bridge used by the HTTP command layer to drive the desktop shell.
 pub fn send(event: AppEvent) {
@@ -190,31 +167,6 @@ fn hide_to_tray(window: &tao::window::Window, hidden: &mut bool) {
     *hidden = true;
     set_window_visible(false);
     notify_hidden_once();
-}
-
-/// 界面事件流水账（logs/gui.log）。
-///
-/// 「程序自己退了」这类问题最难查的地方是没有控制台，什么痕迹都不留。这里把
-/// 事件循环的关键分支记一笔，出问题时能直接看出是哪条退出路径被走到了。
-pub fn trace(text: &str) {
-    use std::io::Write;
-    let path = crate::paths::logs_dir().join("gui.log");
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > 64 * 1024 {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = writeln!(file, "{now} {text}");
-    }
 }
 
 /// 第一次退到后台时弹一条气泡，告诉用户程序在哪儿、怎么叫回来。

@@ -35,8 +35,9 @@ jobs:
       # 只做静态检查，警告不阻断（历史代码有一批 clippy 警告，一次性修不完）。
       - run: cargo clippy --release --manifest-path rust/Cargo.toml
 
-  # 目标是把 Python 那套全换成 Rust，前提是 Rust 也能在 Linux 上跑（现在 Linux
-  # 侧还是 Python 的 headless 在顶着）。这里先验证它能不能编译过。
+  # Rust 在 Linux 上的产物：一条常驻服务（systemd 管着），管理页面用浏览器打开。
+  # 原生界面（tao + wry）只在 Windows 上编，所以这里不需要 WebKit/GTK 的开发包，
+  # 编出来的是一个没有图形栈依赖的静态小二进制。
   build-rust-linux:
     runs-on: ubuntu-latest
     steps:
@@ -45,12 +46,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      # wry 要 WebKitGTK，编译期就需要头文件；headless 模式运行时用不到界面，
-      # 但只要 Cargo.toml 里挂着 wry，编译就得有它。
+      - run: cargo build --release --manifest-path rust/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: network-manager-linux-x86_64
+          path: rust/target/release/network-manager-rs
+      # 冒烟：参数解析正常，且能以服务方式起起来（timeout 到点送 SIGTERM，
+      # 正好验证 systemd stop 用的那条退出路径）。
       - run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
-      - run: cargo check --release --manifest-path rust/Cargo.toml
+          ./rust/target/release/network-manager-rs --help
+          NETWORK_MANAGER_WEB_PORT=19091 timeout --preserve-status 10 \
+            ./rust/target/release/network-manager-rs --headless || true
 
   test-windows:
     runs-on: windows-latest

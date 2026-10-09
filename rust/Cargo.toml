@@ -28,7 +28,6 @@ url = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 data-encoding = "2"
 percent-encoding = "2"
-tao = { version = "0.35", features = ["rwh_06"] }
 # Minimal SSH-2 client (no external ssh.exe / SSH_ASKPASS dependency).
 ring = "0.17"
 aes = "0.8"
@@ -36,7 +35,11 @@ sha2 = "0.10"
 hmac = "0.12"
 num-bigint-dig = "0.8"
 
+# 原生界面只给 Windows：Linux 上的形态是服务器（systemd 常驻 + 浏览器访问
+# 管理页），把 GTK/WebKit 整套图形栈编进来既用不上，也会让发布包和构建环境
+# 平白变重（要 libwebkit2gtk-4.1-dev 才能编过）。Linux 走 --headless 常驻服务。
 [target.'cfg(target_os = "windows")'.dependencies]
+tao = { version = "0.35", features = ["rwh_06"] }
 wry = "0.55"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
@@ -51,13 +54,7 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-wry = "0.55"
-
-[target.'cfg(target_vendor = "apple")'.dependencies]
-wry = "0.55"
-
-[build-dependencies]
+[target.'cfg(target_os = "windows")'.build-dependencies]
 # 把应用图标嵌进 exe（Windows 资源），与 Python 版 spec 里的 icon= 保持一致。
 embed-resource = "3.0"
 

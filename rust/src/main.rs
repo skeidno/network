@@ -6,7 +6,14 @@
 mod core;
 mod credentials;
 mod deploy;
+// 原生界面只在 Windows 上编（tao + wry）；Linux 的形态是常驻服务，用同名的
+// 空实现顶住，这样命令层照旧调用 crate::gui::*，不需要到处写 cfg。
+#[cfg(windows)]
 mod gui;
+#[cfg(not(windows))]
+#[path = "gui_stub.rs"]
+mod gui;
+mod gui_common;
 mod importers;
 mod methods;
 mod mihomo;
@@ -101,8 +108,11 @@ fn print_help() {
          \x20 --username <name>   Basic 认证用户名（默认 admin）\n\
          \x20 --password <secret> Basic 认证密码（环境变量 NETWORK_MANAGER_WEB_PASSWORD）\n\
          \x20 --start-core        启动 WebGUI 时自动拉起内核\n\
-         \x20 --headless          仅运行 HTTP 服务，不创建原生窗口\n\
-         \x20 --startup           随系统启动：隐藏窗口，仅驻留托盘\n"
+         \x20 --headless          仅运行 HTTP 服务，不创建原生窗口（Windows）\n\
+         \x20 --startup           随系统启动：隐藏窗口，仅驻留托盘（Windows）\n\
+         \n\
+         Linux 上没有原生界面，程序始终以常驻服务方式运行，管理页面用浏览器打开\n\
+         上面打印的地址；用 SIGTERM（systemctl stop）结束。\n"
     );
 }
 
@@ -214,21 +224,32 @@ fn is_loopback(host: &str) -> bool {
     matches!(host.to_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1")
 }
 
+/// 等到进程被要求退出（systemd stop 发 SIGTERM，前台 Ctrl-C 发 SIGINT）。
+///
+/// 退出前必须回到 main 做收尾：内核是子进程，直接被杀会留下残留的转发规则。
+async fn wait_for_exit_signal() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate())?;
+        let mut int = signal(SignalKind::interrupt())?;
+        tokio::select! {
+            _ = term.recv() => {},
+            _ = int.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn open_in_browser(url: &str) {
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("rundll32")
-            .args(["url.dll,FileProtocolHandler", url])
-            .spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(url).spawn();
-    }
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    }
+    let _ = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn();
 }
 
 /// GUI 子系统启动时没有控制台，`println!` 会被丢弃。
@@ -300,6 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(err) => eprintln!("内核启动失败：{err}"),
         }
     }
+    #[cfg(windows)]
     let close_to_tray = app.config.close_to_tray;
 
     let shared: Shared = Arc::new(Mutex::new(app));
@@ -318,49 +340,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = display_url(&options.host, bound.port());
     println!("Network Manager {VERSION} WebGUI: {url}");
 
-    if options.headless {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut term = signal(SignalKind::terminate())?;
-            let mut int = signal(SignalKind::interrupt())?;
-            tokio::select! {
-                _ = term.recv() => {},
-                _ = int.recv() => {},
+    #[cfg(windows)]
+    {
+        if options.headless {
+            wait_for_exit_signal().await?;
+        } else {
+            let shell = crate::gui::Shell {
+                url: url.clone(),
+                title: format!("Network Manager {VERSION}"),
+                width: 1280.0,
+                height: 860.0,
+                close_to_tray,
+                start_hidden: options.start_hidden,
+            };
+            let result = crate::gui::run(shell, shared.clone());
+            crate::gui::trace(&format!("main: gui::run 返回 ok={}", result.is_ok()));
+            if let Err(err) = result {
+                eprintln!("界面退出：{err}");
+                if err == crate::gui::LOOP_CRASHED {
+                    // 事件循环崩了：收掉内核再退出，不要挂着一个没有界面的进程。
+                    let mut state = shared.lock().await;
+                    let _ = state.core.stop();
+                    return Err(err.into());
+                }
+                // 其他情况（比如窗口创建失败）退回浏览器兜底。
+                if options.open_browser {
+                    open_in_browser(&url);
+                }
+                tokio::signal::ctrl_c().await?;
             }
         }
-        #[cfg(not(unix))]
-        {
-            tokio::signal::ctrl_c().await?;
-        }
-        let mut state = shared.lock().await;
-        let _ = state.core.stop();
-        return Ok(());
     }
 
-    let shell = crate::gui::Shell {
-        url: url.clone(),
-        title: format!("Network Manager {VERSION}"),
-        width: 1280.0,
-        height: 860.0,
-        close_to_tray,
-        start_hidden: options.start_hidden,
-    };
-    let result = crate::gui::run(shell, shared.clone());
-    crate::gui::trace(&format!("main: gui::run 返回 ok={}", result.is_ok()));
-    if let Err(err) = result {
-        eprintln!("界面退出：{err}");
-        if err == crate::gui::LOOP_CRASHED {
-            // 事件循环崩了：收掉内核再退出，不要挂着一个没有界面的进程。
-            let mut state = shared.lock().await;
-            let _ = state.core.stop();
-            return Err(err.into());
-        }
-        // 其他情况（比如窗口创建失败）退回浏览器兜底。
-        if options.open_browser {
-            open_in_browser(&url);
-        }
-        tokio::signal::ctrl_c().await?;
+    // Linux：没有原生界面，程序就是一条常驻服务（systemd 管着），管理页面用浏览器
+    // 打开上面打印的地址。等到 SIGTERM/SIGINT 再往下走收尾。
+    #[cfg(not(windows))]
+    {
+        wait_for_exit_signal().await?;
     }
 
     let mut state = shared.lock().await;
