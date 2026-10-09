@@ -176,14 +176,19 @@ fn background_mode_enabled(shared: &Shared, fallback: bool) -> bool {
     }
 }
 
-/// 退到后台：窗口最小化，代理内核继续跑，托盘图标留着给用户一个入口。
+/// 关闭界面、退到托盘：窗口真正隐藏，任务栏按钮也一起消失，代理内核继续跑，
+/// 托盘图标是唯一的唤回入口。
 ///
-/// Windows 11 会把首次注册的托盘图标收进「隐藏的图标」溢出区，鼠标点不到
-/// （见 [`crate::tray`] 的排查记录），所以用最小化而不是 `set_visible(false)`：
-/// 任务栏按钮一直在，点一下就回来，不依赖托盘在水面还是溢出区。
-fn minimize_to_tray(window: &tao::window::Window) {
-    window.set_minimized(true);
-    set_window_visible(true);
+/// 用隐藏而不是最小化：用户点关闭要的是「界面关掉」，最小化会在任务栏留一个按钮，
+/// 看着像没关干净。代价是 WebView2 会销毁承载画面与鼠标输入的渲染窗口并且不会自己
+/// 重建，所以这里置 `hidden` 标记，唤回时由 show_window 重建 WebView。
+///
+/// 先隐藏再还原最小化状态，顺序反过来（先还原）会让最小化的窗口在屏幕上闪一帧。
+fn hide_to_tray(window: &tao::window::Window, hidden: &mut bool) {
+    window.set_visible(false);
+    window.set_minimized(false);
+    *hidden = true;
+    set_window_visible(false);
     notify_hidden_once();
 }
 
@@ -317,12 +322,12 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
                         trace(&format!(
                             "CloseRequested quitting={quitting} 后台运行={tray}"
                         ));
-                        // 默认（tray=false）就是正常程序该有的行为：关了就退，
-                        // 任务栏按钮和托盘图标一起消失，不用去任务管理器收尸。
+                        // 默认（tray=true）关闭界面、退到托盘继续跑，托盘能点能唤回；
+                        // 用户在设置里取消「后台运行」或走了退出命令，才真的结束进程。
                         if quitting || !tray {
                             request_exit(control);
                         } else {
-                            minimize_to_tray(&window);
+                            hide_to_tray(&window, &mut window_hidden);
                         }
                     }
                     WindowEvent::Destroyed => {
@@ -352,18 +357,16 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
                         trace("UserEvent::Show");
                         show_window(&window, &mut webview, &url, &mut window_hidden)
                     }
-                    // 自定义标题栏的关闭按钮和窗口的 X 走同一条路径：默认真的退出，
-                    // 用户显式打开「关闭后继续在后台运行」时才收进后台。
+                    // 自定义标题栏的关闭按钮和窗口的 X 走同一条路径：默认关闭界面、
+                    // 退到托盘继续跑，用户在设置里取消「后台运行」才真的退出。
                     AppEvent::Hide | AppEvent::Close => {
-                        // 和标题栏的 X 完全一致：默认真的退出，用户显式开了
-                        // 「后台运行」才收进后台。
                         let tray = background_mode_enabled(&loop_shared, close_to_tray);
                         trace(&format!("UserEvent::Hide/Close 后台运行={tray}"));
                         if !tray {
                             quitting = true;
                             request_exit(control);
                         } else {
-                            minimize_to_tray(&window);
+                            hide_to_tray(&window, &mut window_hidden);
                         }
                     }
                     AppEvent::Minimize => window.set_minimized(true),

@@ -2,7 +2,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const CONFIG_VERSION: i32 = 10;
+pub const CONFIG_VERSION: i32 = 11;
 pub const DEFAULT_SERVER_PROXY_PORT: i32 = 24443;
 pub const COMMON_OVERSEAS_GROUP: &str = "common-overseas";
 pub const NODE_DIALER_PROXY_KEY: &str = "_network-manager-dialer-proxy";
@@ -269,10 +269,12 @@ impl Default for AppConfig {
             controller_secret: default_controller_secret(),
             strict_route: true,
             start_on_launch: false,
-            // 关闭窗口默认就是退出程序：Windows 11 会把首次注册的托盘图标收进
-            // 「隐藏的图标」溢出区，关到托盘等于给用户留一个点不到的图标，只能去
-            // 任务管理器杀进程。需要长期托管的场景在设置里显式打开后台运行。
-            close_to_tray: false,
+            // 关闭窗口默认只收起界面、程序退到托盘继续跑（这是托盘类程序的常规行为）。
+            // 之前默认关闭即退出，是因为托盘点击唤不回界面 —— 那是托盘消息链路的 bug
+            // （explorer 用 SendMessage 投递、通知码在 lParam 低位字），已经修好了，
+            // 见 rust/src/tray.rs 的记录。要完整退出用设置页的「退出并停止接管」
+            // 或托盘菜单的退出；想让 X 直接退出就把这个开关取消勾选。
+            close_to_tray: true,
             start_with_windows: false,
             clash: default_clash(),
             v2ray: default_v2ray(),

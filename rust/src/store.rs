@@ -46,16 +46,16 @@ pub fn load() -> AppConfig {
     }
 }
 
-/// 老配置文件的一次性纠正。
+/// 老配置文件里 `close_to_tray` 的一次性纠正。
 ///
-/// v9 及更早版本里 `closeToTray` 一直是 true，但那不是用户的选择：当时界面上那个
-/// 开关是灰的（`disabled`），只能接受。而 true 意味着点关闭只收起窗口、程序不退，
-/// 配上 Windows 11 把托盘图标收进溢出区（见 [`crate::tray`]），就成了「关不掉、
-/// 托盘又点不到、只能去任务管理器杀进程」。现在默认改回「关闭即退出」，存量配置
-/// 也一并纠正，否则升级后行为完全没变。
+/// v10 时把它统一改成了 false（关闭即退出），理由是「托盘图标被 Windows 11 收进
+/// 溢出区、点不到」。那个结论是错的：托盘收不到消息的真实原因是通知走 SendMessage
+/// 不进消息队列、且通知码在 lParam 低位字 —— 那两个 bug 已经修好了（见
+/// [`crate::tray`]）。托盘现在能点能唤回，默认值也就回到托盘类程序该有的行为：
+/// 关闭只收起界面，程序继续在后台跑。存量配置一并纠正，否则升级后行为没变化。
 /// 返回是否真的改动了（决定是否要重新落盘）。
 fn migrate(config: &mut AppConfig, stored_version: i64) -> bool {
-    if stored_version >= 10 {
+    if stored_version >= 11 {
         return false;
     }
     let before = config.close_to_tray;
