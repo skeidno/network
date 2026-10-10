@@ -21,8 +21,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -31,6 +29,7 @@ import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -38,6 +37,7 @@ import androidx.compose.material.icons.automirrored.filled.Rule
 import androidx.compose.material.icons.filled.AccountTree
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteOutline
@@ -48,13 +48,12 @@ import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Link
-import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Speed
-import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
@@ -63,11 +62,14 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -75,13 +77,19 @@ import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -133,6 +141,7 @@ private enum class AppPage(val label: String, val icon: ImageVector) {
     Settings("设置", Icons.Default.Settings),
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NetworkManagerApp(
     viewModel: AppViewModel,
@@ -157,6 +166,21 @@ fun NetworkManagerApp(
         val wideLayout = maxWidth >= 720.dp
         Scaffold(
             snackbarHost = { SnackbarHost(snackbar) },
+            topBar = {
+                TopAppBar(
+                    title = {
+                        Text(
+                            page.label,
+                            modifier = Modifier.testTag("page-title"),
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                    ),
+                )
+            },
             bottomBar = {
                 if (!wideLayout) {
                     NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
@@ -179,14 +203,13 @@ fun NetworkManagerApp(
                     VerticalDivider(Modifier.fillMaxHeight())
                 }
                 Column(Modifier.fillMaxSize()) {
-                    AppHeader(state = state, page = page, onStartVpn = onStartVpn, onStopVpn = onStopVpn)
-                    HorizontalDivider()
                     when (page) {
                         AppPage.Overview -> OverviewPage(
                             state = state,
                             onMode = viewModel::setMode,
                             onShowNodes = { page = AppPage.Nodes },
                             onTestExit = viewModel::testExit,
+                            onToggleVpn = if (state.running) onStopVpn else onStartVpn,
                         )
                         AppPage.Rules -> RulesPage(
                             state = state,
@@ -253,95 +276,158 @@ private fun AppNavigationRail(selected: AppPage, onSelected: (AppPage) -> Unit) 
 }
 
 @Composable
-private fun AppHeader(state: AppState, page: AppPage, onStartVpn: () -> Unit, onStopVpn: () -> Unit) {
-    Surface(color = MaterialTheme.colorScheme.surface) {
-        Row(
-            modifier = Modifier.fillMaxWidth().height(72.dp).padding(horizontal = 20.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            Column {
-                Text(
-                    page.label,
-                    modifier = Modifier.testTag("page-title"),
-                    style = MaterialTheme.typography.headlineSmall,
-                    fontWeight = FontWeight.Bold,
-                )
-                Text("Network Manager", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            Button(
-                onClick = if (state.running) onStopVpn else onStartVpn,
-                enabled = !state.busy,
-                colors = if (state.running) {
-                    ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                        contentColor = MaterialTheme.colorScheme.onSurface,
-                    )
-                } else ButtonDefaults.buttonColors(),
-            ) {
-                Icon(if (state.running) Icons.Default.Stop else Icons.Default.PlayArrow, contentDescription = null)
-                Spacer(Modifier.width(6.dp))
-                Text(if (state.busy) state.statusMessage else if (state.running) "停止" else "接管")
-            }
-        }
-    }
-}
-
-@Composable
 private fun OverviewPage(
     state: AppState,
     onMode: (RoutingMode) -> Unit,
     onShowNodes: () -> Unit,
     onTestExit: () -> Unit,
+    onToggleVpn: () -> Unit,
 ) {
     val selected = state.nodes.firstOrNull { it.id == state.selectedNodeId }
     Column(
-        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        StatusPanel(state)
-        SectionCard(title = "代理模式", icon = Icons.Default.AccountTree) {
-            SegmentedChoice(
-                options = RoutingMode.entries,
-                selected = state.mode,
-                label = { it.label },
-                onSelected = onMode,
-            )
-        }
-        SectionCard(title = "当前节点", icon = Icons.Default.Dns) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text(selected?.name ?: "尚未选择", fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Spacer(Modifier.height(12.dp))
+        ConnectDial(state = state, onToggle = onToggleVpn)
+        ModeSelector(mode = state.mode, onSelected = onMode)
+        TrafficCard(state = state)
+        PreferenceGroup {
+            ListItem(
+                headlineContent = {
+                    Text(selected?.name ?: "尚未选择", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                },
+                supportingContent = {
                     Text(
-                        selected?.let { "${it.protocol} · ${it.server}:${it.port}" } ?: "导入订阅或节点后即可接管",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.bodySmall,
+                        selected?.let { "${it.protocol} · ${it.server}:${it.port}" }
+                            ?: "导入订阅或节点后即可接管",
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
+                },
+                leadingContent = { PrefIcon(Icons.Default.Dns) },
+                trailingContent = { TextButton(onClick = onShowNodes) { Text("更换") } },
+            )
+            HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+            ExitSection(state = state, onTest = onTestExit)
+        }
+        Spacer(Modifier.height(16.dp))
+    }
+}
+
+/** 移动端主控：一颗大圆形开关就是主操作，状态与模式说明放在它下面。 */
+@Composable
+private fun ConnectDial(state: AppState, onToggle: () -> Unit) {
+    Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(contentAlignment = Alignment.Center) {
+            if (state.busy) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(212.dp),
+                    strokeWidth = 6.dp,
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.4f),
+                )
+            }
+            Surface(
+                modifier = Modifier
+                    .size(184.dp)
+                    .clickable(enabled = !state.busy) { onToggle() },
+                shape = CircleShape,
+                color = if (state.running) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.surfaceVariant
+                },
+                contentColor = if (state.running) {
+                    MaterialTheme.colorScheme.onPrimary
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                tonalElevation = if (state.running) 6.dp else 0.dp,
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    Icon(
+                        Icons.Default.PowerSettingsNew,
+                        contentDescription = null,
+                        modifier = Modifier.size(54.dp),
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        if (state.running) "停止接管" else "开始接管",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
                 }
-                TextButton(onClick = onShowNodes) { Text("选择") }
             }
         }
-        ExitPanel(state = state, onTest = onTestExit)
-        TrafficPanel(state)
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(14.dp))
+        Text(
+            when {
+                state.busy -> state.statusMessage
+                state.running -> "接管中 · ${state.mode.label}"
+                else -> "未接管"
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (state.error.isNotBlank()) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                state.error,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ModeSelector(mode: RoutingMode, onSelected: (RoutingMode) -> Unit) {
+    val options = RoutingMode.entries
+    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+        options.forEachIndexed { index, item ->
+            SegmentedButton(
+                shape = SegmentedButtonDefaults.itemShape(index = index, count = options.size),
+                selected = item == mode,
+                onClick = { onSelected(item) },
+                label = { Text(item.label, maxLines = 1) },
+            )
+        }
     }
 }
 
 @Composable
-private fun ExitPanel(state: AppState, onTest: () -> Unit) {
+private fun ExitSection(state: AppState, onTest: () -> Unit) {
     val checking = state.exitStatus == ExitCheckStatus.Checking
-    SectionCard(title = "当前出口", icon = Icons.Default.Public) {
-        ExitRow("直连出口", state.directExit, checking)
+    Column(
+        Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 8.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            PrefIcon(Icons.Default.Public)
+            Spacer(Modifier.width(10.dp))
+            Text("当前出口", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = onTest, enabled = !checking) {
+                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text(if (checking) "检测中…" else "检测")
+            }
+        }
         Spacer(Modifier.height(10.dp))
+        ExitRow("直连出口", state.directExit, checking)
+        Spacer(Modifier.height(8.dp))
         ExitRow("代理出口", state.proxyExit, checking)
         if (state.exitMessage.isNotBlank()) {
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(8.dp))
             Text(
                 state.exitMessage,
                 color = if (state.exitStatus == ExitCheckStatus.Failed) {
@@ -351,12 +437,6 @@ private fun ExitPanel(state: AppState, onTest: () -> Unit) {
                 },
                 style = MaterialTheme.typography.bodySmall,
             )
-        }
-        Spacer(Modifier.height(12.dp))
-        Button(onClick = onTest, enabled = !checking, modifier = Modifier.fillMaxWidth()) {
-            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(6.dp))
-            Text(if (checking) "检测中…" else "检测出口 IP")
         }
     }
 }
@@ -395,54 +475,62 @@ private fun ExitRow(label: String, info: ExitInfo, checking: Boolean) {
 }
 
 @Composable
-private fun StatusPanel(state: AppState) {
-    val accent = if (state.running) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-    Surface(
+private fun TrafficCard(state: AppState) {
+    Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        color = if (state.running) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         border = CardDefaults.outlinedCardBorder(),
     ) {
-        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(if (state.running) Icons.Default.CheckCircle else Icons.Default.Stop, contentDescription = null, tint = accent)
-            Spacer(Modifier.width(12.dp))
-            Column {
-                Text(if (state.running) "全流量接管运行中" else "全流量接管已停止", fontWeight = FontWeight.Bold)
-                Text(state.statusMessage, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                if (state.error.isNotBlank()) {
-                    Text(
-                        state.error,
-                        color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 3,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
+        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                PrefIcon(Icons.Default.Speed)
+                Spacer(Modifier.width(10.dp))
+                Text("实时流量", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             }
+            Spacer(Modifier.height(12.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                RateTile(
+                    "下载",
+                    formatRate(state.downloadBytesPerSecond),
+                    MaterialTheme.colorScheme.secondary,
+                    Modifier.weight(1f),
+                )
+                RateTile(
+                    "上传",
+                    formatRate(state.uploadBytesPerSecond),
+                    MaterialTheme.colorScheme.tertiary,
+                    Modifier.weight(1f),
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                RateTile(
+                    "累计下载",
+                    formatBytes(state.totalDownloadBytes),
+                    MaterialTheme.colorScheme.onSurfaceVariant,
+                    Modifier.weight(1f),
+                )
+                RateTile(
+                    "累计上传",
+                    formatBytes(state.totalUploadBytes),
+                    MaterialTheme.colorScheme.onSurfaceVariant,
+                    Modifier.weight(1f),
+                )
+            }
+            Spacer(Modifier.height(14.dp))
+            TrafficChart(state.downloadSamples, state.uploadSamples)
         }
     }
 }
 
 @Composable
-private fun TrafficPanel(state: AppState) {
-    SectionCard(title = "实时流量", icon = Icons.Default.Speed) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Metric("下载", formatRate(state.downloadBytesPerSecond), MaterialTheme.colorScheme.secondary, Modifier.weight(1f))
-            Metric("上传", formatRate(state.uploadBytesPerSecond), MaterialTheme.colorScheme.tertiary, Modifier.weight(1f))
-        }
-        Spacer(Modifier.height(8.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Metric("累计下载", formatBytes(state.totalDownloadBytes), MaterialTheme.colorScheme.onSurfaceVariant, Modifier.weight(1f))
-            Metric("累计上传", formatBytes(state.totalUploadBytes), MaterialTheme.colorScheme.onSurfaceVariant, Modifier.weight(1f))
-        }
-        Spacer(Modifier.height(14.dp))
-        TrafficChart(state.downloadSamples, state.uploadSamples)
-    }
-}
-
-@Composable
-private fun Metric(label: String, value: String, color: Color, modifier: Modifier = Modifier) {
-    Surface(modifier = modifier.height(64.dp), color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(6.dp)) {
+private fun RateTile(label: String, value: String, color: Color, modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier.height(64.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = RoundedCornerShape(12.dp),
+    ) {
         Column(Modifier.padding(horizontal = 12.dp, vertical = 9.dp)) {
             Text(value, color = color, fontWeight = FontWeight.Bold, fontSize = 18.sp, maxLines = 1)
             Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -494,81 +582,129 @@ private fun RulesPage(
     var showPortableRules by rememberSaveable { mutableStateOf(false) }
     var showRuleEditor by rememberSaveable { mutableStateOf(false) }
     var editingRuleIndex by rememberSaveable { mutableStateOf<Int?>(null) }
+    var showCommonTarget by rememberSaveable { mutableStateOf(false) }
+    var showFallback by rememberSaveable { mutableStateOf(false) }
     val selected = state.nodes.firstOrNull { it.id == state.selectedNodeId }
-    Column(
-        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(bottom = 24.dp),
     ) {
-        SectionCard(title = "内网与局域网", icon = Icons.Default.CheckCircle) {
-            Text("系统强制直连，不进入代理或保底出口", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text(
-                "私有 IP、回环、链路本地、.lan、.local 与 home.arpa",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+        item { SectionHeader("分流") }
+        item {
+            PreferenceGroup {
+                ListItem(
+                    headlineContent = { Text("常用海外站点") },
+                    supportingContent = {
+                        Text(
+                            "${state.ruleGroup.domains.size} 条域名 · 出口：${state.commonRuleTarget.label}",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                    leadingContent = { PrefIcon(Icons.AutoMirrored.Filled.Rule) },
+                    trailingContent = {
+                        Switch(checked = state.ruleGroup.enabled, onCheckedChange = onRuleEnabled)
+                    },
+                )
+                HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                ListItem(
+                    modifier = Modifier
+                        .testTag("common-rules-edit")
+                        .clickable { showDomains = true },
+                    headlineContent = { Text("编辑匹配内容") },
+                    supportingContent = { Text("一行一个域名后缀") },
+                    leadingContent = { PrefIcon(Icons.Default.Edit) },
+                    trailingContent = { TrailingChevron() },
+                )
+                HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                ListItem(
+                    modifier = Modifier.clickable { showCommonTarget = true },
+                    headlineContent = { Text("站点出口") },
+                    supportingContent = {
+                        Text(
+                            if (state.commonRuleTarget == FallbackTarget.Proxy) {
+                                "走当前节点${selected?.name?.let { "（$it）" }.orEmpty()}"
+                            } else {
+                                "直连"
+                            },
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                    leadingContent = { PrefIcon(Icons.Default.AccountTree) },
+                    trailingContent = { TrailingChevron() },
+                )
+            }
         }
-        SectionCard(title = state.ruleGroup.name, icon = Icons.AutoMirrored.Filled.Rule) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text("${state.ruleGroup.domains.size} 条域名共用一个出口", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(
-                        selected?.name ?: "尚未选择代理节点",
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+        item { SectionHeader("跨设备规则") }
+        item {
+            PreferenceGroup {
+                ListItem(
+                    modifier = Modifier
+                        .testTag("rules-add")
+                        .clickable {
+                            editingRuleIndex = null
+                            showRuleEditor = true
+                        },
+                    headlineContent = { Text("添加规则") },
+                    supportingContent = { Text("应用 / 域名 / IP，共 ${state.portableRules.size} 条") },
+                    leadingContent = { PrefIcon(Icons.Default.Add) },
+                    trailingContent = { TrailingChevron() },
+                )
+                if (state.portableRules.isNotEmpty()) {
+                    HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                    ListItem(
+                        modifier = Modifier.clickable { showPortableRules = true },
+                        headlineContent = { Text("查看规则") },
+                        leadingContent = { PrefIcon(Icons.AutoMirrored.Filled.Rule) },
+                        trailingContent = { TrailingChevron() },
                     )
                 }
-                Switch(checked = state.ruleGroup.enabled, onCheckedChange = onRuleEnabled)
             }
-            Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    modifier = Modifier.testTag("common-rules-edit"),
-                    onClick = { showDomains = true },
-                ) { Text("编辑匹配内容") }
-                TextButton(onClick = onShowNodes) { Text("更换出口") }
-            }
-            Spacer(Modifier.height(10.dp))
-            SegmentedChoice(
-                options = FallbackTarget.entries,
-                selected = state.commonRuleTarget,
-                label = { if (it == FallbackTarget.Proxy) "当前节点" else "直连" },
-                onSelected = onCommonTarget,
-            )
         }
-        SectionCard(title = "跨设备规则", icon = Icons.AutoMirrored.Filled.Rule) {
-            Text(
-                "${state.portableRules.size} 条应用 / 域名 / IP 规则",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    modifier = Modifier.testTag("rules-add"),
-                    onClick = {
-                        editingRuleIndex = null
-                        showRuleEditor = true
+        item { SectionHeader("系统") }
+        item {
+            PreferenceGroup {
+                ListItem(
+                    modifier = Modifier.clickable { showFallback = true },
+                    headlineContent = { Text("强制保底规则") },
+                    supportingContent = { Text("未匹配任何规则时的出口") },
+                    leadingContent = { PrefIcon(Icons.Default.AccountTree) },
+                    trailingContent = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(state.fallbackTarget.label, style = MaterialTheme.typography.bodyMedium)
+                            TrailingChevron()
+                        }
                     },
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = null)
-                    Spacer(Modifier.width(6.dp))
-                    Text("添加规则")
-                }
-                OutlinedButton(
-                    enabled = state.portableRules.isNotEmpty(),
-                    onClick = { showPortableRules = true },
-                ) { Text("查看规则") }
+                )
+                HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                ListItem(
+                    headlineContent = { Text("内网与局域网") },
+                    supportingContent = { Text("私有 IP、回环、.lan、.local 始终直连") },
+                    leadingContent = { PrefIcon(Icons.Default.CheckCircle) },
+                )
             }
         }
-        SectionCard(title = "强制保底规则", icon = Icons.Default.CheckCircle) {
-            Text("其他规则未匹配时始终执行", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Spacer(Modifier.height(10.dp))
-            SegmentedChoice(
-                options = FallbackTarget.entries,
-                selected = state.fallbackTarget,
-                label = { it.label },
-                onSelected = onFallback,
-            )
-        }
+    }
+    if (showCommonTarget) {
+        ChoiceDialog(
+            title = "站点出口",
+            options = FallbackTarget.entries,
+            selected = state.commonRuleTarget,
+            label = { if (it == FallbackTarget.Proxy) "当前节点" else "直连" },
+            onSelected = onCommonTarget,
+            onDismiss = { showCommonTarget = false },
+        )
+    }
+    if (showFallback) {
+        ChoiceDialog(
+            title = "强制保底规则",
+            options = FallbackTarget.entries,
+            selected = state.fallbackTarget,
+            label = { it.label },
+            onSelected = onFallback,
+            onDismiss = { showFallback = false },
+        )
     }
     if (showDomains) {
         val lines = commonDomainsText.lineSequence().map(String::trim).filter(String::isNotBlank).toList()
@@ -1385,173 +1521,250 @@ private fun SettingsPage(
     onImportConfiguration: () -> Unit,
     onExportConfiguration: () -> Unit,
 ) {
-    Column(
-        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+    var showPortEditor by rememberSaveable { mutableStateOf(false) }
+    val actual = state.localProxyActualPort
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(bottom = 24.dp),
     ) {
-        LocalProxyCard(
-            state = state,
-            onEnabled = onLocalProxyEnabled,
-            onApplyPort = onLocalProxyPort,
-        )
-        SectionCard(title = "应用信息", icon = Icons.Default.Settings) {
-            InfoRow("版本号", "v${BuildConfig.VERSION_NAME}（构建 ${BuildConfig.VERSION_CODE}）")
-            HorizontalDivider()
-            InfoRow("代理核心", "sing-box 1.13.20 · libbox")
-            HorizontalDivider()
-            InfoRow("VPN 模式", "Android VpnService")
-        }
-        SectionCard(title = "本机数据", icon = Icons.Default.Dns) {
-            Text("订阅、节点和规则仅保存在应用私有目录。", color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        SectionCard(title = "跨设备配置", icon = Icons.Default.Link) {
-            Text(
-                "节点、订阅和分流规则可与其他平台互通。导出文件可能包含节点密码，请妥善保管。",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(12.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = onImportConfiguration) {
-                    Icon(Icons.Default.FileOpen, contentDescription = null)
-                    Spacer(Modifier.width(6.dp))
-                    Text("导入")
-                }
-                OutlinedButton(onClick = onExportConfiguration) {
-                    Icon(Icons.Default.Save, contentDescription = null)
-                    Spacer(Modifier.width(6.dp))
-                    Text("导出")
+        item { SectionHeader("连接") }
+        item {
+            PreferenceGroup {
+                ListItem(
+                    headlineContent = { Text("本地代理（HTTP + SOCKS5）") },
+                    supportingContent = {
+                        Text(
+                            if (state.localProxyEnabled) {
+                                "127.0.0.1:${actual.takeIf { it > 0 } ?: state.localProxyPort}"
+                            } else {
+                                "未开启"
+                            },
+                        )
+                    },
+                    leadingContent = { PrefIcon(Icons.Default.Wifi) },
+                    trailingContent = {
+                        Switch(checked = state.localProxyEnabled, onCheckedChange = onLocalProxyEnabled)
+                    },
+                )
+                if (state.localProxyEnabled) {
+                    HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                    ListItem(
+                        modifier = Modifier.clickable { showPortEditor = true },
+                        headlineContent = { Text("端口") },
+                        supportingContent = { Text("${state.localProxyPort}") },
+                        leadingContent = { PrefIcon(Icons.Default.Settings) },
+                        trailingContent = { TrailingChevron() },
+                    )
+                    if (state.running && actual > 0) {
+                        HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                        AddressRow("HTTP", "http://127.0.0.1:$actual")
+                        HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                        AddressRow("SOCKS5", "socks5://127.0.0.1:$actual")
+                        if (actual != state.localProxyPort) {
+                            Text(
+                                "端口 ${state.localProxyPort} 已被占用，本次实际使用 $actual",
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    } else {
+                        Text(
+                            if (state.running) "代理核心启动中，端口稍后显示" else "开启接管后开始监听",
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
         }
+        item { SectionHeader("跨设备配置") }
+        item {
+            PreferenceGroup {
+                ListItem(
+                    modifier = Modifier.clickable(onClick = onImportConfiguration),
+                    headlineContent = { Text("导入") },
+                    supportingContent = { Text("从其他设备恢复节点与规则") },
+                    leadingContent = { PrefIcon(Icons.Default.FileOpen) },
+                )
+                HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                ListItem(
+                    modifier = Modifier.clickable(onClick = onExportConfiguration),
+                    headlineContent = { Text("导出") },
+                    supportingContent = { Text("文件含节点密码，请妥善保管") },
+                    leadingContent = { PrefIcon(Icons.Default.Save) },
+                )
+            }
+        }
+        item { SectionHeader("关于") }
+        item {
+            PreferenceGroup {
+                ListItem(
+                    headlineContent = { Text("版本") },
+                    supportingContent = {
+                        Text("v${BuildConfig.VERSION_NAME}（构建 ${BuildConfig.VERSION_CODE}）")
+                    },
+                    leadingContent = { PrefIcon(Icons.Default.Settings) },
+                )
+                HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                ListItem(
+                    headlineContent = { Text("代理核心") },
+                    supportingContent = { Text("sing-box 1.13.20 · libbox") },
+                    leadingContent = { PrefIcon(Icons.Default.Dns) },
+                )
+                HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                ListItem(
+                    headlineContent = { Text("接管方式") },
+                    supportingContent = { Text("Android VpnService") },
+                    leadingContent = { PrefIcon(Icons.Default.CheckCircle) },
+                )
+            }
+        }
+    }
+    if (showPortEditor) {
+        PortDialog(
+            current = state.localProxyPort.toString(),
+            onConfirm = onLocalProxyPort,
+            onDismiss = { showPortEditor = false },
+        )
+    }
+}
+
+/** 移动端设置项的一张分组卡片：一组 [ListItem] 用细分割线串起来。 */
+@Composable
+private fun PreferenceGroup(content: @Composable ColumnScope.() -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = CardDefaults.outlinedCardBorder(),
+    ) {
+        Column(Modifier.fillMaxWidth()) { content() }
     }
 }
 
 @Composable
-private fun LocalProxyCard(
-    state: AppState,
-    onEnabled: (Boolean) -> Unit,
-    onApplyPort: (Int) -> Unit,
-) {
-    var portText by remember(state.localProxyPort) {
-        mutableStateOf(state.localProxyPort.toString())
-    }
-    val portValue = portText.toIntOrNull()
-    SectionCard(title = "本地代理（HTTP + SOCKS5）", icon = Icons.Default.Wifi) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text("开放一个本机端口，浏览器、Telegram 等应用手动填代理即可使用")
-                Text(
-                    "同一个端口同时接受 HTTP 与 SOCKS5，仅 127.0.0.1 可连",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            Spacer(Modifier.width(10.dp))
-            Switch(checked = state.localProxyEnabled, onCheckedChange = onEnabled)
-        }
-        if (!state.localProxyEnabled) return@SectionCard
-        Spacer(Modifier.height(12.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value = portText,
-                onValueChange = { portText = it.filter(Char::isDigit).take(5) },
-                label = { Text("端口") },
-                singleLine = true,
-                modifier = Modifier.width(130.dp),
-            )
-            Spacer(Modifier.width(10.dp))
-            TextButton(
-                enabled = portValue != null && portValue != state.localProxyPort,
-                onClick = { portValue?.let { onApplyPort(it) } },
-            ) { Text("应用") }
-        }
-        Spacer(Modifier.height(12.dp))
-        HorizontalDivider()
-        Spacer(Modifier.height(12.dp))
-        val actual = state.localProxyActualPort
-        if (state.running && actual > 0) {
-            AddressRow("HTTP", "http://127.0.0.1:$actual")
-            Spacer(Modifier.height(6.dp))
-            AddressRow("SOCKS5", "socks5://127.0.0.1:$actual")
-            if (actual != state.localProxyPort) {
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "端口 ${state.localProxyPort} 已被占用，本次实际使用 $actual",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-        } else {
-            Text(
-                if (state.running) "代理核心启动中，端口稍后显示" else "开启接管后监听 127.0.0.1:$portText",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
+private fun SectionHeader(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelLarge,
+        fontWeight = FontWeight.Bold,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(start = 28.dp, end = 16.dp, top = 18.dp, bottom = 6.dp),
+    )
+}
+
+@Composable
+private fun PrefIcon(icon: ImageVector, tint: Color = MaterialTheme.colorScheme.primary) {
+    Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(24.dp))
+}
+
+@Composable
+private fun TrailingChevron() {
+    Icon(
+        Icons.Default.ChevronRight,
+        contentDescription = null,
+        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.size(20.dp),
+    )
 }
 
 @Composable
 private fun AddressRow(label: String, value: String) {
     val context = LocalContext.current
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Text(
-            label,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.width(64.dp),
-        )
-        Text(
-            value,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
-        IconButton(onClick = { copyToClipboard(context, value) }) {
-            Icon(
-                Icons.Default.ContentCopy,
-                contentDescription = "复制",
-                modifier = Modifier.size(18.dp),
-            )
-        }
-    }
+    ListItem(
+        headlineContent = {
+            Text(value, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        },
+        supportingContent = { Text(label) },
+        trailingContent = {
+            IconButton(onClick = { copyToClipboard(context, value) }) {
+                Icon(Icons.Default.ContentCopy, contentDescription = "复制", modifier = Modifier.size(20.dp))
+            }
+        },
+    )
+}
+
+@Composable
+private fun PortDialog(current: String, onConfirm: (Int) -> Unit, onDismiss: () -> Unit) {
+    var text by remember(current) { mutableStateOf(current) }
+    val value = text.toIntOrNull()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("本地代理端口") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it.filter(Char::isDigit).take(5) },
+                    label = { Text("端口") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    "HTTP 与 SOCKS5 共用这一个端口，范围 1024 ~ 65535。被占用时会顺延，界面显示实际端口。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = value != null,
+                onClick = {
+                    value?.let { onConfirm(it) }
+                    onDismiss()
+                },
+            ) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+}
+
+@Composable
+private fun <T> ChoiceDialog(
+    title: String,
+    options: List<T>,
+    selected: T,
+    label: (T) -> String,
+    onSelected: (T) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                options.forEach { option ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                onSelected(option)
+                                onDismiss()
+                            }
+                            .padding(vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(selected = option == selected, onClick = {
+                            onSelected(option)
+                            onDismiss()
+                        })
+                        Spacer(Modifier.width(10.dp))
+                        Text(label(option), style = MaterialTheme.typography.bodyLarge)
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }
 
 private fun copyToClipboard(context: Context, value: String) {
     val manager = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
     manager?.setPrimaryClip(ClipData.newPlainText("proxy-address", value))
     Toast.makeText(context, "已复制 $value", Toast.LENGTH_SHORT).show()
-}
-
-@Composable
-private fun InfoRow(label: String, value: String) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 11.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-        Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, fontWeight = FontWeight.SemiBold)
-    }
-}
-
-@Composable
-private fun SectionCard(title: String, icon: ImageVector, content: @Composable ColumnScope.() -> Unit) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        border = CardDefaults.outlinedCardBorder(),
-    ) {
-        Column(Modifier.fillMaxWidth().padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Surface(shape = RoundedCornerShape(6.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
-                    Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.secondary, modifier = Modifier.padding(7.dp).size(20.dp))
-                }
-                Spacer(Modifier.width(10.dp))
-                Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            }
-            Spacer(Modifier.height(14.dp))
-            content()
-        }
-    }
 }
 
 @Composable
