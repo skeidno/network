@@ -71,6 +71,16 @@ class AppRepository private constructor(private val context: Context) {
     fun setCommonRuleTarget(target: FallbackTarget) =
         update(mutableState.value.copy(commonRuleTarget = target))
 
+    fun setLocalProxyEnabled(enabled: Boolean) =
+        update(mutableState.value.copy(localProxyEnabled = enabled))
+
+    fun setLocalProxyPort(port: Int) {
+        require(port in LOCAL_PROXY_PORT_MIN..LOCAL_PROXY_PORT_MAX) {
+            "端口需要在 $LOCAL_PROXY_PORT_MIN 到 $LOCAL_PROXY_PORT_MAX 之间"
+        }
+        update(mutableState.value.copy(localProxyPort = port))
+    }
+
     fun savePortableRules(
         index: Int?,
         type: String,
@@ -308,6 +318,29 @@ class AppRepository private constructor(private val context: Context) {
         ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { it.localPort }
     }.getOrDefault(0)
 
+    private fun isLoopbackPortFree(port: Int): Boolean = runCatching {
+        ServerSocket(port, 1, InetAddress.getByName("127.0.0.1")).use { true }
+    }.getOrDefault(false)
+
+    /**
+     * 挑本地代理实际监听的端口。
+     *
+     * 用户填的端口可能被别的进程占着，而 sing-box 碰到端口占用是**整个内核启动失败**，
+     * 不是跳过这个入站 —— 所以这里先探测，占了就往后顺延，并把实际端口回写到状态里
+     * 让界面显示真实地址。
+     */
+    private fun resolveLocalProxyPort(preferred: Int, reservedProbePort: Int): Int {
+        var candidate = preferred
+        repeat(16) {
+            if (candidate > LOCAL_PROXY_PORT_MAX) candidate = LOCAL_PROXY_PORT_MIN
+            if (candidate != reservedProbePort && isLoopbackPortFree(candidate)) return candidate
+            candidate += 1
+        }
+        val allocated = allocateLoopbackPort()
+        if (allocated > 0 && allocated != reservedProbePort) return allocated
+        return preferred
+    }
+
     private fun probeExit(proxyPort: Int?, endpoints: List<String>): ExitInfo {
         var lastError: Exception? = null
         endpoints.forEach { endpoint ->
@@ -391,12 +424,23 @@ class AppRepository private constructor(private val context: Context) {
         // 每次生成配置时重新挑一个空闲端口：sing-box 碰到端口占用会直接启动失败，
         // 而 App 挑完端口立刻就用它发请求，不存在「配置里写的」和「实际监听的」不一致的问题。
         probePort = if (state.nodes.isEmpty()) 0 else allocateLoopbackPort()
+        val localProxyPort = if (state.localProxyEnabled) {
+            resolveLocalProxyPort(state.localProxyPort, probePort)
+        } else {
+            0
+        }
         val file = runtimeConfigFile()
         val temporary = File(file.parentFile, "runtime.tmp")
-        temporary.writeText(SingBoxConfigBuilder.build(state, probePort), Charsets.UTF_8)
+        temporary.writeText(
+            SingBoxConfigBuilder.build(state, probePort, localProxyPort),
+            Charsets.UTF_8,
+        )
         if (!temporary.renameTo(file)) {
             temporary.copyTo(file, overwrite = true)
             temporary.delete()
+        }
+        if (mutableState.value.localProxyActualPort != localProxyPort) {
+            update(mutableState.value.copy(localProxyActualPort = localProxyPort), persist = false)
         }
         return file
     }
@@ -659,6 +703,8 @@ class AppRepository private constructor(private val context: Context) {
             .putBoolean("ruleGroupEnabled", state.ruleGroup.enabled)
             .putString("ruleGroupDomains", JSONArray(state.ruleGroup.domains).toString())
             .putString("commonRuleTarget", state.commonRuleTarget.name)
+            .putBoolean("localProxyEnabled", state.localProxyEnabled)
+            .putInt("localProxyPort", state.localProxyPort)
             .putString(
                 "portableRules",
                 JSONArray().apply {
@@ -752,6 +798,10 @@ class AppRepository private constructor(private val context: Context) {
             ),
             commonRuleTarget = enumPreference("commonRuleTarget", FallbackTarget.Proxy),
             portableRules = portableRules,
+            localProxyEnabled = preferences.getBoolean("localProxyEnabled", false),
+            localProxyPort = preferences.getInt("localProxyPort", DEFAULT_LOCAL_PROXY_PORT)
+                .takeIf { it in LOCAL_PROXY_PORT_MIN..LOCAL_PROXY_PORT_MAX }
+                ?: DEFAULT_LOCAL_PROXY_PORT,
         )
     }
 

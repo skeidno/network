@@ -30,6 +30,11 @@ enum class ExitCheckStatus {
     Failed,
 }
 
+/** 本地代理端口默认值，和桌面端 7890 的习惯保持一致。 */
+const val DEFAULT_LOCAL_PROXY_PORT = 7890
+const val LOCAL_PROXY_PORT_MIN = 1024
+const val LOCAL_PROXY_PORT_MAX = 65535
+
 /// 一次出口检测的结果：IP 加能查到的归属地（查不到就留空，不编造）。
 data class ExitInfo(
     val ip: String = "",
@@ -193,6 +198,12 @@ data class AppState(
     val directExit: ExitInfo = ExitInfo(),
     val proxyExit: ExitInfo = ExitInfo(),
     val exitMessage: String = "",
+    // 本地代理：一个 mixed 入站同时接受 HTTP 与 SOCKS5，给浏览器 / Telegram 这类
+    // 手动填代理的应用用。[localProxyPort] 是用户填的偏好端口，[localProxyActualPort]
+    // 是内核实际监听的端口（偏好端口被占用时自动顺延），属于运行态、不落盘。
+    val localProxyEnabled: Boolean = false,
+    val localProxyPort: Int = DEFAULT_LOCAL_PROXY_PORT,
+    val localProxyActualPort: Int = 0,
     val error: String = "",
 )
 

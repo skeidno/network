@@ -38,6 +38,7 @@ import androidx.compose.material.icons.automirrored.filled.Rule
 import androidx.compose.material.icons.filled.AccountTree
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.DeleteSweep
@@ -99,12 +100,17 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
 import com.skeidno.networkmanager.BuildConfig
 import com.skeidno.networkmanager.R
 import com.skeidno.networkmanager.data.AppState
@@ -209,6 +215,9 @@ fun NetworkManagerApp(
                             onTestNode = viewModel::testNode,
                         )
                         AppPage.Settings -> SettingsPage(
+                            state = state,
+                            onLocalProxyEnabled = viewModel::setLocalProxyEnabled,
+                            onLocalProxyPort = viewModel::setLocalProxyPort,
                             onImportConfiguration = onImportConfiguration,
                             onExportConfiguration = onExportConfiguration,
                         )
@@ -1370,6 +1379,9 @@ private fun ImportDialog(
 
 @Composable
 private fun SettingsPage(
+    state: AppState,
+    onLocalProxyEnabled: (Boolean) -> Unit,
+    onLocalProxyPort: (Int) -> Unit,
     onImportConfiguration: () -> Unit,
     onExportConfiguration: () -> Unit,
 ) {
@@ -1377,6 +1389,11 @@ private fun SettingsPage(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        LocalProxyCard(
+            state = state,
+            onEnabled = onLocalProxyEnabled,
+            onApplyPort = onLocalProxyPort,
+        )
         SectionCard(title = "应用信息", icon = Icons.Default.Settings) {
             InfoRow("版本号", "v${BuildConfig.VERSION_NAME}（构建 ${BuildConfig.VERSION_CODE}）")
             HorizontalDivider()
@@ -1407,6 +1424,104 @@ private fun SettingsPage(
             }
         }
     }
+}
+
+@Composable
+private fun LocalProxyCard(
+    state: AppState,
+    onEnabled: (Boolean) -> Unit,
+    onApplyPort: (Int) -> Unit,
+) {
+    var portText by remember(state.localProxyPort) {
+        mutableStateOf(state.localProxyPort.toString())
+    }
+    val portValue = portText.toIntOrNull()
+    SectionCard(title = "本地代理（HTTP + SOCKS5）", icon = Icons.Default.Wifi) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("开放一个本机端口，浏览器、Telegram 等应用手动填代理即可使用")
+                Text(
+                    "同一个端口同时接受 HTTP 与 SOCKS5，仅 127.0.0.1 可连",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            Switch(checked = state.localProxyEnabled, onCheckedChange = onEnabled)
+        }
+        if (!state.localProxyEnabled) return@SectionCard
+        Spacer(Modifier.height(12.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = portText,
+                onValueChange = { portText = it.filter(Char::isDigit).take(5) },
+                label = { Text("端口") },
+                singleLine = true,
+                modifier = Modifier.width(130.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            TextButton(
+                enabled = portValue != null && portValue != state.localProxyPort,
+                onClick = { portValue?.let { onApplyPort(it) } },
+            ) { Text("应用") }
+        }
+        Spacer(Modifier.height(12.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(12.dp))
+        val actual = state.localProxyActualPort
+        if (state.running && actual > 0) {
+            AddressRow("HTTP", "http://127.0.0.1:$actual")
+            Spacer(Modifier.height(6.dp))
+            AddressRow("SOCKS5", "socks5://127.0.0.1:$actual")
+            if (actual != state.localProxyPort) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "端口 ${state.localProxyPort} 已被占用，本次实际使用 $actual",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        } else {
+            Text(
+                if (state.running) "代理核心启动中，端口稍后显示" else "开启接管后监听 127.0.0.1:$portText",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun AddressRow(label: String, value: String) {
+    val context = LocalContext.current
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(64.dp),
+        )
+        Text(
+            value,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        IconButton(onClick = { copyToClipboard(context, value) }) {
+            Icon(
+                Icons.Default.ContentCopy,
+                contentDescription = "复制",
+                modifier = Modifier.size(18.dp),
+            )
+        }
+    }
+}
+
+private fun copyToClipboard(context: Context, value: String) {
+    val manager = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+    manager?.setPrimaryClip(ClipData.newPlainText("proxy-address", value))
+    Toast.makeText(context, "已复制 $value", Toast.LENGTH_SHORT).show()
 }
 
 @Composable

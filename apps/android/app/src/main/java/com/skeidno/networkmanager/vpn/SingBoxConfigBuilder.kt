@@ -17,6 +17,15 @@ object SingBoxConfigBuilder {
      */
     const val probeInboundTag = "probe-in"
 
+    /**
+     * 对外开放的本地代理入站。type = mixed 表示同一个端口同时接受 HTTP 和 SOCKS5，
+     * 不分两个端口，和桌面端的 mixed-port 行为一致。
+     *
+     * 这个入站不加任何强制规则，流量照常走下面的分流规则（受当前代理模式影响），
+     * 这样手动填了代理的应用和走 VPN 接管的应用看到的分流结果是一致的。
+     */
+    const val localInboundTag = "local-in"
+
     private val lanDomainSuffixes = listOf("lan", "local", "home.arpa")
     private val lanCidrs = listOf(
         "0.0.0.0/8",
@@ -35,7 +44,7 @@ object SingBoxConfigBuilder {
         "ff00::/8",
     )
 
-    fun build(state: AppState, probePort: Int = 0): String {
+    fun build(state: AppState, probePort: Int = 0, localProxyPort: Int = 0): String {
         val selected = state.nodes.firstOrNull { it.id == state.selectedNodeId }
             ?: state.nodes.firstOrNull()
         val orderedNodes = state.nodes.sortedByDescending { it.id == selected?.id }
@@ -173,6 +182,15 @@ object SingBoxConfigBuilder {
                     .put("tag", probeInboundTag)
                     .put("listen", "127.0.0.1")
                     .put("listen_port", probePort),
+            )
+        }
+        if (localProxyPort > 0) {
+            inbounds.put(
+                JSONObject()
+                    .put("type", "mixed")
+                    .put("tag", localInboundTag)
+                    .put("listen", "127.0.0.1")
+                    .put("listen_port", localProxyPort),
             )
         }
 

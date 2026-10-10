@@ -198,6 +198,50 @@ class SingBoxConfigBuilderTest {
     }
 
     @Test
+    fun localProxyInboundAcceptsBothHttpAndSocks5OnOnePort() {
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(
+                AppState(mode = RoutingMode.Global, selectedNodeId = node.id, nodes = listOf(node)),
+                probePort = 45001,
+                localProxyPort = 7890,
+            ),
+        )
+
+        val inbounds = config.getJSONArray("inbounds")
+        val local = (0 until inbounds.length())
+            .map { inbounds.getJSONObject(it) }
+            .first { it.optString("tag") == SingBoxConfigBuilder.localInboundTag }
+
+        // sing-box 的 mixed 入站按首字节自动分辨 HTTP 与 SOCKS5，不需要开两个端口。
+        assertEquals("mixed", local.getString("type"))
+        assertEquals(7890, local.getInt("listen_port"))
+        assertEquals("127.0.0.1", local.getString("listen"))
+        // 本地代理不加强制规则，走的是当前代理模式下的正常分流。
+        val forced = config.getJSONObject("route").getJSONArray("rules").let { rules ->
+            (0 until rules.length())
+                .map { rules.getJSONObject(it) }
+                .filter { it.optJSONArray("inbound")?.optString(0) == SingBoxConfigBuilder.localInboundTag }
+        }
+        assertEquals(0, forced.size)
+        assertEquals("proxy", config.getJSONObject("route").getString("final"))
+    }
+
+    @Test
+    fun localProxyInboundIsAbsentWhenPortIsNotAllocated() {
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(
+                AppState(mode = RoutingMode.Rule, selectedNodeId = node.id, nodes = listOf(node)),
+                probePort = 45002,
+            ),
+        )
+
+        val tags = config.getJSONArray("inbounds").let { inbounds ->
+            (0 until inbounds.length()).map { inbounds.getJSONObject(it).optString("tag") }
+        }
+        assertTrue(SingBoxConfigBuilder.localInboundTag !in tags)
+    }
+
+    @Test
     fun authenticatedHttpProxyMapsToSingBoxOutbound() {
         val httpNode = ProxyNode(
             id = "http-node",

@@ -90,6 +90,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         applyConfigurationIfRunning()
     }
 
+    fun setLocalProxyEnabled(enabled: Boolean) {
+        repository.setLocalProxyEnabled(enabled)
+        applyConfigurationIfRunning()
+    }
+
+    fun setLocalProxyPort(port: Int): Boolean = runCatching { repository.setLocalProxyPort(port) }
+        .fold(
+            onSuccess = {
+                applyConfigurationIfRunning()
+                true
+            },
+            onFailure = {
+                mutableMessages.tryEmit(it.message ?: "端口保存失败")
+                false
+            },
+        )
+
     fun savePortableRules(
         index: Int?,
         type: String,
