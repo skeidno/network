@@ -3,7 +3,7 @@
   <assemblyIdentity
     type="win32"
     name="skeidno.NetworkManager"
-    version="0.6.10.0"
+    version="0.6.11.0"
     processorArchitecture="amd64"
   />
   <!-- 双击即提权：TUN 虚拟网卡必须要有管理员令牌，与其让用户右键选
