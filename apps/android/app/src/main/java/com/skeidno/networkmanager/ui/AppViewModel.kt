@@ -10,6 +10,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.skeidno.networkmanager.data.AppRepository
+import com.skeidno.networkmanager.data.ExitCheckStatus
 import com.skeidno.networkmanager.data.FallbackTarget
 import com.skeidno.networkmanager.data.InstalledApp
 import com.skeidno.networkmanager.data.RoutingMode
@@ -188,6 +189,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     mutableMessages.emit("${node.name}：$result")
                 }
                 .onFailure { mutableMessages.emit(it.message ?: "节点入口检测失败") }
+        }
+    }
+
+    fun testExit() {
+        if (state.value.exitStatus == ExitCheckStatus.Checking) return
+        viewModelScope.launch {
+            runCatching { repository.checkExit() }
+                .onFailure { mutableMessages.emit(it.message ?: "出口检测失败") }
+            state.value.exitMessage.takeIf { it.isNotBlank() }?.let { mutableMessages.emit(it) }
         }
     }
 

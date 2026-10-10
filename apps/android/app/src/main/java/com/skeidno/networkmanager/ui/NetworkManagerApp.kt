@@ -48,6 +48,7 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Save
@@ -107,6 +108,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.skeidno.networkmanager.BuildConfig
 import com.skeidno.networkmanager.R
 import com.skeidno.networkmanager.data.AppState
+import com.skeidno.networkmanager.data.ExitCheckStatus
+import com.skeidno.networkmanager.data.ExitInfo
 import com.skeidno.networkmanager.data.DEFAULT_PROXY_DOMAINS
 import com.skeidno.networkmanager.data.FallbackTarget
 import com.skeidno.networkmanager.data.InstalledApp
@@ -177,6 +180,7 @@ fun NetworkManagerApp(
                             state = state,
                             onMode = viewModel::setMode,
                             onShowNodes = { page = AppPage.Nodes },
+                            onTestExit = viewModel::testExit,
                         )
                         AppPage.Rules -> RulesPage(
                             state = state,
@@ -275,7 +279,12 @@ private fun AppHeader(state: AppState, page: AppPage, onStartVpn: () -> Unit, on
 }
 
 @Composable
-private fun OverviewPage(state: AppState, onMode: (RoutingMode) -> Unit, onShowNodes: () -> Unit) {
+private fun OverviewPage(
+    state: AppState,
+    onMode: (RoutingMode) -> Unit,
+    onShowNodes: () -> Unit,
+    onTestExit: () -> Unit,
+) {
     val selected = state.nodes.firstOrNull { it.id == state.selectedNodeId }
     Column(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
@@ -309,8 +318,70 @@ private fun OverviewPage(state: AppState, onMode: (RoutingMode) -> Unit, onShowN
                 TextButton(onClick = onShowNodes) { Text("选择") }
             }
         }
+        ExitPanel(state = state, onTest = onTestExit)
         TrafficPanel(state)
         Spacer(Modifier.height(8.dp))
+    }
+}
+
+@Composable
+private fun ExitPanel(state: AppState, onTest: () -> Unit) {
+    val checking = state.exitStatus == ExitCheckStatus.Checking
+    SectionCard(title = "当前出口", icon = Icons.Default.Public) {
+        ExitRow("直连出口", state.directExit, checking)
+        Spacer(Modifier.height(10.dp))
+        ExitRow("代理出口", state.proxyExit, checking)
+        if (state.exitMessage.isNotBlank()) {
+            Spacer(Modifier.height(10.dp))
+            Text(
+                state.exitMessage,
+                color = if (state.exitStatus == ExitCheckStatus.Failed) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        Button(onClick = onTest, enabled = !checking, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(if (checking) "检测中…" else "检测出口 IP")
+        }
+    }
+}
+
+@Composable
+private fun ExitRow(label: String, info: ExitInfo, checking: Boolean) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(72.dp),
+        )
+        Column(Modifier.weight(1f)) {
+            Text(
+                when {
+                    info.available -> info.ip
+                    checking -> "检测中…"
+                    else -> "尚未检测"
+                },
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (info.location.isNotBlank()) {
+                Text(
+                    info.location,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
     }
 }
 

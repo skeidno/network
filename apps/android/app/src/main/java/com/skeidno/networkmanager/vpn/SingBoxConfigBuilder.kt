@@ -10,6 +10,13 @@ import org.json.JSONObject
 
 object SingBoxConfigBuilder {
     private const val nodeDialerProxyKey = "_network-manager-dialer-proxy"
+
+    /**
+     * 出口检测专用入站的 tag。App 通过这个入站请求检测端点，规则把它强制指向节点出站，
+     * 于是「代理出口」测到的是节点出口；直连出口另走普通请求，不受此影响。
+     */
+    const val probeInboundTag = "probe-in"
+
     private val lanDomainSuffixes = listOf("lan", "local", "home.arpa")
     private val lanCidrs = listOf(
         "0.0.0.0/8",
@@ -28,7 +35,7 @@ object SingBoxConfigBuilder {
         "ff00::/8",
     )
 
-    fun build(state: AppState): String {
+    fun build(state: AppState, probePort: Int = 0): String {
         val selected = state.nodes.firstOrNull { it.id == state.selectedNodeId }
             ?: state.nodes.firstOrNull()
         val orderedNodes = state.nodes.sortedByDescending { it.id == selected?.id }
@@ -58,8 +65,17 @@ object SingBoxConfigBuilder {
         }
         outbounds.put(JSONObject().put("type", "direct").put("tag", "direct"))
 
+        val probeEnabled = orderedNodes.isNotEmpty() && probePort > 0
         val rules = JSONArray()
-            .put(JSONObject().put("action", "sniff"))
+        // 必须排在所有规则之前：检测流量要压过下面的分流规则，一定从节点出去。
+        if (probeEnabled) {
+            rules.put(
+                JSONObject()
+                    .put("inbound", JSONArray().put(probeInboundTag))
+                    .put("outbound", "proxy"),
+            )
+        }
+        rules.put(JSONObject().put("action", "sniff"))
             .put(JSONObject().put("protocol", "dns").put("action", "hijack-dns"))
             .put(
                 JSONObject()
@@ -139,6 +155,27 @@ object SingBoxConfigBuilder {
             ) "remote-proxy" else "local"
         }
 
+        val inbounds = JSONArray().put(
+            JSONObject()
+                .put("type", "tun")
+                .put("tag", "tun-in")
+                .put("address", JSONArray().put("172.19.0.1/30"))
+                .put("mtu", 9000)
+                .put("auto_route", true)
+                .put("route_exclude_address", JSONArray(lanCidrs))
+                .put("strict_route", false)
+                .put("stack", "mixed"),
+        )
+        if (probeEnabled) {
+            inbounds.put(
+                JSONObject()
+                    .put("type", "mixed")
+                    .put("tag", probeInboundTag)
+                    .put("listen", "127.0.0.1")
+                    .put("listen_port", probePort),
+            )
+        }
+
         return JSONObject()
             .put("log", JSONObject().put("level", "info").put("timestamp", true))
             .put(
@@ -149,20 +186,7 @@ object SingBoxConfigBuilder {
                     .put("final", finalDnsServer)
                     .put("strategy", "prefer_ipv4"),
             )
-            .put(
-                "inbounds",
-                JSONArray().put(
-                    JSONObject()
-                        .put("type", "tun")
-                        .put("tag", "tun-in")
-                        .put("address", JSONArray().put("172.19.0.1/30"))
-                        .put("mtu", 9000)
-                        .put("auto_route", true)
-                        .put("route_exclude_address", JSONArray(lanCidrs))
-                        .put("strict_route", false)
-                        .put("stack", "mixed"),
-                ),
-            )
+            .put("inbounds", inbounds)
             .put("outbounds", outbounds)
             .put(
                 "route",

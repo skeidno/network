@@ -13,13 +13,39 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.Proxy
+import java.net.ServerSocket
 import java.net.Socket
+import java.net.URL
 import java.time.OffsetDateTime
 import java.util.UUID
 
 private fun normalizeNodeGroup(value: String): String =
     value.trim().replace(Regex("\\s+"), " ").take(40)
+
+/**
+ * 出口检测端点。
+ *
+ * 直连优先用国内的 ipip / 3322：它们不在默认代理域名表里，接管状态下也是直连出去，
+ * 测到的才是本机真实 IP（ip-api 作兜底）。
+ * 代理优先用境外的 ip-api（带 lang=zh-CN 拿中文归属地）：反过来让节点去访问国内站点
+ * 经常超时，实测通过节点打开 ipip 会卡住。
+ */
+private val DIRECT_EXIT_ENDPOINTS = listOf(
+    "http://myip.ipip.net",
+    "http://ip.3322.net",
+    "http://ip-api.com/json/?lang=zh-CN&fields=status,message,query,country,regionName,city",
+)
+
+private val PROXY_EXIT_ENDPOINTS = listOf(
+    "http://ip-api.com/json/?lang=zh-CN&fields=status,message,query,country,regionName,city",
+    "http://myip.ipip.net",
+)
+
+private val IPV4 = Regex("""\d{1,3}(?:\.\d{1,3}){3}""")
 
 class AppRepository private constructor(private val context: Context) {
     private val preferences = context.getSharedPreferences("network-manager", Context.MODE_PRIVATE)
@@ -233,8 +259,107 @@ class AppRepository private constructor(private val context: Context) {
         update(mutableState.value.copy(nodes = tested))
     }
 
-    suspend fun testNode(id: String): ProxyNode {
+    /**
+     * 检测两个出口：直连（本机真实 IP）与代理（经过所选节点的出口）。
+     *
+     * 代理检测必须走 [SingBoxConfigBuilder.probeInboundTag] 那个入站 —— 内核规则会把它强制
+     * 指向节点出站，否则检测请求会按普通分流规则走直连，"代理出口"就永远等于"直连出口"。
+     */
+    suspend fun checkExit() {
         val current = mutableState.value
+        update(
+            current.copy(exitStatus = ExitCheckStatus.Checking, exitMessage = ""),
+            persist = false,
+        )
+        val direct = withContext(Dispatchers.IO) {
+            runCatching { probeExit(proxyPort = null, endpoints = DIRECT_EXIT_ENDPOINTS) }
+        }
+        val proxy = withContext(Dispatchers.IO) {
+            when {
+                current.nodes.isEmpty() -> Result.failure(IllegalStateException("还没有节点，先导入订阅或分享链接"))
+                !current.running -> Result.failure(IllegalStateException("请先启动接管"))
+                probePort <= 0 -> Result.failure(IllegalStateException("检测端口未就绪，请重新启动接管"))
+                else -> runCatching { probeExit(proxyPort = probePort, endpoints = PROXY_EXIT_ENDPOINTS) }
+            }
+        }
+
+        val directInfo = direct.getOrNull() ?: ExitInfo()
+        val proxyInfo = proxy.getOrNull() ?: ExitInfo()
+        val message = buildList {
+            direct.exceptionOrNull()?.let { add("直连出口检测失败（${it.message ?: "未知错误"}）") }
+            proxy.exceptionOrNull()?.let { add("代理出口检测失败（${it.message ?: "未知错误"}）") }
+            if (direct.isSuccess && proxy.isSuccess && directInfo.ip == proxyInfo.ip) {
+                add("直连与代理出口相同（${proxyInfo.ip}），所选节点可能没有生效")
+            }
+        }.joinToString("；")
+        val now = mutableState.value
+        update(
+            now.copy(
+                exitStatus = if (proxy.isSuccess) ExitCheckStatus.Done else ExitCheckStatus.Failed,
+                directExit = directInfo,
+                proxyExit = proxyInfo,
+                exitMessage = message,
+            ),
+            persist = false,
+        )
+    }
+
+    private fun allocateLoopbackPort(): Int = runCatching {
+        ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { it.localPort }
+    }.getOrDefault(0)
+
+    private fun probeExit(proxyPort: Int?, endpoints: List<String>): ExitInfo {
+        var lastError: Exception? = null
+        endpoints.forEach { endpoint ->
+            runCatching { fetchExit(endpoint, proxyPort) }
+                .onSuccess { return it }
+                .onFailure { lastError = it as? Exception }
+        }
+        throw lastError ?: IllegalStateException("所有检测端点都失败")
+    }
+
+    private fun fetchExit(endpoint: String, proxyPort: Int?): ExitInfo {
+        val connection = if (proxyPort != null) {
+            URL(endpoint).openConnection(
+                Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", proxyPort)),
+            )
+        } else {
+            URL(endpoint).openConnection(Proxy.NO_PROXY)
+        } as HttpURLConnection
+        connection.connectTimeout = 8_000
+        connection.readTimeout = 10_000
+        connection.setRequestProperty("User-Agent", "NetworkManager-Android")
+        return try {
+            if (connection.responseCode !in 200..299) error("HTTP ${connection.responseCode}")
+            val body = connection.inputStream.bufferedReader().use { it.readText() }
+            parseExit(body)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun parseExit(body: String): ExitInfo {
+        val text = body.trim()
+        if (text.startsWith("{")) {
+            val json = JSONObject(text)
+            if (json.optString("status") == "fail") {
+                error(json.optString("message").ifBlank { "检测端点返回失败" })
+            }
+            val ip = json.optString("query").ifBlank { error("检测端点没有返回 IP") }
+            val location = listOf(
+                json.optString("country"),
+                json.optString("regionName"),
+                json.optString("city"),
+            ).filter { it.isNotBlank() && it != "null" }.joinToString(" ")
+            return ExitInfo(ip, location)
+        }
+        // ipip 的文本格式：当前 IP：1.2.3.4  来自于：中国 浙江 杭州  电信
+        val ip = IPV4.find(text)?.value ?: error("检测端点没有返回 IP")
+        val location = text.substringAfter("来自于：", "").replace(Regex("\\s+"), " ").trim()
+        return ExitInfo(ip, location)
+    }
+
+    suspend fun testNode(id: String): ProxyNode {        val current = mutableState.value
         val node = current.nodes.firstOrNull { it.id == id } ?: error("节点不存在或已被删除")
         update(
             current.copy(
@@ -257,10 +382,18 @@ class AppRepository private constructor(private val context: Context) {
 
     fun runtimeConfigFile(): File = File(context.filesDir, "runtime.json")
 
+    /** 出口检测专用入站当前监听的端口，0 表示没有（配置里没写或还没有节点）。 */
+    @Volatile
+    private var probePort: Int = 0
+
     fun writeRuntimeConfig(): File {
+        val state = mutableState.value
+        // 每次生成配置时重新挑一个空闲端口：sing-box 碰到端口占用会直接启动失败，
+        // 而 App 挑完端口立刻就用它发请求，不存在「配置里写的」和「实际监听的」不一致的问题。
+        probePort = if (state.nodes.isEmpty()) 0 else allocateLoopbackPort()
         val file = runtimeConfigFile()
         val temporary = File(file.parentFile, "runtime.tmp")
-        temporary.writeText(SingBoxConfigBuilder.build(mutableState.value), Charsets.UTF_8)
+        temporary.writeText(SingBoxConfigBuilder.build(state, probePort), Charsets.UTF_8)
         if (!temporary.renameTo(file)) {
             temporary.copyTo(file, overwrite = true)
             temporary.delete()

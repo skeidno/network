@@ -23,6 +23,21 @@ enum class LatencyStatus {
     Error,
 }
 
+enum class ExitCheckStatus {
+    Idle,
+    Checking,
+    Done,
+    Failed,
+}
+
+/// 一次出口检测的结果：IP 加能查到的归属地（查不到就留空，不编造）。
+data class ExitInfo(
+    val ip: String = "",
+    val location: String = "",
+) {
+    val available: Boolean get() = ip.isNotBlank()
+}
+
 data class ProxyNode(
     val id: String,
     val name: String,
@@ -173,6 +188,11 @@ data class AppState(
     val totalUploadBytes: Long = 0,
     val downloadSamples: List<Long> = List(30) { 0L },
     val uploadSamples: List<Long> = List(30) { 0L },
+    // 出口检测是运行态，不落盘：进程重启后回到未检测。
+    val exitStatus: ExitCheckStatus = ExitCheckStatus.Idle,
+    val directExit: ExitInfo = ExitInfo(),
+    val proxyExit: ExitInfo = ExitInfo(),
+    val exitMessage: String = "",
     val error: String = "",
 )
 
