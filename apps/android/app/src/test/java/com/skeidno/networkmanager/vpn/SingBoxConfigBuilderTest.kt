@@ -1,6 +1,7 @@
 package com.skeidno.networkmanager.vpn
 
 import com.skeidno.networkmanager.data.AppState
+import com.skeidno.networkmanager.data.DEFAULT_PROXY_DOMAINS
 import com.skeidno.networkmanager.data.FallbackTarget
 import com.skeidno.networkmanager.data.ProxyNode
 import com.skeidno.networkmanager.data.PortableRule
@@ -36,7 +37,8 @@ class SingBoxConfigBuilderTest {
         assertEquals("direct", route.getString("final"))
         val domainRule = route.getJSONArray("rules").getJSONObject(4)
         assertEquals("proxy", domainRule.getString("outbound"))
-        assertEquals(67, domainRule.getJSONArray("domain_suffix").length())
+        // 别写死条数：内置清单会持续扩充，写死的数字每次扩充都会假失败。
+        assertEquals(DEFAULT_PROXY_DOMAINS.size, domainRule.getJSONArray("domain_suffix").length())
         assertTrue(config.toString().contains("arcteryx.com"))
         val outbounds = config.getJSONArray("outbounds")
         assertTrue((0 until outbounds.length()).none {
