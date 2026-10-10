@@ -799,7 +799,9 @@ private fun NodesPage(
     }
     val groupOrder = (state.nodeGroups + groupedNodes.keys).distinct()
     LazyVerticalGrid(
-        columns = GridCells.Adaptive(168.dp),
+        // 168dp 时卡片一行要塞「名字 + 协议 + 延迟 + 三个图标」，中文节点名只剩一个字；
+        // 190dp 让手机上一列、平板上三列，名字都有足够宽度。
+        columns = GridCells.Adaptive(190.dp),
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(16.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -1013,7 +1015,6 @@ private fun NodeCard(
         Column(Modifier.fillMaxSize().padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(node.name, modifier = Modifier.weight(1f), fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Latency(node)
                 IconButton(
                     onClick = onTest,
                     enabled = node.latencyStatus != LatencyStatus.Testing,
@@ -1025,9 +1026,11 @@ private fun NodeCard(
                     Icon(Icons.Default.DeleteOutline, contentDescription = "删除节点", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(19.dp))
                 }
             }
+            // 延迟放第二行：和名字挤同一行时，窄卡片上有延迟就把名字压成「海…」。
             Row(verticalAlignment = Alignment.CenterVertically) {
                 AssistChip(onClick = {}, label = { Text(node.protocol, fontSize = 11.sp) })
                 Spacer(Modifier.weight(1f))
+                Latency(node)
                 IconButton(onClick = onGroup, modifier = Modifier.size(32.dp)) {
                     Icon(
                         Icons.Default.Folder,
