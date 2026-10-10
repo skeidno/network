@@ -2,12 +2,13 @@ use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
-use crate::core::AppState;
+use crate::core::{AppState, NodeDelay};
 use crate::importers::{parse_import_content, unique_node_name};
 use crate::models::{
     AppConfig, ImportedNode, RoutingRule, SshServerProfile, SubscriptionSource,
 };
 use crate::paths::core_log_path;
+use crate::server::Shared;
 
 fn text(args: &[Value], index: usize) -> String {
     args.get(index)
@@ -466,7 +467,9 @@ fn parse_ipv4_at(bytes: &[u8], start: usize) -> Option<(String, usize)> {
     ))
 }
 
-async fn measure_delay(host: &str, port: u16) -> Result<i64, String> {    if host.is_empty() || port == 0 {
+/// 节点的「可用性/延迟」用一次 TCP 握手衡量：够轻，且不依赖内核是否在跑。
+async fn measure_delay(host: &str, port: u16) -> Result<i64, String> {
+    if host.is_empty() || port == 0 {
         return Err("节点缺少地址或端口".into());
     }
     let address = format!("{host}:{port}");
@@ -477,6 +480,95 @@ async fn measure_delay(host: &str, port: u16) -> Result<i64, String> {    if hos
         .map_err(|err| format!("连接失败：{err}"))?;
     drop(stream);
     Ok(start.elapsed().as_millis() as i64)
+}
+
+/// 解析这次要测速的节点下标。
+///
+/// 前端传的是节点**名字**，而这里原来直接按数字下标解析 —— 名字解析不出来就退化成
+/// 0，于是「点某个节点测速」永远在测第一个节点，被点的那张卡片自然毫无动静。
+/// 现在两种写法都认：字符串按名字找，其余按下标。
+fn test_indices(state: &AppState, method: &str, args: &[Value]) -> Vec<usize> {
+    if method == "testAllNodes" {
+        return (0..state.config.imported_nodes.len()).collect();
+    }
+    if method == "testSource" {
+        let index = number(args, 0) as usize;
+        let source_id = state
+            .config
+            .subscriptions
+            .get(index)
+            .map(|source| source.source_id.clone())
+            .unwrap_or_default();
+        return state
+            .config
+            .imported_nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.source_id == source_id)
+            .map(|(index, _)| index)
+            .collect();
+    }
+    match args.first() {
+        Some(Value::String(name)) => state
+            .config
+            .imported_nodes
+            .iter()
+            .position(|node| &node.name() == name)
+            .into_iter()
+            .collect(),
+        _ => vec![number(args, 0) as usize],
+    }
+}
+
+/// 把选中的节点标成「测试中」，界面据此显示进度并禁用按钮。
+fn mark_nodes_testing(state: &mut AppState, indices: &[usize]) {
+    let names: Vec<String> = indices
+        .iter()
+        .filter_map(|index| state.config.imported_nodes.get(*index).map(|node| node.name()))
+        .collect();
+    for name in names {
+        state.node_delays.insert(
+            name,
+            NodeDelay {
+                status: "testing".into(),
+                delay: None,
+                message: String::new(),
+            },
+        );
+    }
+}
+
+/// 后台逐个测速并回写结果。
+///
+/// 每次等待网络前都重新取锁、测完立刻放锁：期间界面照常轮询，能看到「测试中」
+/// 一步步变成具体延迟。
+pub async fn run_node_tests(shared: Shared, indices: Vec<usize>) {
+    for index in indices {
+        let target = {
+            let state = shared.lock().await;
+            state.config.imported_nodes.get(index).map(|node| {
+                let (host, port) = node_endpoint(node);
+                (node.name(), host, port)
+            })
+        };
+        let Some((name, host, port)) = target else {
+            continue;
+        };
+        let delay = match measure_delay(&host, port).await {
+            Ok(delay) => NodeDelay {
+                status: "ok".into(),
+                delay: Some(delay),
+                message: String::new(),
+            },
+            Err(error) => NodeDelay {
+                status: "error".into(),
+                delay: None,
+                message: error,
+            },
+        };
+        let mut state = shared.lock().await;
+        state.node_delays.insert(name, delay);
+    }
 }
 
 /// 常用海外站点规则组在 `rules` 中的下标。
@@ -679,7 +771,12 @@ fn apply(state: &mut AppState) -> Result<Value, String> {
     Ok(json!(true))
 }
 
-pub async fn dispatch(state: &mut AppState, method: &str, args: Vec<Value>) -> Result<Value, String> {
+pub async fn dispatch(
+    shared: &Shared,
+    state: &mut AppState,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     match method {
         "getState" => Ok(crate::state::build(state)),
         "getLogs" => {
@@ -1114,56 +1211,16 @@ pub async fn dispatch(state: &mut AppState, method: &str, args: Vec<Value>) -> R
             apply(state)
         }
         "testNode" | "testAllNodes" | "testSource" => {
-            let indices: Vec<usize> = if method == "testAllNodes" {
-                (0..state.config.imported_nodes.len()).collect()
-            } else if method == "testSource" {
-                let index = number(&args, 0) as usize;
-                let source_id = state
-                    .config
-                    .subscriptions
-                    .get(index)
-                    .map(|source| source.source_id.clone())
-                    .unwrap_or_default();
-                state
-                    .config
-                    .imported_nodes
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, node)| node.source_id == source_id)
-                    .map(|(index, _)| index)
-                    .collect()
-            } else {
-                vec![number(&args, 0) as usize]
-            };
-            for index in indices {
-                let Some(node) = state.config.imported_nodes.get(index) else {
-                    continue;
-                };
-                let name = node.name();
-                let (host, port) = node_endpoint(node);
-                match measure_delay(&host, port).await {
-                    Ok(delay) => {
-                        state.node_delays.insert(
-                            name,
-                            crate::core::NodeDelay {
-                                status: "ok".into(),
-                                delay: Some(delay),
-                                message: String::new(),
-                            },
-                        );
-                    }
-                    Err(error) => {
-                        state.node_delays.insert(
-                            name,
-                            crate::core::NodeDelay {
-                                status: "error".into(),
-                                delay: None,
-                                message: error,
-                            },
-                        );
-                    }
-                }
-            }
+            // 先把要测的节点标成 testing 并立即返回，真正的连接放到后台任务里做。
+            // 以前是在这里同步 await 测完才返回：单节点还好，批量测速（几十个节点
+            // × 最多 3 秒超时）不但让这个请求挂很久，还因为整个 dispatch 持有
+            // state 锁，让界面的状态轮询一起卡住 —— 表现就是「点了没反应」。
+            let indices = test_indices(state, method, &args);
+            mark_nodes_testing(state, &indices);
+            let worker = shared.clone();
+            tokio::spawn(async move {
+                run_node_tests(worker, indices).await;
+            });
             Ok(json!(true))
         }
         "addSubscription" => {

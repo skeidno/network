@@ -20,6 +20,9 @@ let initialFailureCount = 0;
 let statePollTimer = 0;
 // 服务器部署页的多选集合（表格视图下用于批量操作）
 const sshSelection = new Set();
+// 正在等后端回话的服务器（profileId）。部署/检查是同步长请求，后端状态要等
+// 下一轮轮询才可见，这里先本地记一笔，点击后界面立刻显示「检查中」。
+const pendingServerTasks = new Set();
 const renderSignatures = new Map();
 const COLLAPSED_NODE_GROUPS_KEY = "network-manager.collapsed-node-groups";
 const DEFAULT_SERVER_PROXY_PORT = 24443;
@@ -241,7 +244,7 @@ function statePollDelay() {
   const serverDeploying = (appState.sshServers || []).some(
     (server) => server.deployment?.status === "deploying",
   );
-  if (appState.core?.busy || coreActionPending || nodeTesting || serverDeploying) return 500;
+  if (appState.core?.busy || coreActionPending || nodeTesting || serverDeploying || pendingServerTasks.size) return 500;
   if (currentPage === "overview" && appState.core?.running) return 1000;
   if (currentPage === "logs") return 1500;
   return 2500;
@@ -640,7 +643,8 @@ function renderNodes() {
   const testing = sourceNodes.some((node) => node.latencyStatus === "testing");
   const nodes = testing ? sourceNodes : [...sourceNodes].sort(compareNodeLatency);
   const testButton = byId("test-all-nodes");
-  testButton.disabled = !appState.core.running || nodes.length === 0 || testing;
+  // 测速是直接 TCP 握手，不需要内核在跑，别因为这个把按钮灰掉。
+  testButton.disabled = nodes.length === 0 || testing;
   testButton.querySelector("span:last-child").textContent = testing ? "测速中" : "批量测速";
   const errorCount = sourceNodes.filter((node) => node.latencyStatus === "error").length;
   const deleteErrorButton = byId("delete-error-nodes");
@@ -684,7 +688,7 @@ function renderNodes() {
           <div class="node-card-actions">
             <span class="node-latency ${latencyLevel}" title="${escapeHtml(node.latencyMessage || latencyText)}">${latencyText}</span>
             <button class="mini-button${node.dialerProxy ? " active" : ""}" data-node-dialer="${escapeHtml(node.name)}" title="设置前置/中转节点" aria-label="设置前置/中转节点">${icon("link")}</button>
-            <button class="mini-button" data-node-test="${escapeHtml(node.name)}" title="测试该节点" aria-label="测试该节点"${!appState.core.running || node.latencyStatus === "testing" ? " disabled" : ""}>${icon("wifi")}</button>
+            <button class="mini-button" data-node-test="${node.index}" title="测试该节点" aria-label="测试该节点"${node.latencyStatus === "testing" ? " disabled" : ""}>${icon("wifi")}</button>
             <button class="mini-button" data-node-group="${escapeHtml(node.name)}" title="移动到分组" aria-label="移动到分组">${icon("folder-open")}</button>
             <button class="mini-button danger" data-node-delete="${node.index}" title="删除节点" aria-label="删除节点">${icon("trash-2")}</button>
           </div>
@@ -770,24 +774,31 @@ function renderSshServers() {
   // 选中项只保留仍然存在的服务器，避免删除后残留
   const alive = new Set(servers.map((server) => server.profileId));
   sshSelection.forEach((id) => { if (!alive.has(id)) sshSelection.delete(id); });
-  if (!shouldRender("ssh-servers", servers)) { updateSshSelectionUi(); return; }
+  if (!shouldRender("ssh-servers", { servers, pending: [...pendingServerTasks].sort() })) {
+    updateSshSelectionUi();
+    return;
+  }
   byId("ssh-servers-empty").classList.toggle("is-hidden", servers.length > 0);
-  const deploying = servers.find((server) => server.deployment?.status === "deploying");
+  const busyOf = (server) => server.deployment?.status === "deploying" || pendingServerTasks.has(server.profileId);
+  const deploying = servers.find(busyOf);
   const deployedCount = servers.filter((server) => server.deployed).length;
-  byId("ssh-status-title").textContent = deploying ? "正在部署服务器代理" : "远端代理部署";
+  byId("ssh-status-title").textContent = deploying
+    ? deploying.deployed ? "正在检查远端代理服务" : "正在部署服务器代理"
+    : "远端代理部署";
   byId("ssh-status-detail").textContent = deploying
-    ? deploying.deployment.stage || "正在执行远端配置"
+    ? deploying.deployment?.stage || "正在执行远端配置"
     : `${deployedCount} 个服务器节点已就绪；SSH 无需保持连接`;
   const authLabels = { password: "密码", key: "私钥", agent: "SSH Agent" };
   byId("ssh-server-body").innerHTML = servers.map((server) => {
     const task = server.deployment || { status: "idle", stage: "", error: "" };
-    const isDeploying = task.status === "deploying";
+    const isDeploying = task.status === "deploying" || pendingServerTasks.has(server.profileId);
     const hasError = task.status === "error";
     const portWarning = server.proxyPortWarning || "";
     const hasWarning = task.status === "warning" || Boolean(portWarning);
-    const statusText = isDeploying ? "部署中" : hasError ? "部署失败" : portWarning ? "端口需调整" : hasWarning ? "外端口未开放" : server.deployed ? "已部署" : "未部署";
-    const statusClass = hasError ? " is-error" : hasWarning ? " is-warning" : server.deployed ? " is-running" : "";
-    const detail = portWarning || (isDeploying ? task.stage : hasError || hasWarning ? task.error || task.stage : server.deployedVersion || "等待部署");
+    // 已部署的那次动作是「检查服务」，状态就该写「检查中」，别一律叫部署中。
+    const statusText = isDeploying ? (server.deployed ? "检查中" : "部署中") : hasError ? "部署失败" : portWarning ? "端口需调整" : hasWarning ? "外端口未开放" : server.deployed ? "已部署" : "未部署";
+    const statusClass = hasError ? " is-error" : hasWarning ? " is-warning" : isDeploying ? " is-busy" : server.deployed ? " is-running" : "";
+    const detail = portWarning || (isDeploying ? task.stage || (server.deployed ? "正在检查远端代理服务" : "正在执行远端配置") : hasError || hasWarning ? task.error || task.stage : server.deployedVersion || "等待部署");
     const selected = sshSelection.has(server.profileId) ? " checked" : "";
     return `<tr data-profile-id="${server.profileId}"${sshSelection.has(server.profileId) ? ' class="is-selected"' : ""}>
       <td class="cell-select"><input type="checkbox" data-ssh-select="${server.profileId}" aria-label="选择 ${escapeHtml(server.name)}"${selected}></td>
@@ -797,7 +808,7 @@ function renderSshServers() {
       <td title="${escapeHtml(server.host)}:${server.proxyPort}">${escapeHtml(server.host)}:${server.proxyPort}</td>
       <td><span class="small-status${statusClass}" title="${escapeHtml(detail)}">${statusText}</span></td>
       <td class="actions">
-        <button class="button primary compact-button" data-ssh-action="deploy" data-profile-id="${server.profileId}"${isDeploying || Boolean(deploying) ? " disabled" : ""}>${icon(isDeploying || server.deployed ? "refresh-cw" : "hard-drive-download")}<span>${server.deployed ? "检查服务" : "部署代理"}</span></button>
+        <button class="button primary compact-button" data-ssh-action="deploy" data-profile-id="${server.profileId}"${isDeploying || Boolean(deploying) ? " disabled" : ""}>${icon(isDeploying || server.deployed ? "refresh-cw" : "hard-drive-download")}<span>${isDeploying ? (server.deployed ? "检查中" : "部署中") : server.deployed ? "检查服务" : "部署代理"}</span></button>
         <button class="icon-button" data-ssh-action="copy" data-profile-id="${server.profileId}"${server.shareLink ? "" : " disabled"} title="复制节点链接" aria-label="复制节点">${icon("link")}</button>
         <button class="icon-button" data-ssh-action="edit" data-profile-id="${server.profileId}" title="编辑" aria-label="编辑">${icon("square-pen")}</button>
         ${server.hasCredential ? `<button class="icon-button" data-ssh-action="forget" data-profile-id="${server.profileId}" title="清除已保存的密码" aria-label="清除已保存的密码">${icon("key-round")}</button>` : ""}
@@ -1474,9 +1485,21 @@ function openSshServerDialog(server = null) {
   updateAuthFields();
 }
 
+/// 触发一次部署/检查：先本地标成进行中（界面立刻有反馈），请求结束后再交回给
+/// 后端的真实状态。
+function runServerTask(profileId, ...args) {
+  pendingServerTasks.add(profileId);
+  renderSshServers();
+  scheduleStateRefresh(0);
+  return invoke("deploySshServer", profileId, ...args).finally(() => {
+    pendingServerTasks.delete(profileId);
+    scheduleStateRefresh(0);
+  });
+}
+
 function deploySshServer(server) {
   if (server.authMethod === "agent") {
-    invoke("deploySshServer", server.profileId, "");
+    runServerTask(server.profileId, "");
     return;
   }
   const hasSaved = Boolean(server.hasCredential);
@@ -1490,8 +1513,7 @@ function deploySshServer(server) {
     </div>`, [
       { label: "取消", kind: "secondary", action: closeModal },
       { label: server.deployed ? "检查服务" : "开始部署", kind: "primary", action: () => {
-      invoke(
-        "deploySshServer",
+      runServerTask(
         server.profileId,
         byId("modal-connect-password").value,
         byId("modal-connect-remember").checked,
@@ -1691,7 +1713,7 @@ function bindEvents() {
     const testButton = event.target.closest("[data-node-test]");
     if (testButton) {
       event.stopPropagation();
-      invoke("testNode", testButton.dataset.nodeTest);
+      invoke("testNode", Number(testButton.dataset.nodeTest));
       return;
     }
     const groupButton = event.target.closest("[data-node-group]");
@@ -1765,7 +1787,7 @@ function bindEvents() {
       [
         { label: "取消", kind: "secondary", action: () => {} },
         { label: `开始部署 ${picked.length} 台`, kind: "primary", action: () => {
-          picked.forEach((server) => invoke("deploySshServer", server.profileId, "", false));
+          picked.forEach((server) => runServerTask(server.profileId, "", false));
         } },
       ]);
   });

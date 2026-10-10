@@ -5,9 +5,23 @@
 
 use serde_json::{json, Value};
 
+use crate::core::DeployTask;
 use crate::models::{ImportedNode, NODE_DIALER_POLICY_KEY, NODE_DIALER_PROXY_KEY};
 use crate::server::Shared;
 use crate::ssh;
+
+/// 记下这次部署/检查的状态，界面据此显示「检查中／部署中」。
+async fn set_task(shared: &Shared, profile_id: &str, status: &str, stage: &str) {
+    let mut state = shared.lock().await;
+    state.deployments.insert(
+        profile_id.to_string(),
+        DeployTask {
+            status: status.to_string(),
+            stage: stage.to_string(),
+            error: String::new(),
+        },
+    );
+}
 
 fn text(args: &[Value], index: usize) -> String {
     args.get(index)
@@ -92,6 +106,22 @@ pub async fn run(shared: Shared, args: Vec<Value>) -> Result<Value, String> {
             profile.proxy_port
         ));
     }
+
+    // 从这里开始才有远端动作，先把状态挂出去，让界面立刻切到「检查中／部署中」。
+    // 放在端口校验之后：那些早退路径不该留下一个永远转圈的状态。
+    set_task(
+        &shared,
+        &profile_id,
+        "deploying",
+        if force {
+            "正在重新部署并轮换节点密码"
+        } else if existing_node.is_some() {
+            "正在检查远端代理服务"
+        } else {
+            "正在查找远端现有代理服务"
+        },
+    )
+    .await;
 
     let mut progress: Vec<String> = Vec::new();
     let mut reporter = |stage: String| {
@@ -178,6 +208,14 @@ pub async fn run(shared: Shared, args: Vec<Value>) -> Result<Value, String> {
                     "{message}；本次使用的是已保存的旧密码，若服务器密码已变更，请在弹窗中输入新密码并勾选覆盖"
                 );
             }
+            guard.deployments.insert(
+                profile_id.clone(),
+                DeployTask {
+                    status: "error".into(),
+                    stage: String::new(),
+                    error: message.clone(),
+                },
+            );
             guard.notify("error", message.clone());
             return Err(message);
         }
@@ -191,6 +229,7 @@ pub async fn run(shared: Shared, args: Vec<Value>) -> Result<Value, String> {
         .find(|item| item.profile_id == profile_id)
         .cloned()
     else {
+        state.deployments.remove(&profile_id);
         return Err("SSH 服务器不存在".into());
     };
 
@@ -203,6 +242,14 @@ pub async fn run(shared: Shared, args: Vec<Value>) -> Result<Value, String> {
     let target_name = snapshot.name.clone();
     let port_error = crate::models::server_proxy_port_error(deployed_port, ssh_port);
     if !port_error.is_empty() {
+        state.deployments.insert(
+            profile_id.clone(),
+            DeployTask {
+                status: "error".into(),
+                stage: String::new(),
+                error: port_error.clone(),
+            },
+        );
         state.notify("error", port_error.clone());
         return Err(port_error);
     }
@@ -306,6 +353,8 @@ pub async fn run(shared: Shared, args: Vec<Value>) -> Result<Value, String> {
         }
     }
 
+    // 干完了：清掉进度状态，界面回到「已部署」。
+    state.deployments.remove(&profile_id);
     apply_automatic_node_dialers(&mut state.config.imported_nodes);
     let _ = state.apply_config();
     let running = state.core.is_running();

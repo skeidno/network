@@ -343,6 +343,17 @@ body.page-scrolled .topbar { box-shadow: var(--shadow-1); }
 .small-status.is-error { color: var(--danger-text); background: var(--danger-soft); }
 .small-status.is-warning { color: var(--amber-text); background: var(--amber-soft); }
 .status-badge.is-busy { color: var(--amber-text); background: var(--amber-soft); }
+/* 检查中／部署中：蓝色 + 呼吸圆点，让「程序正在干活」一眼可见。 */
+.small-status.is-busy { color: var(--blue-text); background: var(--blue-soft); }
+.small-status.is-busy::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  margin-right: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: status-pulse 1.2s ease-in-out infinite;
+}
 
 .page-content { min-width: 0; min-height: 0; overflow: auto; padding: 24px 30px 34px; }
 .page { display: none; width: 100%; max-width: 1440px; margin: 0 auto; }

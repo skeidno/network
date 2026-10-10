@@ -378,6 +378,9 @@ pub fn build(state: &mut AppState) -> Value {
                     profile.proxy_port, config.server_proxy_port
                 )
             };
+            // 前端靠这个字段显示「检查中／部署中」，以前后端没有它，
+            // 状态列永远停在「已部署」，点了按钮看起来毫无反应。
+            let task = state.deployments.get(&profile.profile_id);
             json!({
                 "profileId": profile.profile_id,
                 "name": profile.name,
@@ -385,6 +388,11 @@ pub fn build(state: &mut AppState) -> Value {
                 "host": profile.host,
                 "port": profile.port,
                 "username": profile.username,
+                "deployment": {
+                    "status": task.map(|item| item.status.clone()).unwrap_or_else(|| "idle".into()),
+                    "stage": task.map(|item| item.stage.clone()).unwrap_or_default(),
+                    "error": task.map(|item| item.error.clone()).unwrap_or_default(),
+                },
                 "proxyPort": profile.proxy_port,
                 "proxyPortWarning": warning,
                 "proxyReachable": profile.proxy_reachable,

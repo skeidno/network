@@ -279,7 +279,7 @@ async fn call_api(
     }
 
     let mut state = shared.lock().await;
-    match crate::methods::dispatch(&mut state, &method, args).await {
+    match crate::methods::dispatch(&shared, &mut state, &method, args).await {
         Ok(result) => security_headers(Json(json!({"ok": true, "result": result})).into_response()),
         Err(message) => security_headers((
             StatusCode::BAD_REQUEST,
@@ -299,7 +299,7 @@ async fn read_api(State(shared): State<Shared>, headers: HeaderMap, uri: Uri) ->
     if !authorized(&state, &headers) {
         return security_headers(unauthorized_json());
     }
-    match crate::methods::dispatch(&mut state, method, Vec::new()).await {
+    match crate::methods::dispatch(&shared, &mut state, method, Vec::new()).await {
         Ok(result) => {
             let content_type = if method == "getLogs" {
                 "text/plain; charset=utf-8"

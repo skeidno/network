@@ -16,6 +16,18 @@ pub struct NodeDelay {
     pub message: String,
 }
 
+/// 服务器代理的部署/检查进度。
+///
+/// 「检查服务」在远端可能要跑好几秒，界面得能显示「检查中」，否则用户会以为
+/// 点了没反应。状态存在这里而不是服务器配置里：它是一次运行态，不该落盘。
+#[derive(Debug, Clone, Default)]
+pub struct DeployTask {
+    /// idle / deploying / error
+    pub status: String,
+    pub stage: String,
+    pub error: String,
+}
+
 
 pub struct CoreProcess {
     child: Option<Child>,
@@ -209,6 +221,8 @@ pub struct AppState {
     pub config: AppConfig,
     pub core: CoreProcess,
     pub node_delays: HashMap<String, NodeDelay>,
+    /// profile_id -> 正在进行的部署/检查任务。
+    pub deployments: HashMap<String, DeployTask>,
     pub session_token: String,
     pub access_username: String,
     pub access_password: String,
@@ -228,6 +242,7 @@ impl AppState {
             config: crate::store::load(),
             core: CoreProcess::default(),
             node_delays: HashMap::new(),
+            deployments: HashMap::new(),
             session_token: crate::server::random_session_token(),
             access_username: "admin".into(),
             access_password: std::env::var("NETWORK_MANAGER_WEB_PASSWORD").unwrap_or_default(),
