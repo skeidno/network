@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  这是一个代理工具，明文 HTTP 是功能的一部分，不是疏漏：
+  1. 出口检测端点里有几家只提供 http（ip-api 免费版、ip.3322.net、ipip 的 80 端口），
+     Android 9 起默认禁止明文，会把出口检测整个拦掉；
+  2. 订阅地址常常是明文 http（自建节点尤其常见），拦掉会表现为「订阅导入失败」。
+  所以这里显式允许明文。App 自身不承载任何账号体系，也不回传数据。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
