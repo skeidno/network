@@ -129,6 +129,28 @@ async fn exit_ip_through_proxy(proxy_url: &str) -> Result<ExitIdentity, String> 
     fetch_exit_identity(&client).await
 }
 
+/// 代理出口检测该连哪个端口，以及是否连上了「检测专用入站」。
+///
+/// 不能直接用混合端口：内核规则第一条 `PROCESS-NAME,NetworkManager.exe,DIRECT`
+/// 会把本程序发出的请求强制直连，于是"代理出口"永远等于"直连出口"。
+/// 内核为此单开了一个检测入站（`IN-PORT` 规则指向内置节点组），这里优先连它。
+/// 内核还在跑旧配置（没有该入站）时退回混合端口，调用方需要提示用户重启接管。
+async fn proxy_probe_endpoint(config: &AppConfig) -> (String, bool) {
+    let probe = crate::mihomo::probe_port(config);
+    let reachable = tokio::time::timeout(
+        Duration::from_millis(500),
+        TcpStream::connect(("127.0.0.1", probe as u16)),
+    )
+    .await
+    .map(|result| result.is_ok())
+    .unwrap_or(false);
+    if reachable {
+        (format!("http://127.0.0.1:{probe}"), true)
+    } else {
+        (format!("http://127.0.0.1:{}", config.mixed_port), false)
+    }
+}
+
 /// 所有端点同时发起。先拿到「带归属地」的结果就直接返回；
 /// 只拿到裸 IP 时，再宽限 3 秒等一个带归属地的响应，实在没有就用裸 IP。
 async fn fetch_exit_identity(client: &reqwest::Client) -> Result<ExitIdentity, String> {
@@ -1401,15 +1423,19 @@ pub async fn dispatch(
         }
         "testExit" => {
             // 一次测两个出口：直连（本机真实 IP）与代理（经过内置节点的出口）。
-            // 代理检测沿用 Python 语义：必须先启动内核，通过本地混合端口出站。
+            // 代理检测必须先启动内核；并且要走「检测专用入站」，否则会被进程名直连规则吃掉。
             let core_running = state.core.is_running();
+            let (proxy, precise) = if core_running {
+                proxy_probe_endpoint(&state.config).await
+            } else {
+                (format!("http://127.0.0.1:{}", state.config.mixed_port), false)
+            };
             let (local, proxy_result) = tokio::join!(
                 exit_ip_direct(),
                 async {
                     if !core_running {
                         return Err("内核未运行".to_string());
                     }
-                    let proxy = format!("http://127.0.0.1:{}", state.config.mixed_port);
                     exit_ip_through_proxy(&proxy).await
                 }
             );
@@ -1437,12 +1463,21 @@ pub async fn dispatch(
                             "success",
                             format!("直连 {} · 代理出口 {}", describe(&local_ip), describe(&identity)),
                         );
-                        if local_ip.ip == identity.ip {
-                            // TUN 接管会把「直连」流量也送进内核，两个 IP 相同是
-                            // 预期结果，说明接管生效；不是检测出错。
+                        if !precise {
+                            // 走的是混合端口，内核的进程名直连规则会把请求变成直连 ——
+                            // 结果必然等于直连，不能当成"节点没生效"来误导用户。
                             state.notify(
-                                "info",
-                                "直连与代理出口相同：当前处于接管状态，直连流量也走了内核".to_string(),
+                                "warning",
+                                "代理出口检测走的是普通端口（内核配置较旧），结果会等于直连；重启一次接管后即可精确检测"
+                                    .to_string(),
+                            );
+                        } else if local_ip.ip == identity.ip {
+                            state.notify(
+                                "warning",
+                                format!(
+                                    "代理出口与直连相同（{}）：所选节点可能没有生效，请检查节点是否可用",
+                                    identity.ip
+                                ),
                             );
                         }
                     }

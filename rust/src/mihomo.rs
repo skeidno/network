@@ -11,6 +11,30 @@ const TARGET_NAMES: &[(&str, &str)] = &[
     ("DIRECT", "DIRECT"),
 ];
 
+/// 出口检测专用的入站监听名。
+///
+/// 为什么必须单开一个入站：规则第一条是 `PROCESS-NAME,NetworkManager.exe,DIRECT`，
+/// 它保证「直连出口」能测到本机真实 IP（否则本程序自己的请求也会被 TUN 送进节点）。
+/// 但同一条规则会把「代理出口」的检测请求也变成直连 —— 两个出口永远相同。
+/// 所以代理检测改走这个专用入站，并在规则最前面用 `IN-PORT` 把它强制指向内置节点组，
+/// 优先级高于进程名规则。
+pub const PROBE_LISTENER_NAME: &str = "egress-probe";
+
+/// 检测入站端口：由混合端口**确定性派生**（紧邻的一个不冲突值）。
+///
+/// 不能用「找一个当前空闲的端口」：内核正常运行时该端口已被内核占用，
+/// 再探测会被判成"被占用"而换一个，于是配置里写的端口和内核实际监听的对不上。
+pub fn probe_port(config: &AppConfig) -> i32 {
+    let mut port = (config.mixed_port + 1).clamp(1, 65535);
+    for _ in 0..8 {
+        if port != config.controller_port && port != config.dns_port && port < 65535 {
+            return port;
+        }
+        port += 1;
+    }
+    port
+}
+
 const UPSTREAM_PROCESSES: &[&str] = &[
     "verge-mihomo.exe",
     "clash.exe",
@@ -199,10 +223,18 @@ pub fn build(config: &AppConfig) -> Value {
         }
     }
 
-    let mut rules: Vec<String> = UPSTREAM_PROCESSES
-        .iter()
-        .map(|name| format!("PROCESS-NAME,{name},DIRECT"))
-        .collect();
+    // 检测入站必须排在最前面：它要压过下面的 `PROCESS-NAME,NetworkManager.exe,DIRECT`，
+    // 否则代理出口检测又会退化成直连（见 PROBE_LISTENER_NAME 的说明）。
+    let probe_port = probe_port(config);
+    let mut rules: Vec<String> = Vec::new();
+    if !config.imported_nodes.is_empty() {
+        rules.push(format!("IN-PORT,{probe_port},{}", target_name("BUILTIN")));
+    }
+    rules.extend(
+        UPSTREAM_PROCESSES
+            .iter()
+            .map(|name| format!("PROCESS-NAME,{name},DIRECT")),
+    );
     rules.push("DST-PORT,22,DIRECT".into());
     rules.extend(dialer_route_rules(config));
     rules.extend(
@@ -304,6 +336,15 @@ pub fn build(config: &AppConfig) -> Value {
         },
         "proxies": proxies,
         "rules": rules,
+        // 只给出口检测用的入站：绑定回环，外部访问不到，也不参与 TUN。
+        "listeners": [
+            {
+                "name": PROBE_LISTENER_NAME,
+                "type": "mixed",
+                "port": probe_port,
+                "listen": "127.0.0.1",
+            }
+        ],
     });
 
     if !config.imported_nodes.is_empty() {
