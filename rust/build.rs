@@ -32,9 +32,12 @@ fn main() {
 
     // Windows 上把图标、UAC 提权清单嵌进 exe：
     //   - 图标让安装后在资源管理器/开始菜单里显示应用图标；
-    //   - requireAdministrator 是 TUN 虚拟网卡的前提，Python 版靠 PyInstaller
-    //     的 uac_admin=True 实现，这里必须等价，否则 mihomo 会报
-    //     "configure tun interface: Access is denied"。
+    //   - 清单里的 requireAdministrator 让双击直接以管理员身份运行（弹一次
+    //     UAC），省掉右键选择或进界面再提权重启这一步；TUN 虚拟网卡本来也
+    //     就要管理员令牌，否则 mihomo 会报 "configure tun interface:
+    //     Access is denied"。注意配套改动：requireAdministrator 的程序放在
+    //     HKCU Run 里会被 Windows 静默跳过，开机自启已改用任务计划
+    //     （见 src/startup.rs）。
     #[cfg(target_os = "windows")]
     {
         let assets = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");

@@ -1308,9 +1308,15 @@ pub async fn dispatch(state: &mut AppState, method: &str, args: Vec<Value>) -> R
             if crate::platform::is_admin() {
                 return Err("已经是管理员权限".to_string());
             }
-            crate::platform::restart_as_admin()?;
-            crate::gui::send(crate::gui::AppEvent::Quit);
-            Ok(json!(true))
+            match crate::platform::restart_as_admin() {
+                Ok(true) => {
+                    crate::gui::send(crate::gui::AppEvent::Quit);
+                    Ok(json!(true))
+                }
+                // 用户在 UAC 上点了「否」：不该把当前实例退掉，否则界面直接没了。
+                Ok(false) => Err("提权重启已取消".to_string()),
+                Err(err) => Err(err),
+            }
         }
         "windowAction" => {
             match text(&args, 0).as_str() {

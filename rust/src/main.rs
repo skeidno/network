@@ -290,9 +290,31 @@ fn install_panic_hook() {
     }));
 }
 
+/// 兜底提权：清单已经标了 requireAdministrator，正常双击时系统在进程创建前
+/// 就会弹 UAC，走不到这里。万一没生效（旧 exe、被别的进程以受限令牌拉起、
+/// 打包时资源没嵌进去），这里自己提一次，省得用户去右键选管理员。
+#[cfg(windows)]
+fn ensure_elevated() {
+    if crate::platform::is_admin() {
+        return;
+    }
+    match crate::platform::restart_as_admin() {
+        // 新进程已经起来了，这个实例让位。
+        Ok(true) => std::process::exit(0),
+        // UAC 被取消或压根没法提权：继续以普通权限跑，界面会提示 TUN 不可用。
+        Ok(false) => eprintln!("UAC 被取消，以普通权限继续运行（TUN 接管不可用）"),
+        Err(err) => eprintln!("自动提权失败，以普通权限继续运行：{err}"),
+    }
+}
+
+#[cfg(not(windows))]
+fn ensure_elevated() {}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = Options::parse();
+    // 必须在 attach_console() 之前：提权重启会换一个进程，挂了控制台也没意义。
+    ensure_elevated();
     install_panic_hook();
     if options.headless {
         attach_console();
@@ -313,6 +335,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if existing_instance_running(&options).await {
         wake_existing_instance(&options).await;
         return Ok(());
+    }
+
+    // 开机自启从 v0.6.11 起改用任务计划（exe 现在是 requireAdministrator，
+    // 挂 Run 键会被 Windows 静默跳过）。配置里是开、任务却不在的话补建一次，
+    // 覆盖「老版本 Run 键条目失效」和「用户手动删了任务」两种情况。
+    #[cfg(windows)]
+    if app.config.start_with_windows {
+        if let Err(err) = crate::startup::ensure_enabled() {
+            eprintln!("补建开机自启任务失败：{err}");
+        }
     }
 
     let should_start = options.start_core || app.config.start_on_launch;

@@ -6,13 +6,14 @@
     version="0.6.10.0"
     processorArchitecture="amd64"
   />
-  <!-- 默认不强制 UAC：只有创建 TUN 虚拟网卡才需要管理员令牌，
-       平时普通权限启动即可。需要接管时前端会提示，用户可一键提权重启。
-       （Python 版用 PyInstaller 的 uac_admin=True 每次都弹窗，体验较差。） -->
+  <!-- 双击即提权：TUN 虚拟网卡必须要有管理员令牌，与其让用户右键选
+       「以管理员身份运行」或进界面再点一次「以管理员身份重启」，不如在进程
+       创建前就让系统弹出 UAC。（Python 版是 PyInstaller 的 uac_admin=True，
+       同样行为。）代价是每次启动都会弹一次 UAC，这是 Windows 的硬性要求。 -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
       </requestedPrivileges>
     </security>
   </trustInfo>
