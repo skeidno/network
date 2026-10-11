@@ -407,10 +407,15 @@ fn toggle_core(runtime: &tokio::runtime::Handle, shared: &Shared) {
         let mut guard = state.lock().await;
         if guard.core.is_running() {
             let _ = guard.core.stop();
+            // 手动关闭：意图置 false，自愈守护不会再把内核拉起来。
+            guard.core_desired_running = false;
         } else {
             let config = guard.config.clone();
             if let Err(err) = guard.core.start(&config) {
                 guard.notify("error", err);
+            } else {
+                // 手动开启：意图置 true，内核若日后崩溃会被自愈守护自动救回。
+                guard.core_desired_running = true;
             }
         }
     });

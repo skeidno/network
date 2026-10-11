@@ -828,12 +828,16 @@ pub async fn dispatch(
         "toggleCore" => {
             if state.core.is_running() {
                 state.core.stop()?;
+                // 手动关闭：意图置 false，自愈守护不会再把内核拉起来。
+                state.core_desired_running = false;
                 Ok(json!(false))
             } else {
                 state.busy = true;
                 let result = state.core.start(&state.config);
                 state.busy = false;
                 result?;
+                // 手动开启：意图置 true，内核若日后崩溃会被自愈守护自动救回。
+                state.core_desired_running = true;
                 Ok(json!(true))
             }
         }
