@@ -1013,7 +1013,10 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
 
   .main-area { flex: 1 1 auto; min-height: 0; grid-template-rows: auto minmax(0, 1fr); }
   .topbar { flex-wrap: wrap; gap: 8px; min-height: 56px; padding: 8px 12px; }
-  .page-content { padding: 14px 12px 26px; }
+  .page-content { overflow-x: hidden; padding: 14px 12px 26px; }
+  /* 工具栏按钮换行，别把整个页面撑出横向滚动；
+     否则触摸滑动会被页面级滚动吃掉，表格自己的横向滚动就动不了 */
+  .page-toolbar { flex-wrap: wrap; min-height: 0; }
 
   /* 表格放不下时横向滚动，不再撑破页面 */
   .table-surface { overflow-x: auto; -webkit-overflow-scrolling: touch; }
