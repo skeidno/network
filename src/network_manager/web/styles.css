@@ -568,7 +568,7 @@ td.actions { text-align: right; overflow: visible; }
 .node-group-head .node-group-error { color: var(--danger); }
 .node-group-head .node-group-chevron { display: inline-flex; width: 26px; height: 26px; align-items: center; justify-content: center; margin-left: auto; color: var(--text-3); }
 .node-group-section.is-collapsed .node-group-head { margin-bottom: 0; }
-.node-group-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 10px; }
+.node-group-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(232px, 100%), 1fr)); gap: 10px; }
 .node-group-grid[hidden] { display: none; }
 .node-group-manager { display: grid; gap: 14px; }
 .node-group-create { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
@@ -611,7 +611,7 @@ td.actions { text-align: right; overflow: visible; }
 .node-card-foot span:last-child { max-width: 55%; text-align: right; font-variant-numeric: tabular-nums; }
 
 .subscription-import { display: grid; grid-template-columns: 150px minmax(240px, 1fr) minmax(170px, 220px) auto auto; gap: 10px; margin-bottom: 16px; padding: 15px; }
-.subscription-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(258px, 1fr)); gap: 12px; }
+.subscription-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(258px, 100%), 1fr)); gap: 12px; }
 .subscription-card { padding: 16px; transition: box-shadow 140ms, transform 140ms; }
 .subscription-card:hover { box-shadow: var(--shadow-2); transform: translateY(-1px); }
 .subscription-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
