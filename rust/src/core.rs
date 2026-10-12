@@ -4,6 +4,10 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::sleep;
 
 use crate::mihomo::render_yaml;
 use crate::models::AppConfig;
@@ -220,6 +224,10 @@ fn assign_to_job(job: isize, child: &Child) -> bool {
 pub struct AppState {
     pub config: AppConfig,
     pub core: CoreProcess,
+    /// 用户「想要内核跑着」的意图：无论是开机自启、界面里手动开启，还是托盘
+    /// 切换开启，都置为 true；手动关闭置为 false。自愈守护用它来区分「内核该跑却
+    /// 崩了」和「用户故意关掉」，只在前一种情况下自动拉起，绝不跟用户的停止操作打架。
+    pub core_desired_running: bool,
     pub node_delays: HashMap<String, NodeDelay>,
     /// profile_id -> 正在进行的部署/检查任务。
     pub deployments: HashMap<String, DeployTask>,
@@ -241,6 +249,7 @@ impl AppState {
         Self {
             config: crate::store::load(),
             core: CoreProcess::default(),
+            core_desired_running: false,
             node_delays: HashMap::new(),
             deployments: HashMap::new(),
             session_token: crate::server::random_session_token(),
@@ -353,4 +362,57 @@ pub fn memory_mb() -> f64 {
         .process(pid)
         .map(|process| process.memory() as f64 / 1024.0 / 1024.0)
         .unwrap_or(0.0)
+}
+
+/// 接管核心自愈守护。
+///
+/// 内核（mihomo）是个独立子进程，目前除了手动开关没有任何守护：它一旦因为崩溃、
+/// 被系统回收、资源不足之类的原因自己死掉，就再也没人把它拉起来。而「关到托盘」
+/// 只是把窗口藏起来，内核本就该继续跑——于是就出现用户描述的故障：托盘还在，
+/// 但 git 之类走代理的流量全断了，打开界面（手动重启）才恢复。
+///
+/// 这个任务跑在 tokio 运行时上，和 GUI 事件循环完全解耦，所以窗口藏起来也照常巡检。
+/// 只要 `core_desired_running` 为 true（说明用户是要它跑着的）而内核实际没在跑，
+/// 就重新拉起。`shutdown` 置位后立刻退出，避免主程序收尾停内核时被它又拉起来。
+pub async fn supervise_core(shared: crate::server::Shared, shutdown: Arc<AtomicBool>) {
+    // 基础巡检间隔；连续恢复失败就指数退避，避免日志被刷屏。
+    let mut backoff = Duration::from_secs(15);
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        // 分两段：先短暂拿锁做判断与动作，再在锁外 sleep，避免长期占着状态锁，
+        // 也不会挡住界面里的开关操作。
+        {
+            let mut state = shared.lock().await;
+            if state.core_desired_running
+                && !state.core.is_running()
+                // 拿锁的瞬间可能主程序正在收尾停内核：再确认一次，避免把刚停掉的
+                // 内核又拉起来（否则收尾后还得靠作业对象兜底杀一次）。
+                && !shutdown.load(Ordering::SeqCst)
+            {
+                let config = state.config.clone();
+                match state.core.start(&config) {
+                    Ok(()) => {
+                        state.notify("warning", "接管核心曾异常退出，已自动恢复");
+                        backoff = Duration::from_secs(15);
+                    }
+                    Err(err) => {
+                        eprintln!("自动恢复接管核心失败：{err}");
+                        backoff = (backoff * 2).min(Duration::from_secs(120));
+                    }
+                }
+            } else {
+                backoff = Duration::from_secs(15);
+            }
+        }
+        // 把 sleep 拆成一秒一跳，期间随时能响应 shutdown，不用傻等整个间隔。
+        let seconds = backoff.as_secs().max(1);
+        for _ in 0..seconds {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
 }
