@@ -16,6 +16,8 @@ in `local_dns` inside `settings.json`, Android keeps it in its own preferences,
 and both ends share the same text format — one `domain IP` pair per line, field
 order free, `#` starts a comment. A `*.example.com` domain matches the apex
 domain plus every subdomain; a bare `example.com` matches that one name only.
+Reaching an HTTPS service through the map requires a certificate the device
+trusts; see [`local-dns-and-tls.md`](local-dns-and-tls.md).
 
 `routing.mode` accepts `rule`, `global`, `smart`, or `direct`. `smart` is
 portable across desktop and mobile clients and uses periodic health checks to

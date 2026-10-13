@@ -90,7 +90,7 @@ cd apps/android
 .\gradlew.bat testDebugUnitTest assembleDebug assembleDebugAndroidTest
 ```
 
-连接模拟器或 Android 设备后，可按 `apps/android/README.md` 运行设备测试。通用配置字段见 `docs/portable-config-v1.md`。
+连接模拟器或 Android 设备后，可按 `apps/android/README.md` 运行设备测试。通用配置字段见 `docs/portable-config-v1.md`；本地 DNS 映射配合 HTTPS 使用时的证书要求见 `docs/local-dns-and-tls.md`。
 
 ## 测试
 
