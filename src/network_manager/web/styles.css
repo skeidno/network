@@ -568,7 +568,7 @@ td.actions { text-align: right; overflow: visible; }
 .node-group-head .node-group-error { color: var(--danger); }
 .node-group-head .node-group-chevron { display: inline-flex; width: 26px; height: 26px; align-items: center; justify-content: center; margin-left: auto; color: var(--text-3); }
 .node-group-section.is-collapsed .node-group-head { margin-bottom: 0; }
-.node-group-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 10px; }
+.node-group-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(232px, 100%), 1fr)); gap: 10px; }
 .node-group-grid[hidden] { display: none; }
 .node-group-manager { display: grid; gap: 14px; }
 .node-group-create { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
@@ -611,7 +611,7 @@ td.actions { text-align: right; overflow: visible; }
 .node-card-foot span:last-child { max-width: 55%; text-align: right; font-variant-numeric: tabular-nums; }
 
 .subscription-import { display: grid; grid-template-columns: 150px minmax(240px, 1fr) minmax(170px, 220px) auto auto; gap: 10px; margin-bottom: 16px; padding: 15px; }
-.subscription-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(258px, 1fr)); gap: 12px; }
+.subscription-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(258px, 100%), 1fr)); gap: 12px; }
 .subscription-card { padding: 16px; transition: box-shadow 140ms, transform 140ms; }
 .subscription-card:hover { box-shadow: var(--shadow-2); transform: translateY(-1px); }
 .subscription-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
@@ -973,11 +973,75 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
 }
 
 @media (max-width: 620px) {
+  /* 手机上把宽度全部留给内容：侧栏收成顶部横向导航 */
+  #app-shell { display: flex; flex-direction: column; }
+  /* 自定义窗口框下 #app-shell 是 height:auto，改成纵向布局后要恢复确定高度 */
+  body.custom-frame #app-shell { height: 100%; }
+  .sidebar {
+    flex: 0 0 auto;
+    flex-direction: row;
+    align-items: center;
+    gap: 4px;
+    height: auto;
+    padding: 10px 12px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .brand { flex: 0 0 auto; padding: 0 8px 0 0; }
+  .brand-mark { width: 34px; height: 34px; }
+  .brand-copy { display: none; }
+  .navigation { flex: 1 1 auto; flex-direction: row; gap: 2px; }
+  .nav-item {
+    flex: 0 0 auto;
+    justify-content: center;
+    width: auto;
+    min-height: 40px;
+    min-width: 44px;
+    padding: 0 12px;
+  }
+  .nav-item.is-active::before {
+    top: auto;
+    bottom: 0;
+    left: 50%;
+    width: 20px;
+    height: 3px;
+    transform: translateX(-50%);
+  }
+  .sidebar-runtime, .sidebar-version { display: none; }
+
+  .main-area { flex: 1 1 auto; min-height: 0; grid-template-rows: auto minmax(0, 1fr); }
+  .topbar { flex-wrap: wrap; gap: 8px; min-height: 56px; padding: 8px 12px; }
+  .page-content { overflow-x: hidden; padding: 14px 12px 26px; }
+  /* 工具栏按钮换行，别把整个页面撑出横向滚动；
+     否则触摸滑动会被页面级滚动吃掉，表格自己的横向滚动就动不了 */
+  .page-toolbar { flex-wrap: wrap; min-height: 0; }
+
+  /* 表格放不下时横向滚动，不再撑破页面 */
+  .table-surface { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .table-surface table { min-width: 640px; }
+  #page-servers .table-surface table { min-width: 700px; }
+
+  /* 触屏点按目标至少 40px */
+  .button { min-height: 40px; }
+  .icon-button { width: 40px; height: 40px; }
+  #page-servers td.actions .button { min-height: 36px; }
+  #page-servers td.actions .icon-button { width: 36px; height: 36px; }
+
+  .segmented { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .segment { border-bottom: 1px solid var(--line-2); }
+  .segment:nth-child(2n) { border-right: 0; }
+  .segment:nth-last-child(-n + 2) { border-bottom: 0; }
+
   .subscription-import { grid-template-columns: minmax(0, 1fr) auto; }
   .subscription-import > :nth-child(3) { grid-column: 1 / -1; }
   .subscription-import > :nth-child(4) { grid-column: 1; }
   .subscription-import > :last-child { grid-column: 2; }
   .subscription-grid { grid-template-columns: minmax(0, 1fr); }
+
+  .modal-content { max-height: calc(100vh - 170px); padding: 14px; }
+  .toast-container { right: 12px; bottom: 12px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

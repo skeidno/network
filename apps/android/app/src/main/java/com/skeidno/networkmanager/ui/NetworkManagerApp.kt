@@ -163,7 +163,13 @@ fun NetworkManagerApp(
     }
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
-        val wideLayout = maxWidth >= 720.dp
+        // 手机上底部导航才是主交互；侧边导航栏只留给真正的大屏。
+        //
+        // 原来这里是 720.dp：1080×1920@240dpi 的竖屏设备（模拟器、桌面模式、
+        // 部分定制 DPI 机型）宽度正好是 720dp，会被判成「宽屏」，于是在手机上
+        // 显示出 PC 味的左侧栏——横竖比不成立的大屏不该走侧边栏。改成 Material
+        // 的 expanded 档（≥840dp）或横屏且至少到 medium 档（≥600dp）才用侧边栏。
+        val wideLayout = maxWidth >= 840.dp || (maxWidth >= 600.dp && maxWidth > maxHeight)
         Scaffold(
             snackbarHost = { SnackbarHost(snackbar) },
             topBar = {

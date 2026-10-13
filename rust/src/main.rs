@@ -348,6 +348,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let should_start = options.start_core || app.config.start_on_launch;
+    // 记录「用户想让内核跑着」的意图：自愈守护只在这种情况下自动拉起崩溃的内核，
+    // 不会跟用户的手动停止操作打架。
+    app.core_desired_running = should_start;
     if should_start && !app.core.is_running() {
         match app.core.start(&app.config.clone()) {
             Ok(()) => println!("内核已启动"),
@@ -373,6 +376,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = display_url(&options.host, bound.port());
     println!("Network Manager {VERSION} WebGUI: {url}");
 
+    // 接管核心自愈守护：内核是个独立子进程，偶尔会自己死掉。把它挂在 tokio 运行时
+    // 上持续巡检，内核该跑却崩了就自动拉起——这样哪怕界面关到托盘甚至完全不打开，
+    // 代理也不会悄悄失效。shutdown 标志用于收尾时让它立刻退场，别把正在停的内核又拉起来。
+    let supervisor_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let shared_for_supervisor = shared.clone();
+        let shutdown_for_supervisor = supervisor_shutdown.clone();
+        tokio::spawn(async move {
+            crate::core::supervise_core(shared_for_supervisor, shutdown_for_supervisor).await;
+        });
+    }
+
     #[cfg(windows)]
     {
         if options.headless {
@@ -392,6 +407,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("界面退出：{err}");
                 if err == crate::gui::LOOP_CRASHED {
                     // 事件循环崩了：收掉内核再退出，不要挂着一个没有界面的进程。
+                    // 先让自愈守护退场，免得它把刚停掉的内核又拉起来。
+                    supervisor_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
                     let mut state = shared.lock().await;
                     let _ = state.core.stop();
                     return Err(err.into());
@@ -414,6 +431,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut state = shared.lock().await;
     crate::gui::trace("main: 拿到 state 锁，准备停内核");
+    // 让自愈守护先退场，否则它可能在我们停掉内核后又把它拉起来。
+    supervisor_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = state.core.stop();
     crate::gui::trace("main: 内核已停，准备返回");
     Ok(())

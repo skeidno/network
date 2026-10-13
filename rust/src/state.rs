@@ -381,6 +381,14 @@ pub fn build(state: &mut AppState) -> Value {
             // 前端靠这个字段显示「检查中／部署中」，以前后端没有它，
             // 状态列永远停在「已部署」，点了按钮看起来毫无反应。
             let task = state.deployments.get(&profile.profile_id);
+            // 前端复制按钮的可点状态依赖 shareLink，但状态里从来没有这个字段，
+            // 已部署服务器的复制按钮因此一直是灰的。按节点配置现算一份。
+            let share_link = config
+                .imported_nodes
+                .iter()
+                .find(|node| node.source_id == format!("server-deployment:{}", profile.profile_id))
+                .map(|node| crate::ssh::shadowsocks_share_link(&node.config))
+                .unwrap_or_default();
             json!({
                 "profileId": profile.profile_id,
                 "name": profile.name,
@@ -404,6 +412,7 @@ pub fn build(state: &mut AppState) -> Value {
                 "deployedVersion": profile.deployed_version,
                 "deployedAt": profile.deployed_at,
                 "proxyReachabilityError": profile.proxy_reachability_error,
+                "shareLink": share_link,
             })
         })
         .collect();

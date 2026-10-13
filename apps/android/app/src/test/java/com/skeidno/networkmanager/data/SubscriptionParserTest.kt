@@ -62,7 +62,10 @@ class SubscriptionParserTest {
 
     @Test
     fun defaultOverseasGroupContainsExpectedDomains() {
-        assertEquals(67, DEFAULT_PROXY_DOMAINS.size)
+        // 内置域名列表会持续扩充，条数不再写死总数（沿用 ee9f270 的思路）：
+        // 这里只校验下限、元素无重复，并抽查几个代表性域名。
+        assertTrue(DEFAULT_PROXY_DOMAINS.size >= 100)
+        assertEquals(DEFAULT_PROXY_DOMAINS.size, DEFAULT_PROXY_DOMAINS.toSet().size)
         assertTrue("arcteryx.com" in DEFAULT_PROXY_DOMAINS)
         assertTrue("chatgpt.com" in DEFAULT_PROXY_DOMAINS)
         assertTrue("claude.ai" in DEFAULT_PROXY_DOMAINS)

@@ -329,11 +329,12 @@ function downloadTextFile(name, content, contentType = "application/json") {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+// 写入剪贴板并返回是否成功，调用方据此提示用户，失败时不再静默。
 async function copyText(content) {
   try {
     if (navigator.clipboard?.writeText) {
       await navigator.clipboard.writeText(content);
-      return;
+      return true;
     }
   } catch (_error) { /* 回落到下面的临时文本框 */ }
   const area = document.createElement("textarea");
@@ -342,10 +343,22 @@ async function copyText(content) {
   area.style.opacity = "0";
   document.body.appendChild(area);
   area.select();
+  let copied = false;
   try {
-    document.execCommand("copy");
-  } catch (_error) { /* 复制失败时静默处理 */ }
+    copied = document.execCommand("copy");
+  } catch (_error) { copied = false; /* 失败交给调用方提示 */ }
   area.remove();
+  return copied;
+}
+
+// 把后端返回的节点配置拼成 IP:端口:账号:密码 的普通格式。
+// 服务器部署生成的是 Shadowsocks 节点，没有用户名，账号位即加密方式
+// （与 ss:// 链接里 base64(加密方式:密码) 的前半段一致），兼容带 username 的节点。
+function nodePlainText(node) {
+  const host = typeof node.server === "string" ? node.server : "";
+  const account = node.username || node.cipher || "";
+  const password = typeof node.password === "string" ? node.password : "";
+  return `${host}:${node.port ?? ""}:${account}:${password}`;
 }
 
 function renderSidebarRate(direction, rate) {
@@ -809,7 +822,7 @@ function renderSshServers() {
       <td><span class="small-status${statusClass}" title="${escapeHtml(detail)}">${statusText}</span></td>
       <td class="actions">
         <button class="button primary compact-button" data-ssh-action="deploy" data-profile-id="${server.profileId}"${isDeploying || Boolean(deploying) ? " disabled" : ""}>${icon(isDeploying || server.deployed ? "refresh-cw" : "hard-drive-download")}<span>${isDeploying ? (server.deployed ? "检查中" : "部署中") : server.deployed ? "检查服务" : "部署代理"}</span></button>
-        <button class="icon-button" data-ssh-action="copy" data-profile-id="${server.profileId}"${server.shareLink ? "" : " disabled"} title="复制节点链接" aria-label="复制节点">${icon("link")}</button>
+        <button class="icon-button" data-ssh-action="copy" data-profile-id="${server.profileId}"${server.shareLink ? "" : " disabled"} title="复制节点（IP:端口:账号:密码）" aria-label="复制节点">${icon("link")}</button>
         <button class="icon-button" data-ssh-action="edit" data-profile-id="${server.profileId}" title="编辑" aria-label="编辑">${icon("square-pen")}</button>
         ${server.hasCredential ? `<button class="icon-button" data-ssh-action="forget" data-profile-id="${server.profileId}" title="清除已保存的密码" aria-label="清除已保存的密码">${icon("key-round")}</button>` : ""}
         <button class="icon-button danger" data-ssh-action="delete" data-profile-id="${server.profileId}" title="删除" aria-label="删除">${icon("trash-2")}</button>
@@ -1791,10 +1804,11 @@ function bindEvents() {
         } },
       ]);
   });
-  byId("batch-copy-ssh").addEventListener("click", () => {
+  byId("batch-copy-ssh").addEventListener("click", async () => {
     const links = selectedSshServers().map((server) => server.shareLink).filter(Boolean);
     if (!links.length) return;
-    copyText(links.join("\n"));
+    const copied = await copyText(links.join("\n"));
+    showToast(copied ? "success" : "error", copied ? `已复制 ${links.length} 条节点链接` : "复制失败，请手动复制");
   });
   byId("batch-delete-ssh").addEventListener("click", () => {
     const picked = selectedSshServers();
@@ -1804,13 +1818,20 @@ function bindEvents() {
       sshSelection.clear();
     });
   });
-  byId("ssh-server-body").addEventListener("click", (event) => {
+  byId("ssh-server-body").addEventListener("click", async (event) => {
     const button = event.target.closest("[data-ssh-action]");
     if (!button) return;
     const server = appState.sshServers.find((item) => item.profileId === button.dataset.profileId);
     if (!server) return;
     if (button.dataset.sshAction === "deploy") deploySshServer(server);
-    else if (button.dataset.sshAction === "copy") invoke("copyServerNode", server.profileId);
+    else if (button.dataset.sshAction === "copy") {
+      // 之前只调用了 invoke 却把返回的节点配置丢掉了，什么都没复制。
+      // 现在拼成 IP:端口:账号:密码 写入剪贴板，并把结果提示出来。
+      const node = await invoke("copyServerNode", server.profileId);
+      if (!node) return; // invoke 失败时已经弹过错误提示
+      const copied = await copyText(nodePlainText(node));
+      showToast(copied ? "success" : "error", copied ? `已复制“${server.name}”的节点（IP:端口:账号:密码）` : "复制失败，请手动复制节点信息");
+    }
     else if (button.dataset.sshAction === "edit") openSshServerDialog(server);
     else if (button.dataset.sshAction === "forget") confirmAction("清除已保存的密码", `将删除“${server.name}”已保存的 SSH 密码，服务器记录和代理节点都会保留。确定继续？`, () => invoke("forgetSshCredential", server.profileId));
     else confirmAction("删除服务器记录", `将删除“${server.name}”和对应内置节点，已保存的 SSH 密码也会一并清除，但不会卸载远端服务。确定继续？`, () => invoke("deleteSshServer", server.profileId));

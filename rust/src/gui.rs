@@ -92,7 +92,30 @@ fn show_window(
             *hidden = false;
         }
     }
+    // 重建／唤回后立刻把 WebView 尺寸对齐当前窗口：隐藏期间窗口尺寸可能变过
+    // （还原、跨屏、DPI 变化），不主动同步的话新 WebView 可能继承旧尺寸。
+    sync_webview_bounds(window, webview.as_ref());
     set_window_visible(true);
+}
+
+/// 把 WebView 的 bounds 同步成窗口客户区的当前尺寸（物理像素直传，避免二次换算）。
+///
+/// wry 在 WM_SIZE 里已经会跟随窗口，但最小化恢复、跨显示器拖动、DPI 变化这些
+/// 路径上 WebView2 的尺寸可能停在旧值：页面按旧宽度排版，窗口右侧被硬裁掉一截
+/// （表现为「最后一列节点显示不全」，且页面没有任何滚动条能滚出来）。窗口尺寸
+/// 每次变化时显式 SetBounds 一次，强制 WebView2 跟当前窗口对齐。
+fn sync_webview_bounds(window: &tao::window::Window, webview: Option<&wry::WebView>) {
+    use wry::dpi::{PhysicalPosition, PhysicalSize};
+    let Some(webview) = webview else { return };
+    // tao 的 inner_size 就是客户区尺寸（不含边框），物理像素。
+    let size = window.inner_size();
+    if size.width == 0 || size.height == 0 {
+        return;
+    }
+    let _ = webview.set_bounds(wry::Rect {
+        position: PhysicalPosition::new(0, 0).into(),
+        size: PhysicalSize::new(size.width as i32, size.height as i32).into(),
+    });
 }
 
 /// 窗口跑到屏幕外时把它拉回主屏中心。
@@ -288,6 +311,13 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
                         ));
                         request_exit(control);
                     }
+                    // 尺寸变化（含还原/最大化/跨屏拖动/DPI 变化引发的重排）后显式
+                    // 同步 WebView bounds。wry 的 WM_SIZE 子类大多数情况能跟上，但
+                    // 上面几条路径仍可能让 WebView2 停在旧尺寸——页面按旧宽度排版、
+                    // 窗口右侧被裁掉且滚不出来，只能重启才恢复。
+                    WindowEvent::Resized(_) => {
+                        sync_webview_bounds(&window, webview.as_ref());
+                    }
                     _ => {}
                 },
                 // tao 收到 WM_ENDSESSION（注销 / 关机 / 重启）时会把内部状态直接置为
@@ -407,10 +437,15 @@ fn toggle_core(runtime: &tokio::runtime::Handle, shared: &Shared) {
         let mut guard = state.lock().await;
         if guard.core.is_running() {
             let _ = guard.core.stop();
+            // 手动关闭：意图置 false，自愈守护不会再把内核拉起来。
+            guard.core_desired_running = false;
         } else {
             let config = guard.config.clone();
             if let Err(err) = guard.core.start(&config) {
                 guard.notify("error", err);
+            } else {
+                // 手动开启：意图置 true，内核若日后崩溃会被自愈守护自动救回。
+                guard.core_desired_running = true;
             }
         }
     });
