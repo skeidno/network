@@ -26,6 +26,12 @@ object SingBoxConfigBuilder {
      */
     const val localInboundTag = "local-in"
 
+    /**
+     * 本地 DNS 映射用的 hosts 服务器 tag（sing-box 1.12+ 的 `type: "hosts"`）。
+     * 工具箱的规则预判要按同一份定义判定，所以这里是 internal。
+     */
+    internal const val localDnsServerTag = "local-dns"
+
     // 工具箱的「规则命中预判」要按同一份局域网定义来判定，所以这里是 internal
     // 而不是 private —— 两处各写一份迟早会走偏。
     internal val lanDomainSuffixes = listOf("lan", "local", "home.arpa")
@@ -125,8 +131,26 @@ object SingBoxConfigBuilder {
                 state.fallbackTarget == FallbackTarget.Proxy && orderedNodes.isNotEmpty()
             ) "proxy" else "direct"
         }
+        // 本地 DNS 映射（自定义域名 → 固定 IP）。用 sing-box 自带的 hosts 服务器：
+        // 它是查表返回，不会真的往外发查询，所以局域网里的自建服务能被稳定命中，
+        // 也不会因为上游 DNS 的缓存或劫持而时好时坏。
+        val localDnsEntries = state.localDnsEntries
+            .filter { it.domain.isNotBlank() && it.address.isNotBlank() }
         val dnsServers = JSONArray()
-            .put(JSONObject().put("type", "local").put("tag", "local"))
+        if (localDnsEntries.isNotEmpty()) {
+            dnsServers.put(
+                JSONObject()
+                    .put("type", "hosts")
+                    .put("tag", localDnsServerTag)
+                    .put(
+                        "predefined",
+                        JSONObject().apply {
+                            localDnsEntries.forEach { entry -> put(entry.domain, entry.address) }
+                        },
+                    ),
+            )
+        }
+        dnsServers.put(JSONObject().put("type", "local").put("tag", "local"))
         if (orderedNodes.isNotEmpty()) {
             dnsServers.put(remoteDnsServer("remote-proxy", "proxy"))
             if (state.mode == RoutingMode.Smart) {
@@ -134,12 +158,22 @@ object SingBoxConfigBuilder {
             }
         }
         val dnsRules = JSONArray()
-            .put(
+        if (localDnsEntries.isNotEmpty()) {
+            // 必须排在最前面：内置的局域网规则里有 .lan / .local 这类后缀，
+            // 配成 nas.lan 也会命中它，先命中先算，映射得排在前面才不会被抢走。
+            dnsRules.put(
                 JSONObject()
-                    .put("domain_suffix", JSONArray(lanDomainSuffixes))
+                    .put("domain", JSONArray(localDnsEntries.map { it.domain }))
                     .put("action", "route")
-                    .put("server", "local"),
+                    .put("server", localDnsServerTag),
             )
+        }
+        dnsRules.put(
+            JSONObject()
+                .put("domain_suffix", JSONArray(lanDomainSuffixes))
+                .put("action", "route")
+                .put("server", "local"),
+        )
         enabledPortableRules.filter { it.type == "package_name" }
             .mapNotNull { rule -> toDnsRule(rule, orderedNodes.isNotEmpty()) }
             .forEach(dnsRules::put)

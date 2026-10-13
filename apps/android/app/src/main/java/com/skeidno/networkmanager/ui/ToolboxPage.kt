@@ -53,7 +53,9 @@ import androidx.compose.ui.unit.dp
 import com.skeidno.networkmanager.data.AppState
 import com.skeidno.networkmanager.data.ExitCheckStatus
 import com.skeidno.networkmanager.data.ExitInfo
+import com.skeidno.networkmanager.data.LocalDnsEntry
 import com.skeidno.networkmanager.data.NetworkTools
+import com.skeidno.networkmanager.data.normalizeLocalDnsDomain
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -80,6 +82,7 @@ internal fun ToolboxPage(
         ExitCard(state = state, onTestExit = onTestExit)
         RoutePreviewCard(state = state)
         DnsCard(state = state)
+        CertificateCard(state = state)
         TcpCard()
         TextToolCard()
         Spacer(Modifier.height(16.dp))
@@ -290,6 +293,15 @@ private fun DnsCard(state: AppState) {
             placeholder = { Text("example.com") },
             singleLine = true,
         )
+        // 命中本地映射时先把话说清楚：这张卡片是直接问 dns.google 的，
+        // 走的是 DoH，不经过内核，所以结果**不会**体现本地映射——免得用户
+        // 看到 DoH 和浏览器里的解析结果不一样，以为映射没生效。
+        localMappingFor(state, name)?.let { entry ->
+            Hint(
+                "本地 DNS 映射：${entry.domain} → ${entry.address}。" +
+                    "注意本卡片是直连 dns.google 查询，不受映射影响；映射只作用于内核（被 TUN 接管的应用）。",
+            )
+        }
         Row(
             modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -380,6 +392,141 @@ private fun DnsCard(state: AppState) {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 证书检测
+// ---------------------------------------------------------------------------
+
+/**
+ * 「局域网里用域名访问、证书还能过校验」由两件事组成：域名解析要对（本地 DNS
+ * 映射），证书链要被信任且名字要对得上。这张卡片负责确认后半段——判定用的是
+ * 平台默认信任库，结论等同于「浏览器打开会不会报红」。
+ */
+@Composable
+private fun CertificateCard(state: AppState) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var target by rememberSaveable { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var result by remember { mutableStateOf<NetworkTools.CertificateProbe?>(null) }
+
+    ToolCard(
+        title = "证书检测",
+        subtitle = "对「域名:端口」做一次真实 TLS 握手，看系统会不会认这张证书。",
+    ) {
+        OutlinedTextField(
+            value = target,
+            onValueChange = { target = it },
+            modifier = Modifier.fillMaxWidth().testTag("toolbox-cert-input"),
+            label = { Text("域名或 域名:端口") },
+            placeholder = { Text("nas.lan 或 nas.lan:8443") },
+            singleLine = true,
+        )
+        localMappingFor(state, NetworkTools.parseHostPort(target).first)?.let { entry ->
+            Hint("该域名有本地映射：${entry.domain} → ${entry.address}")
+        }
+        Button(
+            onClick = {
+                busy = true
+                result = null
+                val (host, port) = NetworkTools.parseHostPort(target)
+                scope.launch {
+                    val outcome = withContext(Dispatchers.IO) {
+                        runCatching { NetworkTools.probeCertificate(host, port) }
+                    }
+                    busy = false
+                    outcome
+                        .onSuccess { result = it }
+                        .onFailure {
+                            Toast.makeText(context, it.message ?: "证书检测失败", Toast.LENGTH_SHORT)
+                                .show()
+                        }
+                }
+            },
+            enabled = !busy && target.isNotBlank(),
+            modifier = Modifier.testTag("toolbox-cert-run"),
+        ) {
+            BusyButtonContent(busy = busy, idle = "检测", working = "检测中…")
+        }
+        result?.let { probe ->
+            HorizontalDivider()
+            if (probe.resolvedAddresses.isNotEmpty()) {
+                Text(
+                    "${probe.host}:${probe.port} → ${probe.resolvedAddresses.joinToString(", ")}",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+            CertVerdict("系统信任", probe.trustedBySystem)
+            if (probe.reachable) CertVerdict("域名匹配", probe.hostnameVerified)
+            Hint(probe.detail, warn = !probe.trustedBySystem || !probe.hostnameVerified)
+            probe.chain.forEachIndexed { index, certificate ->
+                CertDetail(index = index, certificate = certificate)
+            }
+        }
+    }
+}
+
+/** 查询名归一后去映射表里精确匹配——和内核那边 hosts 服务器的匹配方式一致。 */
+internal fun localMappingFor(state: AppState, rawName: String): LocalDnsEntry? {
+    val target = normalizeLocalDnsDomain(rawName)
+    if (target.isEmpty()) return null
+    return state.localDnsEntries.firstOrNull { it.domain == target }
+}
+
+@Composable
+private fun CertVerdict(label: String, ok: Boolean) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            if (ok) "✓" else "✗",
+            fontWeight = FontWeight.Bold,
+            color = if (ok) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+        )
+        Text(label, style = MaterialTheme.typography.bodyMedium)
+    }
+}
+
+@Composable
+private fun CertDetail(index: Int, certificate: NetworkTools.CertificateInfo) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Text(
+            if (index == 0) "服务器证书" else "中间证书 $index",
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.SemiBold,
+        )
+        CertField("主体", certificate.subject)
+        CertField("签发者", certificate.issuer + if (certificate.selfSigned) "（自签）" else "")
+        CertField("有效期", "${certificate.notBefore} ~ ${certificate.notAfter}")
+        CertField("签名算法", certificate.signatureAlgorithm)
+        if (certificate.alternativeNames.isNotEmpty()) {
+            CertField("覆盖域名", certificate.alternativeNames.joinToString(", "))
+        }
+    }
+}
+
+@Composable
+private fun CertField(label: String, value: String) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            label,
+            modifier = Modifier.width(64.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            value,
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.bodySmall,
+        )
     }
 }
 

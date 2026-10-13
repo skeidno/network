@@ -6,6 +6,11 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import java.security.cert.CertPathValidatorException
+import javax.net.ssl.SSLHandshakeException
 
 class NetworkToolsTest {
 
@@ -302,5 +307,82 @@ class NetworkToolsTest {
         assertEquals(9443, node.port)
         assertEquals("2022-blake3-aes-128-gcm", node.raw.optString("cipher"))
         assertTrue(NetworkTools.describeShareLink(link).contains("2022-blake3-aes-128-gcm"))
+    }
+
+    // ------------------------------------------------------------------
+    // 本地 DNS 映射
+    // ------------------------------------------------------------------
+
+    @Test
+    fun localDnsMappingToLanAddressOverridesTheMode() {
+        // 全局模式下本该走节点，但映射到的是内网地址，内核会按 ip_cidr 命中直连——
+        // 这一步必须排在模式兜底前面，否则预判结果和实际行为不一致。
+        val verdict = NetworkTools.previewRoute(
+            state().copy(
+                mode = RoutingMode.Global,
+                localDnsEntries = listOf(LocalDnsEntry("nas.internal-lab.test", "192.168.1.10")),
+            ),
+            "nas.internal-lab.test",
+        )
+        assertEquals(NetworkTools.Outbound.Direct, verdict.outbound)
+        assertTrue(verdict.reason, verdict.reason.contains("本地 DNS 映射"))
+        assertTrue(verdict.reason, verdict.reason.contains("192.168.1.10"))
+    }
+
+    @Test
+    fun localDnsMappingToPublicAddressKeepsNormalRules() {
+        val verdict = NetworkTools.previewRoute(
+            state().copy(
+                mode = RoutingMode.Global,
+                localDnsEntries = listOf(LocalDnsEntry("app.internal-lab.test", "203.0.113.9")),
+            ),
+            "app.internal-lab.test",
+        )
+        assertEquals(NetworkTools.Outbound.Proxy, verdict.outbound)
+        assertTrue(verdict.notes.toString(), verdict.notes.any { it.contains("203.0.113.9") })
+    }
+
+    @Test
+    fun localDnsMappingOnlyMatchesExactDomain() {
+        // hosts 服务器是查表，没有通配；预判也不能比内核更宽松。
+        val verdict = NetworkTools.previewRoute(
+            state().copy(localDnsEntries = listOf(LocalDnsEntry("nas.internal-lab.test", "192.168.1.10"))),
+            "other.internal-lab.test",
+        )
+        assertEquals(NetworkTools.Outbound.Direct, verdict.outbound)
+        assertFalse(verdict.reason, verdict.reason.contains("本地 DNS 映射"))
+    }
+
+    // ------------------------------------------------------------------
+    // 证书检测
+    // ------------------------------------------------------------------
+
+    @Test
+    fun hostPortParsingCoversCommonShapes() {
+        assertEquals("nas.lan" to 443, NetworkTools.parseHostPort("nas.lan"))
+        assertEquals("nas.lan" to 8443, NetworkTools.parseHostPort("nas.lan:8443"))
+        assertEquals("nas.lan" to 443, NetworkTools.parseHostPort("https://nas.lan/admin?x=1"))
+        assertEquals("fe80::1" to 8443, NetworkTools.parseHostPort("[fe80::1]:8443"))
+        // 没有方括号的裸 IPv6 没法区分端口，只能整体当域名/IP 处理。
+        assertEquals("fe80::1" to 443, NetworkTools.parseHostPort("fe80::1"))
+        assertEquals("nas.lan" to 9443, NetworkTools.parseHostPort("  nas.lan:9443  "))
+    }
+
+    @Test
+    fun tlsFailuresAreExplainedInActionableTerms() {
+        val untrusted = SSLHandshakeException("PKIX path building failed").apply {
+            initCause(CertPathValidatorException("Trust anchor for certification path not found."))
+        }
+        assertTrue(
+            NetworkTools.describeTlsFailure(untrusted),
+            NetworkTools.describeTlsFailure(untrusted).contains("不信任"),
+        )
+        assertTrue(
+            NetworkTools.describeTlsFailure(SSLHandshakeException("Hostname nas.lan not verified"))
+                .contains("不匹配"),
+        )
+        assertTrue(NetworkTools.describeTlsFailure(UnknownHostException("nas.lan")).contains("解析失败"))
+        assertTrue(NetworkTools.describeTlsFailure(SocketTimeoutException("read timed out")).contains("超时"))
+        assertTrue(NetworkTools.describeTlsFailure(ConnectException("Connection refused")).contains("拒绝"))
     }
 }

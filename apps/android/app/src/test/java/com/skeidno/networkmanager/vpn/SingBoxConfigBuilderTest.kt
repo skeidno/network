@@ -3,6 +3,7 @@ package com.skeidno.networkmanager.vpn
 import com.skeidno.networkmanager.data.AppState
 import com.skeidno.networkmanager.data.DEFAULT_PROXY_DOMAINS
 import com.skeidno.networkmanager.data.FallbackTarget
+import com.skeidno.networkmanager.data.LocalDnsEntry
 import com.skeidno.networkmanager.data.ProxyNode
 import com.skeidno.networkmanager.data.PortableRule
 import com.skeidno.networkmanager.data.RoutingMode
@@ -308,5 +309,49 @@ class SingBoxConfigBuilderTest {
         assertTrue(tls.getJSONObject("reality").getBoolean("enabled"))
         assertTrue(tls.getJSONObject("utls").getBoolean("enabled"))
         assertEquals("chrome", tls.getJSONObject("utls").getString("fingerprint"))
+    }
+
+    @Test
+    fun localDnsMappingBecomesHostsServerThatBeatsTheLanSuffixRule() {
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(
+                AppState(
+                    mode = RoutingMode.Global,
+                    selectedNodeId = node.id,
+                    nodes = listOf(node),
+                    localDnsEntries = listOf(
+                        LocalDnsEntry("nas.lan", "192.168.1.10"),
+                        LocalDnsEntry("wiki.internal-lab.test", "10.0.0.8"),
+                    ),
+                ),
+            ),
+        )
+
+        val dns = config.getJSONObject("dns")
+        val hosts = dns.getJSONArray("servers").getJSONObject(0)
+        assertEquals("hosts", hosts.getString("type"))
+        assertEquals(SingBoxConfigBuilder.localDnsServerTag, hosts.getString("tag"))
+        val predefined = hosts.getJSONObject("predefined")
+        assertEquals("192.168.1.10", predefined.getString("nas.lan"))
+        assertEquals("10.0.0.8", predefined.getString("wiki.internal-lab.test"))
+
+        // 顺序是关键：nas.lan 同样命中内置的 .lan 后缀规则，映射规则必须排在它前面。
+        val rules = dns.getJSONArray("rules")
+        val first = rules.getJSONObject(0)
+        assertEquals("route", first.getString("action"))
+        assertEquals(SingBoxConfigBuilder.localDnsServerTag, first.getString("server"))
+        assertEquals("nas.lan", first.getJSONArray("domain").getString(0))
+        val lanRule = rules.getJSONObject(1)
+        assertEquals("local", lanRule.getString("server"))
+        assertTrue(lanRule.getJSONArray("domain_suffix").toString().contains("lan"))
+    }
+
+    @Test
+    fun dnsServersStayUntouchedWithoutLocalDnsMapping() {
+        // 没配映射时不能凭空多出一台 DNS 服务器，否则原有配置的语义就变了。
+        val config = JSONObject(SingBoxConfigBuilder.build(AppState(nodes = listOf(node))))
+        val dns = config.getJSONObject("dns")
+        assertEquals("local", dns.getJSONArray("servers").getJSONObject(0).getString("tag"))
+        assertEquals("local", dns.getJSONArray("rules").getJSONObject(0).getString("server"))
     }
 }

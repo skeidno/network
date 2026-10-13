@@ -81,6 +81,21 @@ class AppRepository private constructor(private val context: Context) {
         update(mutableState.value.copy(localProxyPort = port))
     }
 
+    /**
+     * 保存本地 DNS 映射。
+     *
+     * 落盘的只有域名和地址：这是**设备本地**配置（同一个域名在公司和在家要指到
+     * 不同机器），所以刻意不进跨设备导入导出的那份文件。
+     */
+    fun setLocalDnsEntries(entries: List<LocalDnsEntry>): Int {
+        val sanitized = sanitizeLocalDnsEntries(entries)
+        update(mutableState.value.copy(localDnsEntries = sanitized))
+        return sanitized.size
+    }
+
+    /** 收编辑器里的多行文本：解析 → 校验 → 落盘，有非法行就抛出去让界面提示。 */
+    fun setLocalDnsFromText(text: String): Int = setLocalDnsEntries(localDnsEntriesFromText(text))
+
     fun savePortableRules(
         index: Int?,
         type: String,
@@ -706,6 +721,18 @@ class AppRepository private constructor(private val context: Context) {
             .putBoolean("localProxyEnabled", state.localProxyEnabled)
             .putInt("localProxyPort", state.localProxyPort)
             .putString(
+                "localDns",
+                JSONArray().apply {
+                    state.localDnsEntries.forEach { entry ->
+                        put(
+                            JSONObject()
+                                .put("domain", entry.domain)
+                                .put("address", entry.address),
+                        )
+                    }
+                }.toString(),
+            )
+            .putString(
                 "portableRules",
                 JSONArray().apply {
                     state.portableRules.forEach { rule ->
@@ -781,6 +808,16 @@ class AppRepository private constructor(private val context: Context) {
             val array = JSONArray(preferences.getString("ruleGroupDomains", null))
             ruleGroupDomainsFromValues(List(array.length()) { index -> array.optString(index) })
         }.getOrDefault(DEFAULT_PROXY_DOMAINS)
+        // 存的是外面来的文本，读回来时再挑一遍：手改过配置文件也不该让内核拿到脏数据。
+        val localDnsEntries = runCatching {
+            val array = JSONArray(preferences.getString("localDns", "[]"))
+            sanitizeLocalDnsEntries(
+                List(array.length()) { index ->
+                    val item = array.getJSONObject(index)
+                    LocalDnsEntry(domain = item.optString("domain"), address = item.optString("address"))
+                },
+            )
+        }.getOrDefault(emptyList())
         return AppState(
             mode = enumPreference("mode", RoutingMode.Rule),
             fallbackTarget = enumPreference("fallback", FallbackTarget.Direct),
@@ -802,6 +839,7 @@ class AppRepository private constructor(private val context: Context) {
             localProxyPort = preferences.getInt("localProxyPort", DEFAULT_LOCAL_PROXY_PORT)
                 .takeIf { it in LOCAL_PROXY_PORT_MIN..LOCAL_PROXY_PORT_MAX }
                 ?: DEFAULT_LOCAL_PROXY_PORT,
+            localDnsEntries = localDnsEntries,
         )
     }
 

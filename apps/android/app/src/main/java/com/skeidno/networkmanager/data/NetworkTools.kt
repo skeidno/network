@@ -11,8 +11,18 @@ import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.security.cert.X509Certificate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Base64
 import java.util.UUID
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSession
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.X509TrustManager
+import javax.security.auth.x500.X500Principal
 
 /**
  * 「工具箱」页面的能力实现。
@@ -27,7 +37,10 @@ import java.util.UUID
 object NetworkTools {
     private const val userAgent = "NetworkManager-Android"
 
-    private val ipv4Pattern = Regex("""^\d{1,3}(?:\.\d{1,3}){3}$""")
+    private val certificateDateFormat: DateTimeFormatter =
+        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault())
+
+    private val commonNamePattern = Regex("""(?:^|[,\s])CN=([^,]*)""", RegexOption.IGNORE_CASE)
 
     /** dns.google 的 JSON 接口用数字表示记录类型，这里做双向映射。 */
     private val dnsTypeCodes = mapOf(
@@ -198,6 +211,247 @@ object NetworkTools {
     }
 
     // ------------------------------------------------------------------
+    // 证书检测
+    // ------------------------------------------------------------------
+
+    data class CertificateInfo(
+        val subject: String,
+        val issuer: String,
+        val notBefore: String,
+        val notAfter: String,
+        val selfSigned: Boolean,
+        val alternativeNames: List<String>,
+        val signatureAlgorithm: String,
+    )
+
+    data class CertificateProbe(
+        val host: String,
+        val port: Int,
+        /** 解析出来的地址。配了本地 DNS 映射时，这里就是映射的目标。 */
+        val resolvedAddresses: List<String>,
+        /** TCP 是否连上——没连上时下面两项没有意义。 */
+        val reachable: Boolean,
+        val trustedBySystem: Boolean,
+        val hostnameVerified: Boolean,
+        val detail: String,
+        val chain: List<CertificateInfo> = emptyList(),
+    )
+
+    /**
+     * 对 `域名:端口` 做一次真实的 TLS 握手，报告**系统会不会认这张证书**。
+     *
+     * 「局域网里用域名访问、证书也通过校验」这件事分成两步：域名要先能解析到
+     * 那台机器（靠本地 DNS 映射），然后证书里的名字要对得上、签发链要被信任。
+     * 这里只负责回答第二步——证书链是否被系统信任、名字是否匹配、链上有谁。
+     *
+     * 判定用的是平台默认信任库（和浏览器同一套），所以结论可以直接当成
+     * 「浏览器打开会不会报红」。
+     */
+    fun probeCertificate(host: String, port: Int = 443, timeoutMs: Int = 6_000): CertificateProbe {
+        val target = host.trim()
+            .removePrefix("https://")
+            .removePrefix("http://")
+            .substringBefore('/')
+            .removeSurrounding("[", "]")
+            .trim()
+        if (target.isBlank()) {
+            return CertificateProbe(target, port, emptyList(), false, false, false, "请填写域名或 IP")
+        }
+        if (port !in 1..65_535) {
+            return CertificateProbe(target, port, emptyList(), false, false, false, "端口要在 1..65535 之间")
+        }
+        val resolved = runCatching {
+            InetAddress.getAllByName(target).map { address ->
+                address.hostAddress.orEmpty().substringBefore('%')
+            }
+        }.getOrElse { error ->
+            return CertificateProbe(
+                target, port, emptyList(), false, false, false,
+                "域名解析失败：${error.message ?: error.javaClass.simpleName}" +
+                    "（如果这个域名配了本地 DNS 映射，确认接管已开启）",
+            )
+        }
+
+        // 第一次握手走系统信任库，它给出的就是权威结论。
+        try {
+            openTls(target, port, timeoutMs, permissive = false).use { connection ->
+                val verified = HttpsURLConnection.getDefaultHostnameVerifier()
+                    .verify(target, connection.session)
+                return CertificateProbe(
+                    host = target,
+                    port = port,
+                    resolvedAddresses = resolved,
+                    reachable = true,
+                    trustedBySystem = true,
+                    hostnameVerified = verified,
+                    detail = if (verified) {
+                        "系统信任该证书，且证书覆盖 $target"
+                    } else {
+                        "证书链可信，但证书里的域名不包含 $target（浏览器会报「名称不匹配」）"
+                    },
+                    chain = connection.chain,
+                )
+            }
+        } catch (error: Exception) {
+            val reason = describeTlsFailure(error)
+            // 信任不过、或者名字不对时，仍然把对方递过来的证书挖出来给用户看：
+            // 只剩一句「握手失败」是没法排查的。
+            val permissive = runCatching { openTls(target, port, timeoutMs, permissive = true) }
+            val connection = permissive.getOrNull()
+                ?: return CertificateProbe(
+                    target, port, resolved, false, false, false, reason,
+                )
+            connection.use {
+                val verified = HttpsURLConnection.getDefaultHostnameVerifier()
+                    .verify(target, it.session)
+                return CertificateProbe(
+                    host = target,
+                    port = port,
+                    resolvedAddresses = resolved,
+                    reachable = true,
+                    trustedBySystem = false,
+                    hostnameVerified = verified,
+                    detail = reason,
+                    chain = it.chain,
+                )
+            }
+        }
+    }
+
+    /**
+     * 把「域名」「域名:端口」「[v6]:端口」都拆成 host 与 port。
+     *
+     * 域名里的冒号只可能是端口分隔符，所以按最后一个冒号切；IPv6 必须带方括号，
+     * 不带的话没法区分是地址还是端口，那种输入一律按域名处理。
+     */
+    fun parseHostPort(input: String, defaultPort: Int = 443): Pair<String, Int> {
+        val text = input.trim()
+            .removePrefix("https://")
+            .removePrefix("http://")
+            .substringBefore('/')
+        if (text.startsWith("[")) {
+            val end = text.indexOf(']')
+            if (end > 0) {
+                val host = text.substring(1, end)
+                val port = text.substring(end + 1).removePrefix(":").toIntOrNull()
+                return host to (port ?: defaultPort)
+            }
+        }
+        val colon = text.lastIndexOf(':')
+        if (colon > 0 && text.indexOf(':') == colon) {
+            val port = text.substring(colon + 1).toIntOrNull()
+            if (port != null) return text.substring(0, colon) to port
+        }
+        return text to defaultPort
+    }
+
+    private class TlsConnection(
+        val socket: SSLSocket,
+        val session: SSLSession,
+        val chain: List<CertificateInfo>,
+    ) : java.io.Closeable {
+        override fun close() {
+            runCatching { socket.close() }
+        }
+    }
+
+    private fun openTls(host: String, port: Int, timeoutMs: Int, permissive: Boolean): TlsConnection {
+        val plain = Socket()
+        var wrapped: SSLSocket? = null
+        try {
+            plain.connect(InetSocketAddress(host, port), timeoutMs)
+            val factory = if (permissive) {
+                permissiveSocketFactory
+            } else {
+                SSLSocketFactory.getDefault() as SSLSocketFactory
+            }
+            // autoClose = true：关掉 TLS 套接字时会一起关掉底层 TCP。
+            val ssl = factory.createSocket(plain, host, port, true) as SSLSocket
+            wrapped = ssl
+            ssl.soTimeout = timeoutMs
+            ssl.startHandshake()
+            return TlsConnection(ssl, ssl.session, ssl.session.peerChain())
+        } catch (error: Throwable) {
+            runCatching { wrapped?.close() ?: plain.close() }
+            throw error
+        }
+    }
+
+    private fun SSLSession.peerChain(): List<CertificateInfo> =
+        (peerCertificates as? Array<*>)?.mapNotNull { (it as? X509Certificate)?.toInfo() }.orEmpty()
+
+    /**
+     * 只在 [probeCertificate] 里用来「看证书」的一次性信任管理器。
+     *
+     * 它不参与任何真实连接：既不装进全局 SSLContext，也不给内核或业务请求用，
+     * 只是为了在对方证书不被信任时还能把链上的证书读出来显示。握手完即弃。
+     */
+    private val permissiveSocketFactory: SSLSocketFactory by lazy {
+        val trustManager = object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+        }
+        SSLContext.getInstance("TLS")
+            .apply { init(null, arrayOf(trustManager), null) }
+            .socketFactory
+    }
+
+    /**
+     * 把 TLS 失败翻译成能指导下一步的说法。
+     *
+     * 各实现抛的异常类型和文案并不统一（Conscrypt / OpenSSL / JVM 都不一样），
+     * 所以这里连类型带消息一起看，再按最可能的原因归类。
+     */
+    internal fun describeTlsFailure(error: Throwable): String {
+        val types = mutableListOf<String>()
+        val messages = mutableListOf<String>()
+        var current: Throwable? = error
+        while (current != null && types.size < 8) {
+            types += current.javaClass.simpleName
+            messages += current.message.orEmpty()
+            current = current.cause
+        }
+        val all = (types + messages).joinToString(" | ").lowercase()
+        return when {
+            "unknownhost" in all -> "域名解析失败"
+            "sockettimeout" in all -> "连接超时"
+            "connectexception" in all || "connection refused" in all -> "连接被拒绝"
+            "not verified" in all || "hostname" in all -> "证书与域名不匹配"
+            "expired" in all -> "证书已过期"
+            "not yet valid" in all -> "证书尚未生效"
+            "trust anchor" in all || "unable to find valid certification" in all ||
+                "certpathvalidator" in all || "not trusted" in all ->
+                "系统不信任该证书链（多半是自签证书或自建 CA，需要把 CA 装进设备信任库）"
+            else -> error.message ?: error.javaClass.simpleName
+        }
+    }
+
+    private fun X509Certificate.toInfo(): CertificateInfo = CertificateInfo(
+        subject = describePrincipal(subjectX500Principal),
+        issuer = describePrincipal(issuerX500Principal),
+        notBefore = certificateDateFormat.format(notBefore.toInstant()),
+        notAfter = certificateDateFormat.format(notAfter.toInstant()),
+        selfSigned = subjectX500Principal == issuerX500Principal,
+        alternativeNames = subjectAlternativeNames?.mapNotNull { entry ->
+            val value = entry.getOrNull(1) as? String ?: return@mapNotNull null
+            when (entry.getOrNull(0)) {
+                2 -> value
+                7 -> "IP:$value"
+                else -> null
+            }
+        }.orEmpty(),
+        signatureAlgorithm = sigAlgName,
+    )
+
+    /** 显示用：优先取 CN，取不到（或没有 CN）就退回完整主体。 */
+    private fun describePrincipal(principal: X500Principal): String {
+        val name = runCatching { principal.getName(X500Principal.RFC2253) }.getOrDefault("")
+        val common = commonNamePattern.find(name)?.groupValues?.get(1)?.trim()
+        return common?.takeIf(String::isNotEmpty) ?: name
+    }
+
+    // ------------------------------------------------------------------
     // 分享链接解析
     // ------------------------------------------------------------------
 
@@ -259,20 +513,48 @@ object NetworkTools {
     /**
      * 按当前配置预判某个域名/IP 会走哪条出站。
      *
-     * 顺序严格照抄 [SingBoxConfigBuilder.build] 里 rules 的排列：局域网 →
-     * （节点服务器地址直连）→ 常用站点规则 → 自定义规则 → 模式兜底。
+     * 顺序严格照抄 [SingBoxConfigBuilder.build] 里 rules 的排列：本地 DNS 映射
+     * → 局域网 → （节点服务器地址直连）→ 常用站点规则 → 自定义规则 → 模式兜底。
      * 唯一没覆盖的是 probe-in 入站那条强制规则，它只作用于出口检测流量，
      * 普通流量不会命中。
      */
     fun previewRoute(state: AppState, query: String): RoutePreview {
         val target = query.trim().removeSuffix(".").lowercase()
         val hasNodes = state.nodes.isNotEmpty()
-        val isIp = ipv4Pattern.matches(target) || target.contains(':')
+        val isIp = isIpLiteral(target)
 
         if (target.isBlank()) {
             return RoutePreview(query, Outbound.Direct, "请输入域名或 IP")
         }
 
+        // 本地 DNS 映射先看：域名会被内核直接解析成映射里的地址。
+        val local = state.localDnsEntries.firstOrNull { it.domain == target }
+        if (local != null && SingBoxConfigBuilder.lanCidrs.any { ipInCidr(local.address, it) }) {
+            return RoutePreview(
+                query = query,
+                outbound = Outbound.Direct,
+                reason = "命中本地 DNS 映射：$target → ${local.address}（内网地址，按局域网 ip_cidr 规则直连）",
+            )
+        }
+
+        val verdict = routeFor(state, query, target, hasNodes)
+        // 映射到非内网地址时出站不受影响，但用户多半就是冲着「这个域名归我管」才配的，
+        // 不说一句会以为映射没生效。
+        if (local == null) return verdict
+        return verdict.copy(
+            notes = verdict.notes + "该域名配了本地 DNS 映射 $target → ${local.address}；" +
+                "它不是内网地址，所以出站仍按上面的规则判定",
+        )
+    }
+
+    /** 规则链判定，顺序就是 [SingBoxConfigBuilder.build] 里 rules 的排列。 */
+    private fun routeFor(
+        state: AppState,
+        query: String,
+        target: String,
+        hasNodes: Boolean,
+    ): RoutePreview {
+        val isIp = isIpLiteral(target)
         // 1) 局域网：域名按 domain_suffix 字符串后缀匹配，IP 按 ip_cidr 匹配。
         if (isIp) {
             if (SingBoxConfigBuilder.lanCidrs.any { ipInCidr(target, it) }) {
@@ -386,13 +668,5 @@ object NetworkTools {
     }
 
     /** 只解析字面量 IP，绝不触发 DNS（getByName 对主机名会发查询）。 */
-    private fun parseLiteralIp(text: String): ByteArray? {
-        val value = text.trim().removeSurrounding("[", "]").substringBefore('%')
-        if (value.isEmpty()) return null
-        val looksLikeIp = ipv4Pattern.matches(value) || value.contains(':')
-        if (!looksLikeIp) return null
-        val isIpv4 = ipv4Pattern.matches(value)
-        if (isIpv4 && value.split('.').any { (it.toIntOrNull() ?: 256) > 255 }) return null
-        return runCatching { InetAddress.getByName(value).address }.getOrNull()
-    }
+    private fun parseLiteralIp(text: String): ByteArray? = parseIpLiteral(text)
 }

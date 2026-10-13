@@ -129,10 +129,12 @@ import com.skeidno.networkmanager.data.DEFAULT_PROXY_DOMAINS
 import com.skeidno.networkmanager.data.FallbackTarget
 import com.skeidno.networkmanager.data.InstalledApp
 import com.skeidno.networkmanager.data.LatencyStatus
+import com.skeidno.networkmanager.data.LocalDnsEntry
 import com.skeidno.networkmanager.data.PortableRule
 import com.skeidno.networkmanager.data.ProxyNode
 import com.skeidno.networkmanager.data.RoutingMode
 import com.skeidno.networkmanager.data.Subscription
+import com.skeidno.networkmanager.data.localDnsEntriesToText
 import kotlin.math.max
 
 private enum class AppPage(val label: String, val icon: ImageVector) {
@@ -253,6 +255,7 @@ fun NetworkManagerApp(
                             state = state,
                             onLocalProxyEnabled = viewModel::setLocalProxyEnabled,
                             onLocalProxyPort = viewModel::setLocalProxyPort,
+                            onLocalDns = viewModel::setLocalDnsText,
                             onImportConfiguration = onImportConfiguration,
                             onExportConfiguration = onExportConfiguration,
                         )
@@ -1530,10 +1533,12 @@ private fun SettingsPage(
     state: AppState,
     onLocalProxyEnabled: (Boolean) -> Unit,
     onLocalProxyPort: (Int) -> Unit,
+    onLocalDns: (String) -> Boolean,
     onImportConfiguration: () -> Unit,
     onExportConfiguration: () -> Unit,
 ) {
     var showPortEditor by rememberSaveable { mutableStateOf(false) }
+    var showLocalDnsEditor by rememberSaveable { mutableStateOf(false) }
     val actual = state.localProxyActualPort
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -1591,6 +1596,25 @@ private fun SettingsPage(
                 }
             }
         }
+        item { SectionHeader("本地 DNS") }
+        item {
+            PreferenceGroup {
+                ListItem(
+                    modifier = Modifier.clickable { showLocalDnsEditor = true },
+                    headlineContent = { Text("自定义域名映射") },
+                    supportingContent = {
+                        Text(
+                            state.localDnsEntries.firstOrNull()?.let { first ->
+                                val more = state.localDnsEntries.size - 1
+                                "${first.domain} → ${first.address}" + if (more > 0) " 等 ${state.localDnsEntries.size} 条" else ""
+                            } ?: "未配置 · 让局域网服务能用域名访问",
+                        )
+                    },
+                    leadingContent = { PrefIcon(Icons.Default.Public) },
+                    trailingContent = { TrailingChevron() },
+                )
+            }
+        }
         item { SectionHeader("跨设备配置") }
         item {
             PreferenceGroup {
@@ -1641,6 +1665,69 @@ private fun SettingsPage(
             onDismiss = { showPortEditor = false },
         )
     }
+    if (showLocalDnsEditor) {
+        LocalDnsEditorDialog(
+            entries = state.localDnsEntries,
+            onSave = onLocalDns,
+            onDismiss = { showLocalDnsEditor = false },
+        )
+    }
+}
+
+/**
+ * 本地 DNS 映射编辑器。
+ *
+ * 做成多行文本而不是一行一条的列表，理由有两个：一是和「编辑常用海外站点」
+ * 用同一套交互，二是这一块经常是直接把服务器的 /etc/hosts 粘过来改，
+ * 文本形态最省事。
+ */
+@Composable
+private fun LocalDnsEditorDialog(
+    entries: List<LocalDnsEntry>,
+    onSave: (String) -> Boolean,
+    onDismiss: () -> Unit,
+) {
+    var text by remember(entries) { mutableStateOf(localDnsEntriesToText(entries)) }
+    val lines = text.lineSequence()
+        .map { it.substringBefore('#').trim() }
+        .filter(String::isNotBlank)
+        .toList()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("本地 DNS 映射") },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    label = { Text("一行一条，域名和 IP 顺序随意") },
+                    placeholder = { Text("nas.lan 192.168.1.10") },
+                    minLines = 6,
+                    maxLines = 12,
+                    modifier = Modifier.fillMaxWidth().testTag("local-dns-values"),
+                )
+                Text(
+                    if (lines.isEmpty()) "当前没有映射" else "共 ${lines.size} 条",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "只做精确域名匹配，不支持通配。地址属于内网网段时会自动直连；" +
+                        "要在局域网里用 HTTPS，证书里的名字得和这里的域名一致——" +
+                        "自签证书还要把 CA 装进设备信任库，可以用工具箱的「证书检测」确认。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { if (onSave(text)) onDismiss() }) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }
 
 /** 移动端设置项的一张分组卡片：一组 [ListItem] 用细分割线串起来。 */

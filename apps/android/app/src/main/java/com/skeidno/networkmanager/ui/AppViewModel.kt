@@ -14,6 +14,7 @@ import com.skeidno.networkmanager.data.ExitCheckStatus
 import com.skeidno.networkmanager.data.FallbackTarget
 import com.skeidno.networkmanager.data.InstalledApp
 import com.skeidno.networkmanager.data.RoutingMode
+import com.skeidno.networkmanager.data.localDnsEntriesFromText
 import com.skeidno.networkmanager.vpn.NetworkVpnService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -106,6 +107,28 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 false
             },
         )
+
+    /**
+     * 保存本地 DNS 映射（自定义域名 → IP）。
+     *
+     * 有非法行时 [localDnsEntriesFromText] 会抛异常，这里翻成提示语并把编辑框留着
+     * 不给关——半截配置比没配置更难查。
+     */
+    fun setLocalDnsText(text: String): Boolean = runCatching {
+        repository.setLocalDnsFromText(text)
+    }.fold(
+        onSuccess = { count ->
+            mutableMessages.tryEmit(
+                if (count == 0) "本地 DNS 映射已清空" else "已保存 $count 条本地 DNS 映射",
+            )
+            applyConfigurationIfRunning()
+            true
+        },
+        onFailure = {
+            mutableMessages.tryEmit(it.message ?: "本地 DNS 映射保存失败")
+            false
+        },
+    )
 
     fun savePortableRules(
         index: Int?,
