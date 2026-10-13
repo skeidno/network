@@ -872,7 +872,33 @@ function renderSettings() {
   byId("setting-start-on-launch").checked = settings.startOnLaunch;
   byId("setting-close-to-tray").checked = settings.closeToTray;
   byId("setting-start-with-windows").checked = settings.startWithWindows;
+  byId("setting-local-dns").value =
+    settings.localDnsText || localDnsTextFromEntries(settings.localDns || []);
+  updateLocalDnsSummary();
   settingsInitialized = true;
+}
+
+/** 已经落盘的映射用 Rust 回写的文本表示；界面只做兜底拼接。 */
+function localDnsTextFromEntries(entries) {
+  return entries.map((entry) => `${entry.domain} ${entry.address}`).join("\n");
+}
+
+/** 摘要只数「去掉注释后还有内容的行」，和真正保存时的解析口径一致。 */
+function localDnsLineCount(text) {
+  return text
+    .split("\n")
+    .map((line) => line.split("#")[0].trim())
+    .filter(Boolean).length;
+}
+
+function updateLocalDnsSummary(text) {
+  const summary = byId("setting-local-dns-summary");
+  if (!summary) return;
+  const dirty = text !== undefined;
+  const value = dirty ? text : byId("setting-local-dns").value;
+  const count = localDnsLineCount(value);
+  summary.textContent = count ? `共 ${count} 条映射${dirty ? "（未保存）" : ""}` : "当前没有映射";
+  summary.classList.toggle("has-warning", dirty && count > 0);
 }
 
 async function refreshLogs() {
@@ -1848,6 +1874,18 @@ function bindEvents() {
       closeToTray: byId("setting-close-to-tray").checked,
       startWithWindows: byId("setting-start-with-windows").checked,
     }));
+    settingsInitialized = false;
+  });
+  // 本地 DNS 映射：独立保存，不跟「保存设置」一起提交 —— 它是多行文本，
+  // 解析失败要能单独报错并把编辑框留着，混进表单里会让整组设置一起白改。
+  byId("setting-local-dns").addEventListener("input", (event) => {
+    updateLocalDnsSummary(event.target.value);
+  });
+  byId("save-local-dns").addEventListener("click", async () => {
+    const result = await invoke("saveLocalDns", byId("setting-local-dns").value);
+    if (!result) return; // 失败时已经提示过，输入内容保持原样让用户改
+    byId("setting-local-dns").value = result.text || "";
+    updateLocalDnsSummary();
     settingsInitialized = false;
   });
   byId("setting-random-server-proxy-port").addEventListener("click", () => {

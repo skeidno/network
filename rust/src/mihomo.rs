@@ -64,6 +64,60 @@ const LAN_IPV4_CIDRS: &[&str] = &[
 
 const LAN_IPV6_CIDRS: &[&str] = &["::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"];
 
+/// 判断地址是否落在某个 CIDR 里。只用来做「这个映射是不是指向内网」这一个判断，
+/// 所以不引第三方库，前缀位运算就够了。
+fn cidr_contains(cidr: &str, address: IpAddr) -> bool {
+    let Some((network, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let (Ok(network), Ok(prefix)) = (network.parse::<IpAddr>(), prefix.parse::<u8>()) else {
+        return false;
+    };
+    match (network, address) {
+        (IpAddr::V4(net), IpAddr::V4(addr)) if prefix <= 32 => {
+            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            u32::from(net) & mask == u32::from(addr) & mask
+        }
+        (IpAddr::V6(net), IpAddr::V6(addr)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(net) & mask == u128::from(addr) & mask
+        }
+        _ => false,
+    }
+}
+
+/// 映射目标是不是内网地址。
+///
+/// 和 Android 端用的是同一份局域网网段清单（那里叫 `lanCidrs`），判定口径要一致，
+/// 否则同一个映射在手机和电脑上会走向不同的出口。
+fn is_lan_address(address: &str) -> bool {
+    let Some(parsed) = crate::models::parse_ip_literal(address) else {
+        return false;
+    };
+    LAN_IPV4_CIDRS
+        .iter()
+        .chain(LAN_IPV6_CIDRS.iter())
+        .any(|cidr| cidr_contains(cidr, parsed))
+}
+
+/// 本地 DNS 映射里指向内网地址的那几条，生成显式直连规则。
+///
+/// 局域网里的服务交给节点毫无意义，而兜底的 `IP-CIDR` 规则在这个场景下不一定命中：
+/// TUN 开着嗅探、`override-destination` 又是 true 时，规则匹配看到的是域名而不是 IP。
+/// 这里补一条域名规则，让「映射到内网」= 「直连」这个结论和 Android 端完全一致。
+fn local_dns_direct_rules(config: &AppConfig) -> Vec<String> {
+    config
+        .local_dns
+        .iter()
+        .filter(|entry| !entry.domain.is_empty() && is_lan_address(&entry.address))
+        .map(|entry| format!("DOMAIN,{},DIRECT", entry.domain.to_lowercase()))
+        .collect()
+}
+
 fn target_name(target: &str) -> String {
     TARGET_NAMES
         .iter()
@@ -237,6 +291,9 @@ pub fn build(config: &AppConfig) -> Value {
     );
     rules.push("DST-PORT,22,DIRECT".into());
     rules.extend(dialer_route_rules(config));
+    // 本地 DNS 映射里指向内网的域名排在局域网后缀规则之前，和用户自建规则相比也是
+    // 先命中先算 —— 映射是用户明确写下的意图，优先级应当高于后面的通用规则。
+    rules.extend(local_dns_direct_rules(config));
     rules.extend(
         ["lan", "local", "home.arpa"]
             .iter()
@@ -347,6 +404,19 @@ pub fn build(config: &AppConfig) -> Value {
         ],
     });
 
+    // 本地 DNS 映射（自定义域名 → 固定 IP）。`hosts` 是内核查表，命中就返回写死的
+    // 地址、不往外发查询，所以局域网里的自建服务不会被上游 DNS 的缓存/劫持带偏。
+    // 只在真的有映射时才写这个键：没有映射的用户拿到的配置和以前逐字节一致。
+    if !config.local_dns.is_empty() {
+        result["hosts"] = Value::Object(
+            config
+                .local_dns
+                .iter()
+                .map(|entry| (entry.domain.clone(), Value::String(entry.address.clone())))
+                .collect(),
+        );
+    }
+
     if !config.imported_nodes.is_empty() {
         let mut node_names: Vec<String> = config.imported_nodes.iter().map(|n| n.name()).collect();
         if node_names.contains(&config.selected_node) {
@@ -375,4 +445,132 @@ pub fn build(config: &AppConfig) -> Value {
 pub fn render_yaml(config: &AppConfig) -> Result<String, String> {
     let value = build(config);
     serde_yaml::to_string(&value).map_err(|err| format!("生成配置失败：{err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::LocalDnsEntry;
+
+    fn config_with(entries: &[(&str, &str)]) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.local_dns = entries
+            .iter()
+            .map(|(domain, address)| LocalDnsEntry {
+                domain: (*domain).into(),
+                address: (*address).into(),
+            })
+            .collect();
+        config
+    }
+
+    fn rules_of(value: &Value) -> Vec<String> {
+        value["rules"]
+            .as_array()
+            .expect("rules 应当是数组")
+            .iter()
+            .map(|rule| rule.as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_config_without_mappings_looks_exactly_as_before() {
+        // 没用这个功能的用户，生成的配置不该多出 hosts 键。
+        let value = build(&AppConfig::default());
+        assert!(value.get("hosts").is_none());
+        let filter: Vec<&str> = value["dns"]["fake-ip-filter"]
+            .as_array()
+            .expect("fake-ip-filter 应当是数组")
+            .iter()
+            .map(|item| item.as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            filter,
+            vec![
+                "+.lan",
+                "+.local",
+                "localhost.ptlogin2.qq.com",
+                "time.windows.com",
+                "time.nist.gov"
+            ]
+        );
+    }
+
+    #[test]
+    fn mappings_become_a_hosts_table() {
+        let value = build(&config_with(&[("nas.lan", "192.168.1.10")]));
+        assert_eq!(value["hosts"]["nas.lan"], "192.168.1.10");
+    }
+
+    #[test]
+    fn fake_ip_filter_is_left_alone() {
+        // `hosts` 命中就返回固定 IP，fake-ip 阶段根本轮不到它 —— 不往 filter 里塞域名，
+        // 免得哪天 hosts 那条路没走上时，反而把一个只存在于内网的域名推给公网 DNS。
+        let value = build(&config_with(&[("nas.lan", "192.168.1.10")]));
+        let filter: Vec<&str> = value["dns"]["fake-ip-filter"]
+            .as_array()
+            .expect("fake-ip-filter 应当是数组")
+            .iter()
+            .map(|item| item.as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(filter.len(), 5);
+        assert!(!filter.contains(&"nas.lan"), "{filter:?}");
+    }
+
+    #[test]
+    fn lan_mappings_are_forced_direct() {
+        // 各网段各挑一个，确保内网判定用的是和 Android 端同一份清单。
+        for address in ["192.168.1.10", "10.0.0.5", "172.16.3.4", "127.0.0.1", "fd00::5"] {
+            let value = build(&config_with(&[("nas.lan", address)]));
+            assert!(
+                rules_of(&value).contains(&"DOMAIN,nas.lan,DIRECT".to_string()),
+                "{address} 应当被判成内网地址"
+            );
+        }
+    }
+
+    #[test]
+    fn public_mappings_keep_normal_routing() {
+        // 映射到公网地址只是钉住解析结果，走哪个出口仍然交给分流规则决定。
+        let value = build(&config_with(&[("cdn.example.com", "1.1.1.1")]));
+        assert!(!rules_of(&value).contains(&"DOMAIN,cdn.example.com,DIRECT".to_string()));
+    }
+
+    #[test]
+    fn lan_mappings_win_over_user_rules() {
+        // 用户给同一个域名写了「走节点」的规则：映射是更明确的一条，先命中先算，
+        // 所以映射的直连规则必须排在用户规则前面。
+        let mut config = config_with(&[("nas.lan", "192.168.1.10")]);
+        config.rules = vec![crate::models::RoutingRule {
+            rule_type: "DOMAIN-SUFFIX".into(),
+            value: "nas.lan".into(),
+            target: "CLASH".into(),
+            ..Default::default()
+        }];
+        let rules = rules_of(&build(&config));
+        let mapping = rules
+            .iter()
+            .position(|rule| rule == "DOMAIN,nas.lan,DIRECT")
+            .expect("应当有映射直连规则");
+        let user_rule = rules
+            .iter()
+            .position(|rule| rule == "DOMAIN-SUFFIX,nas.lan,UPSTREAM-CLASH")
+            .expect("应当有用户规则");
+        assert!(mapping < user_rule, "映射规则要排在用户规则之前：{rules:?}");
+    }
+
+    #[test]
+    fn cidr_matching_agrees_with_the_lan_list() {
+        let address = |text: &str| text.parse::<IpAddr>().expect("测试用的都是字面量");
+        assert!(is_lan_address("192.168.1.10"));
+        assert!(is_lan_address("100.64.0.1"));
+        assert!(is_lan_address("fd00::5"));
+        assert!(!is_lan_address("8.8.8.8"));
+        assert!(!is_lan_address("2001:4860:4860::8888"));
+        // 不能把域名字符串当成 IP（那会触发真实解析），这里必须是 false。
+        assert!(!is_lan_address("router.lan"));
+        assert!(cidr_contains("192.168.0.0/16", address("192.168.255.254")));
+        assert!(!cidr_contains("192.168.0.0/16", address("192.169.0.1")));
+        assert!(cidr_contains("0.0.0.0/0", address("8.8.8.8")));
+    }
 }

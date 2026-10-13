@@ -251,6 +251,16 @@ fun localDnsAddressError(rawAddress: String): String? {
     return null
 }
 
+/**
+ * 存下来的地址统一成不带方括号的字面量。
+ *
+ * 内核的 hosts 表要的是 `fd00::10`，而用户从 URL 或别处粘过来的多半是 `[fd00::10]`。
+ * 校验在带括号的原串上做（两种写法都认），落盘只留一种写法，桌面端也是同一套规则 ——
+ * 两端存出来的配置才是同一种形态。
+ */
+fun normalizeLocalDnsAddress(rawAddress: String): String =
+    rawAddress.trim().removeSurrounding("[", "]").trim()
+
 private val domainPattern = Regex("""^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?)+$""")
 
 /**
@@ -288,7 +298,7 @@ fun localDnsEntriesFromText(
         localDnsAddressError(addressPart)?.let { throw IllegalArgumentException("第 ${index + 1} 行：$it") }
         val domain = normalizeLocalDnsDomain(domainPart)
         entries.remove(domain)
-        entries[domain] = LocalDnsEntry(domain = domain, address = addressPart.trim())
+        entries[domain] = LocalDnsEntry(domain = domain, address = normalizeLocalDnsAddress(addressPart))
     }
     if (entries.size > limit) {
         throw IllegalArgumentException("最多 $limit 条映射，当前 ${entries.size} 条")
@@ -308,7 +318,7 @@ fun sanitizeLocalDnsEntries(
     val result = LinkedHashMap<String, LocalDnsEntry>()
     entries.forEach { entry ->
         val domain = normalizeLocalDnsDomain(entry.domain)
-        val address = entry.address.trim()
+        val address = normalizeLocalDnsAddress(entry.address)
         if (localDnsDomainError(domain) != null || localDnsAddressError(address) != null) return@forEach
         result.remove(domain)
         result[domain] = LocalDnsEntry(domain, address)

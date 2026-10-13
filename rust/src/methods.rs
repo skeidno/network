@@ -905,6 +905,37 @@ pub async fn dispatch(
             }
             apply(state)
         }
+        "saveLocalDns" => {
+            // 收编辑器里的多行文本：解析 → 校验 → 落盘。有非法行就整条拒绝并回错误，
+            // 不存半截配置（否则用户以为存上了，实际少了几条映射）。
+            let entries = match crate::models::local_dns_entries_from_text(&text(&args, 0)) {
+                Ok(entries) => entries,
+                Err(reason) => {
+                    state.notify("error", reason);
+                    return Ok(json!(null));
+                }
+            };
+            let count = entries.len();
+            let running = state.core.is_running();
+            state.config.local_dns = entries;
+            apply(state)?;
+            // 内核不热重载：运行中改映射要重新接管才生效，这里必须说清楚，
+            // 不然用户会以为保存没起作用。
+            state.notify(
+                "success",
+                if count == 0 {
+                    "已清空本地 DNS 映射".to_string()
+                } else if running {
+                    format!("已保存 {count} 条本地 DNS 映射，重新接管后生效")
+                } else {
+                    format!("已保存 {count} 条本地 DNS 映射")
+                },
+            );
+            Ok(json!({
+                "count": count,
+                "text": crate::models::local_dns_entries_to_text(&state.config.local_dns),
+            }))
+        }
         "saveSources" => {
             let patch = payload(&args, 0)?;
             for (key, slot) in [("clash", "Clash 7897"), ("v2ray", "v2ray 10808")] {

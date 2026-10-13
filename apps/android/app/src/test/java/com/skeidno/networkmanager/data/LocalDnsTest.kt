@@ -60,6 +60,13 @@ class LocalDnsTest {
     }
 
     @Test
+    fun acceptsBracketedIpv6ButStoresItWithoutBrackets() {
+        // 粘 URL 写法要认，但落盘只留一种：hosts 表里需要的是 `fd00::10`。
+        // 桌面端（rust/src/models.rs 的 normalize_address_literal）是同一套规则。
+        assertEquals("fd00::10", localDnsEntriesFromText("nas.lan [fd00::10]").single().address)
+    }
+
+    @Test
     fun rejectsWildcardAndSaysWhy() {
         val error = assertThrows(IllegalArgumentException::class.java) {
             localDnsEntriesFromText("*.lan 192.168.1.10")

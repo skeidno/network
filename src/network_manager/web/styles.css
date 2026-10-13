@@ -865,6 +865,10 @@ label > small { display: block; margin-top: 5px; color: var(--text-3); font-size
 .switch-row input:checked + i { background: var(--blue); }
 .switch-row input:checked + i::after { transform: translateX(18px); }
 .switch-row input:focus-visible + i { box-shadow: 0 0 0 2px var(--focus-soft), 0 0 0 3px var(--focus-border); }
+.local-dns-field { display: block; }
+#setting-local-dns { min-height: 128px; font: 12px/1.6 Consolas, "Microsoft YaHei UI", monospace; }
+.settings-note { max-width: 78ch; margin: 10px 0 0; color: var(--text-3); font-size: 11px; line-height: 1.55; }
+.settings-note strong { color: var(--text-2); font-weight: 600; }
 
 /* ==========================================================================
    Logs

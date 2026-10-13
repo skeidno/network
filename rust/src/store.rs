@@ -24,9 +24,15 @@ pub fn load() -> AppConfig {
                     config.version = crate::models::CONFIG_VERSION;
                     config.mode = config.mode.to_uppercase();
                     config.default_target = config.default_target.to_uppercase();
+                    // 映射列表是外部文本存下来的（settings.json 允许手改），读回来时
+                    // 不该信任：非法条目、重复域名、超量的一次性清掉。
+                    let raw_entries = std::mem::take(&mut config.local_dns);
+                    let entries = crate::models::sanitize_local_dns_entries(raw_entries.clone());
+                    let entries_changed = entries != raw_entries;
+                    config.local_dns = entries;
                     // 迁移只在内存里改的话，每次启动都要重算一遍，配置文件里的
                     // 旧值也永远在那里；改了就落盘，让用户看到真实生效的值。
-                    if migrate(&mut config, stored_version) {
+                    if migrate(&mut config, stored_version) || entries_changed {
                         save(&config);
                     }
                     config
