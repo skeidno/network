@@ -26,8 +26,10 @@ object SingBoxConfigBuilder {
      */
     const val localInboundTag = "local-in"
 
-    private val lanDomainSuffixes = listOf("lan", "local", "home.arpa")
-    private val lanCidrs = listOf(
+    // 工具箱的「规则命中预判」要按同一份局域网定义来判定，所以这里是 internal
+    // 而不是 private —— 两处各写一份迟早会走偏。
+    internal val lanDomainSuffixes = listOf("lan", "local", "home.arpa")
+    internal val lanCidrs = listOf(
         "0.0.0.0/8",
         "10.0.0.0/8",
         "100.64.0.0/10",

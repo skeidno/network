@@ -36,6 +36,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Rule
 import androidx.compose.material.icons.filled.AccountTree
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ContentCopy
@@ -138,6 +139,7 @@ private enum class AppPage(val label: String, val icon: ImageVector) {
     Overview("概览", Icons.Default.Home),
     Rules("规则", Icons.AutoMirrored.Filled.Rule),
     Nodes("节点", Icons.Default.Dns),
+    Toolbox("工具箱", Icons.Default.Build),
     Settings("设置", Icons.Default.Settings),
 }
 
@@ -242,6 +244,10 @@ fun NetworkManagerApp(
                             onDeleteSubscription = viewModel::deleteSubscription,
                             onTest = viewModel::testAllNodes,
                             onTestNode = viewModel::testNode,
+                        )
+                        AppPage.Toolbox -> ToolboxPage(
+                            state = state,
+                            onTestExit = viewModel::testExit,
                         )
                         AppPage.Settings -> SettingsPage(
                             state = state,
@@ -1767,14 +1773,16 @@ private fun <T> ChoiceDialog(
     )
 }
 
-private fun copyToClipboard(context: Context, value: String) {
+// internal 而非 private：工具箱页（ToolboxPage.kt）在同一包里，复用同一套交互件，
+// 免得复制一份出来两边慢慢走样。
+internal fun copyToClipboard(context: Context, value: String) {
     val manager = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
     manager?.setPrimaryClip(ClipData.newPlainText("proxy-address", value))
     Toast.makeText(context, "已复制 $value", Toast.LENGTH_SHORT).show()
 }
 
 @Composable
-private fun <T> SegmentedChoice(
+internal fun <T> SegmentedChoice(
     options: List<T>,
     selected: T,
     label: (T) -> String,
