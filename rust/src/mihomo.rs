@@ -1,7 +1,9 @@
 use serde_json::{json, Value};
 use std::net::IpAddr;
 
-use crate::models::{AppConfig, RoutingRule, NODE_DIALER_POLICY_KEY, NODE_DIALER_PROXY_KEY};
+use crate::models::{
+    AppConfig, LocalDnsEntry, RoutingRule, NODE_DIALER_POLICY_KEY, NODE_DIALER_PROXY_KEY,
+};
 
 const TARGET_NAMES: &[(&str, &str)] = &[
     ("CLASH", "UPSTREAM-CLASH"),
@@ -114,8 +116,22 @@ fn local_dns_direct_rules(config: &AppConfig) -> Vec<String> {
         .local_dns
         .iter()
         .filter(|entry| !entry.domain.is_empty() && is_lan_address(&entry.address))
-        .map(|entry| format!("DOMAIN,{},DIRECT", entry.domain.to_lowercase()))
+        .map(|entry| match entry.wildcard_suffix() {
+            Some(suffix) => format!("DOMAIN-SUFFIX,{},DIRECT", suffix.to_lowercase()),
+            None => format!("DOMAIN,{},DIRECT", entry.domain.to_lowercase()),
+        })
         .collect()
+}
+
+/// hosts 表的键。通配条目翻译成 `+.domain`，不是 `*.domain`。
+///
+/// 实测（mihomo v1.19.32）：`*.demo.test` 只命中 `a.demo.test`，查询 `demo.test` 本身会漏；
+/// `+.demo.test` 才是「自身 + 所有子域」，正好对上 `*.baidu.com` 在两端定下的语义。
+fn local_dns_hosts_key(entry: &LocalDnsEntry) -> String {
+    match entry.wildcard_suffix() {
+        Some(suffix) => format!("+.{suffix}"),
+        None => entry.domain.clone(),
+    }
 }
 
 fn target_name(target: &str) -> String {
@@ -406,13 +422,14 @@ pub fn build(config: &AppConfig) -> Value {
 
     // 本地 DNS 映射（自定义域名 → 固定 IP）。`hosts` 是内核查表，命中就返回写死的
     // 地址、不往外发查询，所以局域网里的自建服务不会被上游 DNS 的缓存/劫持带偏。
+    // 通配条目在这里翻译成 `+.domain`（见 local_dns_hosts_key）。
     // 只在真的有映射时才写这个键：没有映射的用户拿到的配置和以前逐字节一致。
     if !config.local_dns.is_empty() {
         result["hosts"] = Value::Object(
             config
                 .local_dns
                 .iter()
-                .map(|entry| (entry.domain.clone(), Value::String(entry.address.clone())))
+                .map(|entry| (local_dns_hosts_key(entry), Value::String(entry.address.clone())))
                 .collect(),
         );
     }
@@ -500,6 +517,30 @@ mod tests {
     fn mappings_become_a_hosts_table() {
         let value = build(&config_with(&[("nas.lan", "192.168.1.10")]));
         assert_eq!(value["hosts"]["nas.lan"], "192.168.1.10");
+    }
+
+    #[test]
+    fn wildcard_mappings_are_translated_to_the_plus_syntax() {
+        // `*.baidu.com` 要翻成 `+.baidu.com`：实测 mihomo 的 `*.x` 不含 x 本身。
+        let value = build(&config_with(&[("*.baidu.com", "127.0.0.1")]));
+        assert_eq!(value["hosts"]["+.baidu.com"], "127.0.0.1");
+        assert!(value["hosts"].get("*.baidu.com").is_none());
+    }
+
+    #[test]
+    fn wildcard_lan_mappings_become_domain_suffix_rules() {
+        let value = build(&config_with(&[("*.baidu.com", "10.0.2.2")]));
+        assert!(
+            rules_of(&value).contains(&"DOMAIN-SUFFIX,baidu.com,DIRECT".to_string()),
+            "{:?}",
+            rules_of(&value)
+        );
+    }
+
+    #[test]
+    fn wildcard_public_mappings_keep_normal_routing() {
+        let value = build(&config_with(&[("*.cdn.example.com", "1.1.1.1")]));
+        assert!(!rules_of(&value).contains(&"DOMAIN-SUFFIX,cdn.example.com,DIRECT".to_string()));
     }
 
     #[test]

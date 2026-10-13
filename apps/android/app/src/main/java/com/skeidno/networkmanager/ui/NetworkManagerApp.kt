@@ -1704,7 +1704,7 @@ private fun LocalDnsEditorDialog(
                     value = text,
                     onValueChange = { text = it },
                     label = { Text("一行一条，域名和 IP 顺序随意") },
-                    placeholder = { Text("nas.lan 192.168.1.10") },
+                    placeholder = { Text("nas.lan 192.168.1.10\n*.baidu.com 10.0.2.2") },
                     minLines = 6,
                     maxLines = 12,
                     modifier = Modifier.fillMaxWidth().testTag("local-dns-values"),
@@ -1715,7 +1715,8 @@ private fun LocalDnsEditorDialog(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    "只做精确域名匹配，不支持通配。地址属于内网网段时会自动直连；" +
+                    "写成 nas.lan 只匹配这一个名字；写成 *.baidu.com 则 baidu.com 本身和它" +
+                        "的所有子域都算。地址属于内网网段时会自动直连；" +
                         "要在局域网里用 HTTPS，证书里的名字得和这里的域名一致——" +
                         "自签证书还要把 CA 装进设备信任库，可以用工具箱的「证书检测」确认。",
                     style = MaterialTheme.typography.bodySmall,

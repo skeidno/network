@@ -313,7 +313,7 @@
             <section class="panel settings-section">
               <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/database.svg')"></span></div><div><h2>本地 DNS</h2><p>把自定义域名固定指向指定 IP</p></div></div>
               <label class="local-dns-field"><span>映射列表（一行一条，域名和 IP 顺序随意）</span><textarea id="setting-local-dns" rows="6" spellcheck="false" placeholder="nas.lan 192.168.1.10"></textarea><span class="rule-value-toolbar"><small id="setting-local-dns-summary">当前没有映射</small><span><button id="save-local-dns" type="button" class="text-button">保存映射</button></span></span></label>
-              <p class="settings-note">写进内核的 hosts 表，命中即返回，不会往外发查询 —— 局域网里的 NAS、路由器、自建站点因此能直接用域名访问。<strong>只做精确域名匹配，不支持通配</strong>；地址属于内网网段时会自动直连。要在局域网里跑 HTTPS，证书里的名字得和这里的域名一致（自签证书还要把 CA 装进系统信任库）。浏览器与系统的「安全 DNS / 私人 DNS」会绕过这张表，属于预期行为。</p>
+              <p class="settings-note">写进内核的 hosts 表，命中即返回，不会往外发查询 —— 局域网里的 NAS、路由器、自建站点因此能直接用域名访问。<strong>写成 <code>*.baidu.com</code> 就是通配</strong>：baidu.com 本身和它的所有子域都算，只写 <code>nas.lan</code> 则只匹配这一个名字；地址属于内网网段时会自动直连。要在局域网里跑 HTTPS，证书里的名字得和这里的域名一致（自签证书还要把 CA 装进系统信任库）。浏览器与系统的「安全 DNS / 私人 DNS」会绕过这张表，属于预期行为。</p>
             </section>
             <section class="panel settings-section">
               <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/settings.svg')"></span></div><div><h2>运行行为</h2><p>启动、路由与托盘设置</p></div></div>

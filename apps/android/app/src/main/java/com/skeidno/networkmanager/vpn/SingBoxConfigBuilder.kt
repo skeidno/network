@@ -2,6 +2,7 @@ package com.skeidno.networkmanager.vpn
 
 import com.skeidno.networkmanager.data.AppState
 import com.skeidno.networkmanager.data.FallbackTarget
+import com.skeidno.networkmanager.data.LOCAL_DNS_WILDCARD_PREFIX
 import com.skeidno.networkmanager.data.PortableRule
 import com.skeidno.networkmanager.data.ProxyNode
 import com.skeidno.networkmanager.data.RoutingMode
@@ -131,13 +132,15 @@ object SingBoxConfigBuilder {
                 state.fallbackTarget == FallbackTarget.Proxy && orderedNodes.isNotEmpty()
             ) "proxy" else "direct"
         }
-        // 本地 DNS 映射（自定义域名 → 固定 IP）。用 sing-box 自带的 hosts 服务器：
+        // 本地 DNS 映射（自定义域名 → 固定 IP）。精确域名用 sing-box 自带的 hosts 服务器：
         // 它是查表返回，不会真的往外发查询，所以局域网里的自建服务能被稳定命中，
         // 也不会因为上游 DNS 的缓存或劫持而时好时坏。
         val localDnsEntries = state.localDnsEntries
             .filter { it.domain.isNotBlank() && it.address.isNotBlank() }
+        val exactDnsEntries = localDnsEntries.filterNot { it.isWildcard }
+        val wildcardDnsEntries = localDnsEntries.filter { it.isWildcard }
         val dnsServers = JSONArray()
-        if (localDnsEntries.isNotEmpty()) {
+        if (exactDnsEntries.isNotEmpty()) {
             dnsServers.put(
                 JSONObject()
                     .put("type", "hosts")
@@ -145,7 +148,7 @@ object SingBoxConfigBuilder {
                     .put(
                         "predefined",
                         JSONObject().apply {
-                            localDnsEntries.forEach { entry -> put(entry.domain, entry.address) }
+                            exactDnsEntries.forEach { entry -> put(entry.domain, entry.address) }
                         },
                     ),
             )
@@ -158,14 +161,38 @@ object SingBoxConfigBuilder {
             }
         }
         val dnsRules = JSONArray()
-        if (localDnsEntries.isNotEmpty()) {
+        if (exactDnsEntries.isNotEmpty()) {
             // 必须排在最前面：内置的局域网规则里有 .lan / .local 这类后缀，
             // 配成 nas.lan 也会命中它，先命中先算，映射得排在前面才不会被抢走。
             dnsRules.put(
                 JSONObject()
-                    .put("domain", JSONArray(localDnsEntries.map { it.domain }))
+                    .put("domain", JSONArray(exactDnsEntries.map { it.domain }))
                     .put("action", "route")
                     .put("server", localDnsServerTag),
+            )
+        }
+        // 通配条目：hosts 服务器只认精确域名，所以走 DNS 规则的 `predefined` 动作。
+        // 记录名写成 `*.baidu.com` 时 sing-box 会把它换成实际查询的域名（rewriteRecords），
+        // 响应里的名字和查询名一致，系统解析器／浏览器才肯收下。
+        // `domain_suffix` 是含顶级域自身的，所以要配两条：精确的管 baidu.com，
+        // 带 `*.` 的管子域 —— 少了精确那条，访问 `https://baidu.com` 会漏出去。
+        wildcardDnsEntries.forEach { entry ->
+            val suffix = entry.wildcardSuffix ?: return@forEach
+            val recordType = if (':' in entry.address) "AAAA" else "A"
+            dnsRules.put(
+                JSONObject()
+                    .put("domain", JSONArray().put(suffix))
+                    .put("action", "predefined")
+                    .put("answer", JSONArray().put("$suffix. IN $recordType ${entry.address}")),
+            )
+            dnsRules.put(
+                JSONObject()
+                    .put("domain_suffix", JSONArray().put(suffix))
+                    .put("action", "predefined")
+                    .put(
+                        "answer",
+                        JSONArray().put("$LOCAL_DNS_WILDCARD_PREFIX$suffix. IN $recordType ${entry.address}"),
+                    ),
             )
         }
         dnsRules.put(

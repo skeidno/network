@@ -67,11 +67,47 @@ class LocalDnsTest {
     }
 
     @Test
-    fun rejectsWildcardAndSaysWhy() {
+    fun acceptsWildcardEntry() {
+        val entry = localDnsEntriesFromText("*.baidu.com 10.0.2.2").single()
+        assertEquals("*.baidu.com", entry.domain)
+        assertTrue(entry.isWildcard)
+        assertEquals("baidu.com", entry.wildcardSuffix)
+    }
+
+    @Test
+    fun wildcardMatchesApexAndSubdomainsOnly() {
+        val entry = LocalDnsEntry("*.baidu.com", "10.0.2.2")
+        assertTrue(entry.matchesDomain("baidu.com"))
+        assertTrue(entry.matchesDomain("www.baidu.com"))
+        assertTrue(entry.matchesDomain("tieba.baidu.com"))
+        assertTrue(entry.matchesDomain("WWW.BAIDU.COM."))
+        // 按标签匹配，不能被同尾字符串蹭到。
+        assertFalse(entry.matchesDomain("notbaidu.com"))
+        assertFalse(entry.matchesDomain("baidu.com.cn"))
+    }
+
+    @Test
+    fun exactEntryStaysExact() {
+        val entry = LocalDnsEntry("nas.lan", "192.168.1.10")
+        assertTrue(entry.matchesDomain("nas.lan"))
+        assertFalse(entry.matchesDomain("www.nas.lan"))
+    }
+
+    @Test
+    fun rejectsWildcardThatWouldTakeOverATld() {
+        // `*.com` 会把整个顶级域接管，必须挡在保存之前。
         val error = assertThrows(IllegalArgumentException::class.java) {
-            localDnsEntriesFromText("*.lan 192.168.1.10")
+            localDnsEntriesFromText("*.com 192.168.1.10")
         }
-        assertTrue(error.message.orEmpty(), error.message.orEmpty().contains("通配"))
+        assertTrue(error.message.orEmpty(), error.message.orEmpty().contains("完整域名"))
+    }
+
+    @Test
+    fun rejectsWildcardInTheMiddle() {
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            localDnsEntriesFromText("nas.*.lan 192.168.1.10")
+        }
+        assertTrue(error.message.orEmpty(), error.message.orEmpty().contains("通配只能写在最前面"))
     }
 
     @Test
@@ -123,10 +159,21 @@ class LocalDnsTest {
                 LocalDnsEntry("nas.lan", "192.168.1.10"),
                 LocalDnsEntry("bad.lan", "not-an-ip"),
                 LocalDnsEntry("", "192.168.1.1"),
-                LocalDnsEntry("*.lan", "192.168.1.1"),
+                LocalDnsEntry("*.com", "192.168.1.1"),
             ),
         )
         assertEquals(listOf(LocalDnsEntry("nas.lan", "192.168.1.10")), sanitized)
+    }
+
+    @Test
+    fun sanitizeKeepsValidWildcardEntries() {
+        val sanitized = sanitizeLocalDnsEntries(
+            listOf(
+                LocalDnsEntry("*.BAIDU.com.", "10.0.2.2"),
+                LocalDnsEntry("*.baidu.com", "10.0.2.2"),
+            ),
+        )
+        assertEquals(listOf(LocalDnsEntry("*.baidu.com", "10.0.2.2")), sanitized)
     }
 
     @Test

@@ -344,13 +344,57 @@ class NetworkToolsTest {
 
     @Test
     fun localDnsMappingOnlyMatchesExactDomain() {
-        // hosts 服务器是查表，没有通配；预判也不能比内核更宽松。
+        // 精确条目是查表，精确域名之外的子域不命中；预判也不能比内核更宽松。
         val verdict = NetworkTools.previewRoute(
             state().copy(localDnsEntries = listOf(LocalDnsEntry("nas.internal-lab.test", "192.168.1.10"))),
             "other.internal-lab.test",
         )
         assertEquals(NetworkTools.Outbound.Direct, verdict.outbound)
         assertFalse(verdict.reason, verdict.reason.contains("本地 DNS 映射"))
+    }
+
+    @Test
+    fun wildcardMappingCoversSubdomains() {
+        val verdict = NetworkTools.previewRoute(
+            state().copy(
+                mode = RoutingMode.Global,
+                localDnsEntries = listOf(LocalDnsEntry("*.internal-lab.test", "192.168.1.10")),
+            ),
+            "anything.internal-lab.test",
+        )
+        assertEquals(NetworkTools.Outbound.Direct, verdict.outbound)
+        assertTrue(verdict.reason, verdict.reason.contains("通配映射"))
+        assertTrue(verdict.reason, verdict.reason.contains("192.168.1.10"))
+    }
+
+    @Test
+    fun wildcardMappingAlsoCoversTheApexDomain() {
+        val verdict = NetworkTools.previewRoute(
+            state().copy(
+                mode = RoutingMode.Global,
+                localDnsEntries = listOf(LocalDnsEntry("*.internal-lab.test", "192.168.1.10")),
+            ),
+            "internal-lab.test",
+        )
+        assertEquals(NetworkTools.Outbound.Direct, verdict.outbound)
+        assertTrue(verdict.reason, verdict.reason.contains("通配映射"))
+    }
+
+    @Test
+    fun exactMappingIsPreferredOverWildcard() {
+        // 生成的规则里精确规则排在通配规则前面，预判要给出同一个结论。
+        val verdict = NetworkTools.previewRoute(
+            state().copy(
+                mode = RoutingMode.Global,
+                localDnsEntries = listOf(
+                    LocalDnsEntry("*.internal-lab.test", "10.1.1.1"),
+                    LocalDnsEntry("app.internal-lab.test", "10.2.2.2"),
+                ),
+            ),
+            "app.internal-lab.test",
+        )
+        assertTrue(verdict.reason, verdict.reason.contains("10.2.2.2"))
+        assertFalse(verdict.reason, verdict.reason.contains("10.1.1.1"))
     }
 
     // ------------------------------------------------------------------

@@ -528,12 +528,20 @@ object NetworkTools {
         }
 
         // 本地 DNS 映射先看：域名会被内核直接解析成映射里的地址。
-        val local = state.localDnsEntries.firstOrNull { it.domain == target }
+        // 精确条目优先于通配条目 —— 生成的规则里精确规则排在通配规则前面，先命中先算。
+        val local = state.localDnsEntries
+            .filter { it.matchesDomain(target) }
+            .minByOrNull { if (it.isWildcard) 1 else 0 }
+        val label = when {
+            local == null -> ""
+            local.isWildcard -> "通配映射 ${local.domain}"
+            else -> "本地 DNS 映射 $target"
+        }
         if (local != null && SingBoxConfigBuilder.lanCidrs.any { ipInCidr(local.address, it) }) {
             return RoutePreview(
                 query = query,
                 outbound = Outbound.Direct,
-                reason = "命中本地 DNS 映射：$target → ${local.address}（内网地址，按局域网 ip_cidr 规则直连）",
+                reason = "命中$label：$target → ${local.address}（内网地址，按局域网 ip_cidr 规则直连）",
             )
         }
 
@@ -542,7 +550,7 @@ object NetworkTools {
         // 不说一句会以为映射没生效。
         if (local == null) return verdict
         return verdict.copy(
-            notes = verdict.notes + "该域名配了本地 DNS 映射 $target → ${local.address}；" +
+            notes = verdict.notes + "该域名配了$label → ${local.address}；" +
                 "它不是内网地址，所以出站仍按上面的规则判定",
         )
     }

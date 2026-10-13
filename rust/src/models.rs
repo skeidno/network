@@ -561,8 +561,17 @@ pub const LOCAL_DNS_MAX_ENTRIES: usize = 200;
 /// 用途和平台无关：在局域网里用域名访问 NAS、路由器、自建站点，不用每台设备各
 /// 记一套 IP；域名和服务端证书里的名字对上了，HTTPS 才有机会通过校验。
 ///
-/// 只做**精确域名**匹配。两个平台的内核都是查表（mihomo 的 `hosts`、sing-box 的
-/// hosts DNS 服务器），通配不会生效，所以这里干脆不接受通配，让两端行为一致。
+/// 域名支持两种写法：
+///
+/// - `nas.lan`：**精确**匹配这一个名字；
+/// - `*.baidu.com`：**后缀**匹配，`baidu.com` 本身和它的所有子域都算（`www.baidu.com`、
+///   `tieba.baidu.com`……）。适合「一个站点有几十个子域，全都要指到同一台机器」。
+///
+/// 通配是用 `*.` 而不是裸后缀，是因为裸后缀太容易误伤（写个 `com` 就等于接管整个 .com）。
+/// 两端内核给通配留了不同的口子，所以 `*.x` 的含义在这里定死，由各自的生成器翻译：
+/// mihomo 的 `hosts` 用 `+.baidu.com`；sing-box 没有通配查表，改用 `predefined` 动作的
+/// 「记录名以 `*` 开头时替换成实际查询名」这条规则（见 SingBoxConfigBuilder）。
+///
 /// 字段带 `#[serde(default)]`：settings.json 是允许手改的，缺一个字段不该让整份
 /// 配置反序列化失败（那会把用户所有配置一起隔离掉）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,6 +579,31 @@ pub const LOCAL_DNS_MAX_ENTRIES: usize = 200;
 pub struct LocalDnsEntry {
     pub domain: String,
     pub address: String,
+}
+
+/// 通配前缀。写成 `*.baidu.com` 表示「baidu.com 及其所有子域」。
+pub const LOCAL_DNS_WILDCARD_PREFIX: &str = "*.";
+
+impl LocalDnsEntry {
+    /// 通配条目的后缀部分：`*.baidu.com` → `Some("baidu.com")`；精确条目 → `None`。
+    pub fn wildcard_suffix(&self) -> Option<&str> {
+        self.domain
+            .strip_prefix(LOCAL_DNS_WILDCARD_PREFIX)
+            .filter(|suffix| !suffix.is_empty())
+    }
+
+    pub fn is_wildcard(&self) -> bool {
+        self.wildcard_suffix().is_some()
+    }
+
+    /// 与内核规则一致的命中判断：精确条目比较全名，通配条目按后缀（含自身）比较。
+    pub fn matches_domain(&self, host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_lowercase();
+        match self.wildcard_suffix() {
+            Some(suffix) => host == suffix || host.ends_with(&format!(".{suffix}")),
+            None => host == self.domain,
+        }
+    }
 }
 
 /// 只认**字面量** IP。
@@ -597,19 +631,30 @@ pub fn is_ip_literal(text: &str) -> bool {
 }
 
 /// 域名归一：能贴 `https://nas.lan/admin` 也能贴 `nas.lan`，末尾的点去掉，统一小写。
+/// 通配前缀 `*.` 保留在最前面 —— 它是要落到内核规则里的语义，不能被当成普通字符丢掉。
 pub fn normalize_local_dns_domain(raw: &str) -> String {
     let text = raw.trim();
-    let host = match url::Url::parse(text) {
-        Ok(parsed) if parsed.host_str().is_some() => parsed.host_str().unwrap_or("").to_string(),
-        _ => text.to_string(),
+    let (wildcard, rest) = match text.strip_prefix(LOCAL_DNS_WILDCARD_PREFIX) {
+        Some(rest) => (true, rest.trim()),
+        None => (false, text),
     };
-    host.split('/')
+    let host = match url::Url::parse(rest) {
+        Ok(parsed) if parsed.host_str().is_some() => parsed.host_str().unwrap_or("").to_string(),
+        _ => rest.to_string(),
+    };
+    let domain = host
+        .split('/')
         .next()
         .unwrap_or("")
         .trim()
         .to_lowercase()
         .trim_end_matches('.')
-        .to_string()
+        .to_string();
+    if wildcard {
+        format!("{LOCAL_DNS_WILDCARD_PREFIX}{domain}")
+    } else {
+        domain
+    }
 }
 
 /// 存下来的地址统一成不带方括号的字面量。
@@ -628,22 +673,27 @@ fn normalize_address_literal(raw: &str) -> String {
 /// 返回 None 表示合法，否则是直接给用户看的失败原因。
 pub fn local_dns_domain_error(raw: &str) -> Option<String> {
     let domain = normalize_local_dns_domain(raw);
-    if domain.is_empty() {
+    let checked = domain
+        .strip_prefix(LOCAL_DNS_WILDCARD_PREFIX)
+        .unwrap_or(&domain);
+    if checked.is_empty() {
         return Some("域名不能为空".into());
     }
-    if domain.contains('*') {
-        return Some("只支持精确域名，不支持通配（内核对 hosts 是查表匹配，通配不会生效）".into());
+    if checked.contains('*') {
+        return Some(format!(
+            "通配只能写在最前面，例如 {LOCAL_DNS_WILDCARD_PREFIX}baidu.com"
+        ));
     }
-    if domain.chars().any(char::is_whitespace) {
+    if checked.chars().any(char::is_whitespace) {
         return Some("域名里不能有空格".into());
     }
-    if domain.contains(':') {
+    if checked.contains(':') {
         return Some("这里只填域名，不要带端口 —— 端口由访问方决定".into());
     }
-    if !domain.contains('.') {
+    if !checked.contains('.') {
         return Some("请输入完整域名，例如 nas.lan".into());
     }
-    if !is_valid_domain(&domain) {
+    if !is_valid_domain(checked) {
         return Some("域名里有非法字符".into());
     }
     None
@@ -842,8 +892,51 @@ mod local_dns_tests {
     }
 
     #[test]
-    fn rejects_wildcards_and_missing_dots() {
-        // 内核的 hosts 是查表，通配不会生效 —— 必须在保存前挡掉，不能静默存进配置。
+    fn accepts_wildcard_entries() {
+        let entries = parsed("*.baidu.com 127.0.0.1");
+        assert_eq!(entries[0].domain, "*.baidu.com");
+        assert!(entries[0].is_wildcard());
+        assert_eq!(entries[0].wildcard_suffix(), Some("baidu.com"));
+    }
+
+    #[test]
+    fn wildcard_normalization_keeps_the_prefix() {
+        // 大小写、末尾的点、整条 URL 都要能贴进来，前缀不能被吃掉。
+        assert_eq!(normalize_local_dns_domain("*.BAIDU.com."), "*.baidu.com");
+        assert_eq!(normalize_local_dns_domain(" *.baidu.com "), "*.baidu.com");
+    }
+
+    #[test]
+    fn wildcard_matches_the_apex_and_every_subdomain() {
+        let entry = LocalDnsEntry {
+            domain: "*.baidu.com".into(),
+            address: "127.0.0.1".into(),
+        };
+        assert!(entry.matches_domain("baidu.com"));
+        assert!(entry.matches_domain("www.baidu.com"));
+        assert!(entry.matches_domain("tieba.baidu.com"));
+        assert!(entry.matches_domain("WWW.BAIDU.COM."));
+        // 后缀匹配要按标签来，不能被同尾字符串蹭到。
+        assert!(!entry.matches_domain("notbaidu.com"));
+        assert!(!entry.matches_domain("baidu.com.cn"));
+    }
+
+    #[test]
+    fn exact_entries_stay_exact() {
+        let entry = LocalDnsEntry {
+            domain: "nas.lan".into(),
+            address: "192.168.1.10".into(),
+        };
+        assert!(entry.matches_domain("nas.lan"));
+        assert!(!entry.matches_domain("www.nas.lan"));
+        assert!(!entry.matches_domain("other.lan"));
+    }
+
+    #[test]
+    fn rejects_bad_wildcards_and_missing_dots() {
+        // 通配只认最前面的 `*.`，且后面必须是一个完整域名（`*.com` 这类会接管整个顶级域）。
+        assert!(local_dns_entries_from_text("nas.*.lan 192.168.1.10").is_err());
+        assert!(local_dns_entries_from_text("*.com 192.168.1.10").is_err());
         assert!(local_dns_entries_from_text("*.lan 192.168.1.10").is_err());
         assert!(local_dns_entries_from_text("nas 192.168.1.10").is_err());
         assert!(local_dns_entries_from_text("nas.lan:8080 192.168.1.10").is_err());
@@ -876,7 +969,7 @@ mod local_dns_tests {
                 address: "192.168.1.99".into(),
             },
             LocalDnsEntry {
-                domain: "*.bad.lan".into(),
+                domain: "*.com".into(),
                 address: "192.168.1.1".into(),
             },
             LocalDnsEntry {

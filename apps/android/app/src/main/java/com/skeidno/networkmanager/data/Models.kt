@@ -95,12 +95,37 @@ data class InstalledApp(
  * 设备各记一套 IP。域名对上之后，服务端证书里的名字才有机会和访问地址一致，
  * HTTPS 才可能通过校验（自签证书还要把 CA 装进设备信任库，见工具箱的证书检测）。
  *
- * 只做**精确域名**匹配：sing-box 的 hosts 服务器就是查表，没有通配。
+ * 域名支持两种写法：
+ *
+ * - `nas.lan`：**精确**匹配这一个名字；
+ * - `*.baidu.com`：**后缀**匹配，`baidu.com` 本身和它的所有子域都算（`www.baidu.com`、
+ *   `tieba.baidu.com`……）。适合「一个站点有几十个子域，全都要指到同一台机器」。
+ *
+ * sing-box 的 hosts 服务器只有精确查表，所以通配条目走的是 DNS 规则的 `predefined`
+ * 动作：记录名以 `*` 开头时它会把名字换成实际查询的域名（见 SingBoxConfigBuilder）。
+ * 桌面端 mihomo 的 hosts 表用 `+.baidu.com` 表达同一个意思，两端语义一致。
  */
 data class LocalDnsEntry(
     val domain: String,
     val address: String,
-)
+) {
+    /** 通配条目的后缀部分：`*.baidu.com` → `baidu.com`；精确条目 → null。 */
+    val wildcardSuffix: String?
+        get() = domain.removePrefix(LOCAL_DNS_WILDCARD_PREFIX)
+            .takeIf { it.isNotEmpty() && it != domain }
+
+    val isWildcard: Boolean get() = wildcardSuffix != null
+
+    /** 与内核规则一致的命中判断：精确条目比全名，通配条目按后缀（含自身）比。 */
+    fun matchesDomain(host: String): Boolean {
+        val name = host.trim().trimEnd('.').lowercase()
+        val suffix = wildcardSuffix ?: return name == domain
+        return name == suffix || name.endsWith(".$suffix")
+    }
+}
+
+/** 通配前缀。写成 `*.baidu.com` 表示「baidu.com 及其所有子域」。 */
+const val LOCAL_DNS_WILDCARD_PREFIX = "*."
 
 val PORTABLE_RULE_TYPES = setOf(
     "package_name",
@@ -220,26 +245,31 @@ fun parseIpLiteral(text: String): ByteArray? {
 
 fun isIpLiteral(text: String): Boolean = parseIpLiteral(text) != null
 
-/** 域名归一：能贴 `https://nas.lan/admin` 也能贴 `nas.lan`，末尾的点去掉，统一小写。 */
+/**
+ * 域名归一：能贴 `https://nas.lan/admin` 也能贴 `nas.lan`，末尾的点去掉，统一小写。
+ * 通配前缀 `*.` 保留在最前面 —— 它要落进内核规则，不能被当成普通字符丢掉。
+ */
 fun normalizeLocalDnsDomain(raw: String): String {
-    var value = raw.trim()
+    val text = raw.trim()
+    val wildcard = text.startsWith(LOCAL_DNS_WILDCARD_PREFIX)
+    var value = if (wildcard) text.removePrefix(LOCAL_DNS_WILDCARD_PREFIX).trim() else text
     if ("://" in value) {
         value = runCatching { URI(value).host }.getOrNull() ?: value
     }
-    return value.substringBefore('/').trim().lowercase().trimEnd('.')
+    val domain = value.substringBefore('/').trim().lowercase().trimEnd('.')
+    return if (wildcard) "$LOCAL_DNS_WILDCARD_PREFIX$domain" else domain
 }
 
 /** 返回 null 表示合法，否则是直接给用户看的失败原因。 */
 fun localDnsDomainError(rawDomain: String): String? {
     val domain = normalizeLocalDnsDomain(rawDomain)
-    if (domain.isEmpty()) return "域名不能为空"
-    if (domain.startsWith("*.") || '*' in domain) {
-        return "只支持精确域名，不支持通配（sing-box 的 hosts 是查表匹配，通配不会生效）"
-    }
-    if (domain.any(Char::isWhitespace)) return "域名里不能有空格"
-    if (':' in domain) return "这里只填域名，不要带端口——端口由访问方决定"
-    if ('.' !in domain) return "请输入完整域名，例如 nas.lan"
-    if (!domain.matches(domainPattern)) return "域名里有非法字符"
+    val checked = domain.removePrefix(LOCAL_DNS_WILDCARD_PREFIX)
+    if (checked.isEmpty()) return "域名不能为空"
+    if ('*' in checked) return "通配只能写在最前面，例如 ${LOCAL_DNS_WILDCARD_PREFIX}baidu.com"
+    if (checked.any(Char::isWhitespace)) return "域名里不能有空格"
+    if (':' in checked) return "这里只填域名，不要带端口——端口由访问方决定"
+    if ('.' !in checked) return "请输入完整域名，例如 nas.lan"
+    if (!checked.matches(domainPattern)) return "域名里有非法字符"
     return null
 }
 

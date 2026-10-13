@@ -347,6 +347,71 @@ class SingBoxConfigBuilderTest {
     }
 
     @Test
+    fun wildcardMappingBecomesPredefinedDnsRecords() {
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(
+                AppState(
+                    mode = RoutingMode.Global,
+                    selectedNodeId = node.id,
+                    nodes = listOf(node),
+                    localDnsEntries = listOf(LocalDnsEntry("*.baidu.com", "10.0.2.2")),
+                ),
+            ),
+        )
+
+        val dns = config.getJSONObject("dns")
+        // 通配条目进不了 hosts 服务器（那是精确查表），所以有它就不该建这台服务器。
+        assertEquals("local", dns.getJSONArray("servers").getJSONObject(0).getString("tag"))
+
+        val rules = dns.getJSONArray("rules")
+        // 第一条管顶级域自身：`domain_suffix` 是含自身的，但 `*.` 记录换名只对子域生效，
+        // 少了这条 https://baidu.com 会漏出去。
+        val apex = rules.getJSONObject(0)
+        assertEquals("predefined", apex.getString("action"))
+        assertEquals("baidu.com", apex.getJSONArray("domain").getString(0))
+        assertEquals("baidu.com. IN A 10.0.2.2", apex.getJSONArray("answer").getString(0))
+        // 第二条管子域：记录名带 `*`，sing-box 会把它换成实际查询的域名。
+        val suffix = rules.getJSONObject(1)
+        assertEquals("predefined", suffix.getString("action"))
+        assertEquals("baidu.com", suffix.getJSONArray("domain_suffix").getString(0))
+        assertEquals("*.baidu.com. IN A 10.0.2.2", suffix.getJSONArray("answer").getString(0))
+    }
+
+    @Test
+    fun wildcardMappingToIpv6UsesAaaaRecords() {
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(
+                AppState(
+                    mode = RoutingMode.Global,
+                    localDnsEntries = listOf(LocalDnsEntry("*.baidu.com", "fd00::5")),
+                ),
+            ),
+        )
+        val rules = config.getJSONObject("dns").getJSONArray("rules")
+        assertEquals("baidu.com. IN AAAA fd00::5", rules.getJSONObject(0).getJSONArray("answer").getString(0))
+    }
+
+    @Test
+    fun exactMappingStillWinsOverWildcard() {
+        // 精确条目生成的规则排在通配条目前面，先命中先算。
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(
+                AppState(
+                    mode = RoutingMode.Global,
+                    localDnsEntries = listOf(
+                        LocalDnsEntry("*.baidu.com", "10.0.2.2"),
+                        LocalDnsEntry("www.baidu.com", "10.0.2.3"),
+                    ),
+                ),
+            ),
+        )
+        val rules = config.getJSONObject("dns").getJSONArray("rules")
+        assertEquals("route", rules.getJSONObject(0).getString("action"))
+        assertEquals("www.baidu.com", rules.getJSONObject(0).getJSONArray("domain").getString(0))
+        assertEquals("predefined", rules.getJSONObject(1).getString("action"))
+    }
+
+    @Test
     fun dnsServersStayUntouchedWithoutLocalDnsMapping() {
         // 没配映射时不能凭空多出一台 DNS 服务器，否则原有配置的语义就变了。
         val config = JSONObject(SingBoxConfigBuilder.build(AppState(nodes = listOf(node))))
