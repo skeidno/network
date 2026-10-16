@@ -419,4 +419,30 @@ class SingBoxConfigBuilderTest {
         assertEquals("local", dns.getJSONArray("servers").getJSONObject(0).getString("tag"))
         assertEquals("local", dns.getJSONArray("rules").getJSONObject(0).getString("server"))
     }
+
+    @Test
+    fun tunInboundCarriesIncludePackageForProfileAllowList() {
+        // 档案限定了「只接管这几个 App」时，白名单必须落在 tun inbound 上 ——
+        // libbox 靠它调用 addAllowedApplication，名单外的 App 才真的不进 TUN。
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(
+                AppState(nodes = listOf(node), tunPackages = listOf("com.android.chrome", "org.telegram.messenger")),
+            ),
+        )
+        val tun = config.getJSONArray("inbounds").getJSONObject(0)
+        assertEquals("tun", tun.getString("type"))
+        val include = tun.getJSONArray("include_package")
+        assertEquals(2, include.length())
+        assertEquals("com.android.chrome", include.getString(0))
+        assertTrue(!tun.has("exclude_package"))
+    }
+
+    @Test
+    fun tunInboundOmitsIncludePackageWhenProfileTakesEverything() {
+        // 空名单不能写成空数组：空数组的含义是「谁都不接管」，和「接管全部」正好相反。
+        val config = JSONObject(SingBoxConfigBuilder.build(AppState(nodes = listOf(node))))
+        val tun = config.getJSONArray("inbounds").getJSONObject(0)
+        assertTrue(!tun.has("include_package"))
+        assertTrue(!tun.has("exclude_package"))
+    }
 }

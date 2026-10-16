@@ -1,6 +1,7 @@
 package com.skeidno.networkmanager.data
 
 import android.content.Context
+import android.content.SharedPreferences
 import com.skeidno.networkmanager.vpn.SingBoxConfigBuilder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -48,9 +49,35 @@ private val PROXY_EXIT_ENDPOINTS = listOf(
 private val IPV4 = Regex("""\d{1,3}(?:\.\d{1,3}){3}""")
 
 class AppRepository private constructor(private val context: Context) {
-    private val preferences = context.getSharedPreferences("network-manager", Context.MODE_PRIVATE)
+    private val profileStore = ProfileStore.get(context)
+
+    /** 当前生效的档案。所有配置读写都发生在它自己的偏好文件里。 */
+    @Volatile
+    private var profileId: String = profileStore.activeId()
+
+    @Volatile
+    private var preferences: SharedPreferences =
+        context.getSharedPreferences(profilePrefsName(profileId), Context.MODE_PRIVATE)
+
     private val mutableState = MutableStateFlow(load())
     val state: StateFlow<AppState> = mutableState.asStateFlow()
+
+    fun activeProfileId(): String = profileId
+
+    /**
+     * 切换档案：偏好文件与数据目录整体换根，然后重新从新档案读书。
+     *
+     * 调用方必须**先停掉接管**——正在跑的 sing-box 还握着旧档案的配置与 working 目录，
+     * 换根之后再去 reload 会读到一半新一半旧的东西。
+     */
+    fun switchProfile(id: String) {
+        if (id == profileId) return
+        if (!profileStore.setActive(id)) return
+        profileId = id
+        preferences = context.getSharedPreferences(profilePrefsName(id), Context.MODE_PRIVATE)
+        probePort = 0
+        mutableState.value = load()
+    }
 
     fun setMode(mode: RoutingMode) = update(mutableState.value.copy(mode = mode))
 
@@ -95,6 +122,24 @@ class AppRepository private constructor(private val context: Context) {
 
     /** 收编辑器里的多行文本：解析 → 校验 → 落盘，有非法行就抛出去让界面提示。 */
     fun setLocalDnsFromText(text: String): Int = setLocalDnsEntries(localDnsEntriesFromText(text))
+
+    /** 本地证书状态是运行态（local-certs/ 下的文件才是事实来源），不进配置。 */
+    fun setLocalCertStatus(status: LocalCertStatus) =
+        update(mutableState.value.copy(localCert = status), persist = false)
+
+    /**
+     * 改写当前档案接管的 App 名单（空 = 接管全部 App）。
+     *
+     * 名单的落点在**档案清单**里（跟着档案走），不属于这份档案偏好，所以这里只刷新运行态快照。
+     * 内核侧要重启接管才会按新名单建立 TUN —— 名单是 `addAllowedApplication` 级别的，
+     * 建接口时定死，运行时改不了。
+     */
+    fun setTunPackages(packages: List<String>): List<String> {
+        profileStore.setPackages(profileId, packages)
+        val applied = profileStore.profiles().firstOrNull { it.id == profileId }?.packages.orEmpty()
+        update(mutableState.value.copy(tunPackages = applied), persist = false)
+        return applied
+    }
 
     fun savePortableRules(
         index: Int?,
@@ -428,7 +473,9 @@ class AppRepository private constructor(private val context: Context) {
         return tested
     }
 
-    fun runtimeConfigFile(): File = File(context.filesDir, "runtime.json")
+    /** 内核配置落在当前档案自己的目录里 —— 换档案就等于换了一份 runtime.json。 */
+    fun runtimeConfigFile(): File =
+        File(context.profilePaths(profileId).dataRoot, PROFILE_RUNTIME_FILE)
 
     /** 出口检测专用入站当前监听的端口，0 表示没有（配置里没写或还没有节点）。 */
     @Volatile
@@ -840,6 +887,10 @@ class AppRepository private constructor(private val context: Context) {
                 .takeIf { it in LOCAL_PROXY_PORT_MIN..LOCAL_PROXY_PORT_MAX }
                 ?: DEFAULT_LOCAL_PROXY_PORT,
             localDnsEntries = localDnsEntries,
+            tunPackages = profileStore.profiles()
+                .firstOrNull { it.id == profileId }
+                ?.packages
+                .orEmpty(),
         )
     }
 

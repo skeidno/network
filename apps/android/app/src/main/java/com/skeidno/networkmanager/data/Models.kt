@@ -389,6 +389,12 @@ data class AppState(
     // 本地 DNS 映射（自定义域名 → IP）：写进内核的 hosts DNS 服务器，
     // 让 TUN 接管的所有应用都能按域名找到局域网里的服务。
     val localDnsEntries: List<LocalDnsEntry> = emptyList(),
+    // 当前档案接管的 App（包名）。空 = 接管全部 App。它是**档案的属性**，
+    // 存在档案清单里而不是这份配置里，这里只是读取时的快照，不落盘。
+    val tunPackages: List<String> = emptyList(),
+    // 本地 CA / 叶证书的状态（给工具箱的证书卡片）：文件才是事实来源，这里只是快照，
+    // 不落盘 —— 每次生成/重签后由 ViewModel 刷新。
+    val localCert: LocalCertStatus = LocalCertStatus(),
     val error: String = "",
 )
 

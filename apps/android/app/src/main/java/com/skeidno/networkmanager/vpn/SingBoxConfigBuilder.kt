@@ -227,17 +227,23 @@ object SingBoxConfigBuilder {
             ) "remote-proxy" else "local"
         }
 
-        val inbounds = JSONArray().put(
-            JSONObject()
-                .put("type", "tun")
-                .put("tag", "tun-in")
-                .put("address", JSONArray().put("172.19.0.1/30"))
-                .put("mtu", 9000)
-                .put("auto_route", true)
-                .put("route_exclude_address", JSONArray(lanCidrs))
-                .put("strict_route", false)
-                .put("stack", "mixed"),
-        )
+        // 档案限定「只接管这几个 App」时下发白名单：libbox 会把它落到
+        // VpnService.Builder.addAllowedApplication，名单外的 App 完全不进 TUN。
+        // 空名单**不下发**这个字段 —— 那就是原来的全局接管。
+        val tunInbound = JSONObject()
+            .put("type", "tun")
+            .put("tag", "tun-in")
+            .put("address", JSONArray().put("172.19.0.1/30"))
+            .put("mtu", 9000)
+            .put("auto_route", true)
+            .put("route_exclude_address", JSONArray(lanCidrs))
+            .put("strict_route", false)
+            .put("stack", "mixed")
+        if (state.tunPackages.isNotEmpty()) {
+            tunInbound.put("include_package", JSONArray(state.tunPackages))
+        }
+
+        val inbounds = JSONArray().put(tunInbound)
         if (probeEnabled) {
             inbounds.put(
                 JSONObject()

@@ -156,6 +156,9 @@ fun NetworkManagerApp(
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val installedApps by viewModel.installedApps.collectAsStateWithLifecycle()
+    val profiles by viewModel.profiles.collectAsStateWithLifecycle()
+    // 当前档案名挂在标题下面常驻显示：档案是「数据隔离」的开关，切过去之后必须一眼能看出来。
+    val activeProfileName = profiles.firstOrNull { it.active }?.name.orEmpty()
     val snackbar = remember { SnackbarHostState() }
     var page by rememberSaveable { mutableStateOf(AppPage.Overview) }
 
@@ -179,12 +182,22 @@ fun NetworkManagerApp(
             topBar = {
                 TopAppBar(
                     title = {
-                        Text(
-                            page.label,
-                            modifier = Modifier.testTag("page-title"),
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold,
-                        )
+                        Column {
+                            Text(
+                                page.label,
+                                modifier = Modifier.testTag("page-title"),
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            if (activeProfileName.isNotEmpty()) {
+                                Text(
+                                    "档案：$activeProfileName",
+                                    modifier = Modifier.testTag("active-profile-name"),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(
                         containerColor = MaterialTheme.colorScheme.surface,
@@ -249,7 +262,20 @@ fun NetworkManagerApp(
                         )
                         AppPage.Toolbox -> ToolboxPage(
                             state = state,
+                            profiles = profiles,
+                            installedApps = installedApps,
                             onTestExit = viewModel::testExit,
+                            onGenerateLocalCert = viewModel::generateLocalCerts,
+                            onInstallLocalCa = viewModel::localCaInstallIntent,
+                            onInstallLocalCaWithRoot = viewModel::installLocalCaWithRoot,
+                            onExportLocalCa = viewModel::exportLocalCa,
+                            onRefreshProfiles = viewModel::refreshProfiles,
+                            onCreateProfile = viewModel::createProfile,
+                            onDuplicateProfile = viewModel::duplicateActiveProfile,
+                            onSwitchProfile = viewModel::switchProfile,
+                            onRenameProfile = viewModel::renameProfile,
+                            onDeleteProfile = viewModel::deleteProfile,
+                            onSetProfilePackages = viewModel::setActiveProfilePackages,
                         )
                         AppPage.Settings -> SettingsPage(
                             state = state,
