@@ -4,6 +4,11 @@ NetWorkManger launches the official Mihomo executable as a separate process.
 
 - Mihomo: Copyright the MetaCubeX contributors, licensed under GPL-3.0.
   Source and license: https://github.com/MetaCubeX/mihomo
+- Wintun: prebuilt signed `wintun.dll`, Copyright WireGuard LLC. TUN mode needs it, so
+  the Windows package ships it next to the Mihomo core together with a verbatim copy of
+  its license (`wintun-LICENSE.txt`). Redistribution is permitted under clause 3.d for
+  software that uses Wintun only through its public API, which is how Mihomo uses it.
+  Source and license: https://www.wintun.net/
 - sing-box: Copyright the SagerNet contributors, licensed under GPL-3.0-or-later.
   The Android client embeds the official libbox library, and the desktop application can
   install the official binary as an independent service on a user-managed Linux server.

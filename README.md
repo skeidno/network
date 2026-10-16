@@ -41,9 +41,12 @@ Windows 桌面端是 Rust 实现的（`rust/`），需要 Rust 工具链。TUN �
 cargo build --release --manifest-path rust/Cargo.toml
 ```
 
-产物是 `rust/target/release/network-manager-rs.exe` 单个文件；`mihomo.exe` 放在它旁边。
-打包安装包时如果 `vendor\mihomo.exe` 不存在，`scripts/build_windows_installer.ps1`
-会按 `vendor/mihomo.version.json` 钉住的版本自动下载、校验 SHA-256 并解压。
+产物是 `rust/target/release/network-manager-rs.exe` 单个文件，`mihomo.exe` 与
+`wintun.dll` 放在它旁边（TUN 模式要用 wintun，而且必须与内核同级——mihomo 是按
+DLL 名加载它，Windows 的搜索顺序里可执行文件所在目录最优先）。
+打包安装包时如果 `vendor\` 下还没有这两个文件，`scripts/build_windows_installer.ps1`
+会按 `vendor/mihomo.version.json`、`vendor/wintun.version.json` 钉住的版本自动下载、
+校验 SHA-256 并解压出来。
 需要管理员权限时从已提权的终端启动，或由安装包配置的清单触发 UAC。
 
 无界面调试可以直接跑 HTTP 服务而不创建窗口：
@@ -80,6 +83,24 @@ powershell -ExecutionPolicy Bypass -File scripts/build_windows_installer.ps1
 
 Mihomo 作为独立子进程运行，主程序异常退出时 Windows Job Object 会清理核心。
 
+### 安装包在目标机器上需要什么
+
+安装包自带 `mihomo.exe`、`wintun.dll` 与许可文本，Web 前端在编译期内嵌进 exe，
+证书生成是纯 Rust 实现（不依赖 OpenSSL），根证书信任走系统自带的 `certutil`。
+exe 通过 `.cargo/config.toml` 里的 `+crt-static` 静态链接 MSVC 运行时，所以
+**不需要** VC++ 2015-2022 可再发行组件。
+
+硬依赖只有一项：
+
+- **Microsoft Edge WebView2 运行时** —— 原生窗口由它渲染，且它不是 Windows 系统
+  组件。Windows 11 和装过新版 Edge 的 Windows 10 都自带；LTSC、Server、精简装机
+  可能没有，缺了窗口就是一片空白。安装包会检测它，缺失时用内置的 Evergreen
+  Bootstrapper 静默安装（这一步需要联网下载运行时）。
+
+其余环境要求：Windows 10 1809（build 17763）及以上、64 位。程序清单声明
+`requireAdministrator`，每次启动都会弹一次 UAC；TUN 需要管理员令牌，这是 Windows
+的硬性要求。TUN 首次启动时可能被安全软件拦截虚拟网卡创建，需要放行。
+
 ## Android 开发与测试
 
 Android 原生客户端位于 `apps/android/`，使用系统 `VpnService` 和 sing-box libbox。它支持与 Windows 相同的订阅、节点、常用海外站点规则、强制保底、智能节点、实时流量及通用配置导入导出，但不包含 SSH 服务器部署。
@@ -90,7 +111,7 @@ cd apps/android
 .\gradlew.bat testDebugUnitTest assembleDebug assembleDebugAndroidTest
 ```
 
-连接模拟器或 Android 设备后，可按 `apps/android/README.md` 运行设备测试。通用配置字段见 `docs/portable-config-v1.md`；本地 DNS 映射配合 HTTPS 使用时的证书要求见 `docs/local-dns-and-tls.md`。
+连接模拟器或 Android 设备后，可按 `apps/android/README.md` 运行设备测试。通用配置字段见 `docs/portable-config-v1.md`；本地 DNS 映射配合 HTTPS 使用时的证书要求、桌面端与 Android 端内置的「本地 CA + 397 天叶证书」自动签发与一键信任，以及用 Python（Flask）脚本把映射域名跑成 HTTPS 服务的示例（`scripts/local_https_flask.py`），见 `docs/local-dns-and-tls.md`。
 
 ## 测试
 

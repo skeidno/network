@@ -1,0 +1,17 @@
+# 静态链接 MSVC 运行时（CRT），消掉对 VC++ 2015-2022 Redistributable 的依赖。
+#
+# 不加这个开关时，rustc 默认动态链接 CRT，产物导入表里会出现
+#   VCRUNTIME140.dll / VCRUNTIME140_1.dll
+# 这两个 DLL 不是 Windows 系统组件：干净装好的 Win10 上若没装过 VC++ Redist
+# （Office、VS、Chrome 等往往会顺带装上，但 LTSC / Server / 精简版系统没有），
+# 双击程序会直接弹「由于找不到 VCRUNTIME140_1.dll，无法继续执行代码」并退出。
+# 静态链接后这几个 DLL 全被编进 exe，安装包不再有这项外部依赖。
+#
+# 路径很关键：cargo 只从「当前工作目录」逐级向上查找 .cargo/config.toml，
+# 不会去看 --manifest-path 指向的目录。CI（.github/workflows/release.yml）和
+# scripts/build_windows_installer.ps1 都是在仓库根目录执行 cargo，因此这份配置
+# 必须放在仓库根目录，放在 rust/ 下不会生效。
+#
+# 只对 Windows MSVC 目标生效，Linux 目标的构建不受影响。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
