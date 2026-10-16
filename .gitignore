@@ -25,6 +25,9 @@ build-webview/
 dist-webview/
 /*.png
 vendor/mihomo.exe
+vendor/wintun.dll
+vendor/wintun-LICENSE.txt
+vendor/MicrosoftEdgeWebview2Setup.exe
 vendor/*.zip
 vendor/*.tmp
 vendor/release.json

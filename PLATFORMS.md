@@ -24,4 +24,5 @@ implementations use the same contract.
 
 Windows, Linux, and Android currently share the versioned `network-manager-config` JSON
 contract documented in `docs/portable-config-v1.md`. SSH profiles, credentials,
-process rules, and platform-local ports intentionally remain device-local.
+process rules, platform-local ports, and the local DNS map intentionally remain
+device-local.

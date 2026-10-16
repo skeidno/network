@@ -88,6 +88,45 @@ data class InstalledApp(
     val packageName: String,
 )
 
+/**
+ * 本地 DNS 映射：把自定义域名直接指到固定 IP。
+ *
+ * 用途是在局域网里用域名访问自己的服务（NAS、路由器、自建站点），不用每台
+ * 设备各记一套 IP。域名对上之后，服务端证书里的名字才有机会和访问地址一致，
+ * HTTPS 才可能通过校验（自签证书还要把 CA 装进设备信任库，见工具箱的证书检测）。
+ *
+ * 域名支持两种写法：
+ *
+ * - `nas.lan`：**精确**匹配这一个名字；
+ * - `*.baidu.com`：**后缀**匹配，`baidu.com` 本身和它的所有子域都算（`www.baidu.com`、
+ *   `tieba.baidu.com`……）。适合「一个站点有几十个子域，全都要指到同一台机器」。
+ *
+ * sing-box 的 hosts 服务器只有精确查表，所以通配条目走的是 DNS 规则的 `predefined`
+ * 动作：记录名以 `*` 开头时它会把名字换成实际查询的域名（见 SingBoxConfigBuilder）。
+ * 桌面端 mihomo 的 hosts 表用 `+.baidu.com` 表达同一个意思，两端语义一致。
+ */
+data class LocalDnsEntry(
+    val domain: String,
+    val address: String,
+) {
+    /** 通配条目的后缀部分：`*.baidu.com` → `baidu.com`；精确条目 → null。 */
+    val wildcardSuffix: String?
+        get() = domain.removePrefix(LOCAL_DNS_WILDCARD_PREFIX)
+            .takeIf { it.isNotEmpty() && it != domain }
+
+    val isWildcard: Boolean get() = wildcardSuffix != null
+
+    /** 与内核规则一致的命中判断：精确条目比全名，通配条目按后缀（含自身）比。 */
+    fun matchesDomain(host: String): Boolean {
+        val name = host.trim().trimEnd('.').lowercase()
+        val suffix = wildcardSuffix ?: return name == domain
+        return name == suffix || name.endsWith(".$suffix")
+    }
+}
+
+/** 通配前缀。写成 `*.baidu.com` 表示「baidu.com 及其所有子域」。 */
+const val LOCAL_DNS_WILDCARD_PREFIX = "*."
+
 val PORTABLE_RULE_TYPES = setOf(
     "package_name",
     "domain",
@@ -174,6 +213,149 @@ private fun isValidCidr(value: String): Boolean {
     return prefix in 0..if (parsed.address.size == 4) 32 else 128
 }
 
+// ---------------------------------------------------------------------------
+// 本地 DNS 映射
+// ---------------------------------------------------------------------------
+
+/** 映射条数上限：够盖住一个局域网，也不至于把 DNS 规则撑到没法看。 */
+const val LOCAL_DNS_MAX_ENTRIES = 200
+
+private val ipv4LiteralPattern = Regex("""^\d{1,3}(?:\.\d{1,3}){3}$""")
+private val ipv6LiteralPattern = Regex("""^[0-9A-Fa-f:.]+$""")
+private val whitespacePattern = Regex("""[\s,]+""")
+
+/**
+ * 只解析**字面量** IP。
+ *
+ * 绝不用 [InetAddress.getByName] 去碰主机名——它收到 `example.com` 会真的发起
+ * DNS 查询，让一个纯字符串判断变成一次网络往返。所以先用字符集把候选卡死。
+ */
+fun parseIpLiteral(text: String): ByteArray? {
+    val value = text.trim().removeSurrounding("[", "]").substringBefore('%')
+    if (value.isEmpty()) return null
+    val looksLikeIp = if (':' in value) {
+        ipv6LiteralPattern.matches(value)
+    } else {
+        ipv4LiteralPattern.matches(value)
+    }
+    if (!looksLikeIp) return null
+    if (':' !in value && value.split('.').any { (it.toIntOrNull() ?: 256) > 255 }) return null
+    return runCatching { InetAddress.getByName(value).address }.getOrNull()
+}
+
+fun isIpLiteral(text: String): Boolean = parseIpLiteral(text) != null
+
+/**
+ * 域名归一：能贴 `https://nas.lan/admin` 也能贴 `nas.lan`，末尾的点去掉，统一小写。
+ * 通配前缀 `*.` 保留在最前面 —— 它要落进内核规则，不能被当成普通字符丢掉。
+ */
+fun normalizeLocalDnsDomain(raw: String): String {
+    val text = raw.trim()
+    val wildcard = text.startsWith(LOCAL_DNS_WILDCARD_PREFIX)
+    var value = if (wildcard) text.removePrefix(LOCAL_DNS_WILDCARD_PREFIX).trim() else text
+    if ("://" in value) {
+        value = runCatching { URI(value).host }.getOrNull() ?: value
+    }
+    val domain = value.substringBefore('/').trim().lowercase().trimEnd('.')
+    return if (wildcard) "$LOCAL_DNS_WILDCARD_PREFIX$domain" else domain
+}
+
+/** 返回 null 表示合法，否则是直接给用户看的失败原因。 */
+fun localDnsDomainError(rawDomain: String): String? {
+    val domain = normalizeLocalDnsDomain(rawDomain)
+    val checked = domain.removePrefix(LOCAL_DNS_WILDCARD_PREFIX)
+    if (checked.isEmpty()) return "域名不能为空"
+    if ('*' in checked) return "通配只能写在最前面，例如 ${LOCAL_DNS_WILDCARD_PREFIX}baidu.com"
+    if (checked.any(Char::isWhitespace)) return "域名里不能有空格"
+    if (':' in checked) return "这里只填域名，不要带端口——端口由访问方决定"
+    if ('.' !in checked) return "请输入完整域名，例如 nas.lan"
+    if (!checked.matches(domainPattern)) return "域名里有非法字符"
+    return null
+}
+
+/** 返回 null 表示合法，否则是直接给用户看的失败原因。 */
+fun localDnsAddressError(rawAddress: String): String? {
+    val address = rawAddress.trim()
+    if (address.isEmpty()) return "IP 不能为空"
+    if (!isIpLiteral(address)) return "「$address」不是合法的 IP（只支持 IPv4 / IPv6 字面量）"
+    return null
+}
+
+/**
+ * 存下来的地址统一成不带方括号的字面量。
+ *
+ * 内核的 hosts 表要的是 `fd00::10`，而用户从 URL 或别处粘过来的多半是 `[fd00::10]`。
+ * 校验在带括号的原串上做（两种写法都认），落盘只留一种写法，桌面端也是同一套规则 ——
+ * 两端存出来的配置才是同一种形态。
+ */
+fun normalizeLocalDnsAddress(rawAddress: String): String =
+    rawAddress.trim().removeSurrounding("[", "]").trim()
+
+private val domainPattern = Regex("""^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?)+$""")
+
+/**
+ * 解析「域名 IP」多行文本。做成纯函数，界面与单测共用同一套规则。
+ *
+ * - 空行、`#` 注释行忽略；行尾 `#` 之后也算注释（所以能把 hosts 文件直接粘进来）
+ * - 一行的两个字段顺序随意：`nas.lan 192.168.1.10` 和 `192.168.1.10 nas.lan` 等价，
+ *   但两个都不像 IP 时会按「第几个是域名」的自然顺序理解
+ * - 同一域名重复出现时后写的覆盖先写的
+ * - 任何一行有问题都直接抛 [IllegalArgumentException]，并带行号，避免存半截配置
+ */
+fun localDnsEntriesFromText(
+    text: String,
+    limit: Int = LOCAL_DNS_MAX_ENTRIES,
+): List<LocalDnsEntry> {
+    val entries = LinkedHashMap<String, LocalDnsEntry>()
+    text.lineSequence().forEachIndexed { index, rawLine ->
+        val line = rawLine.substringBefore('#').trim()
+        if (line.isEmpty()) return@forEachIndexed
+        val parts = line.split(whitespacePattern).filter(String::isNotBlank)
+        if (parts.size < 2) {
+            throw IllegalArgumentException(
+                "第 ${index + 1} 行：一行要写「域名 IP」两段内容，例如 nas.lan 192.168.1.10",
+            )
+        }
+        // 字段顺序随意：hosts 文件是「IP 域名」，命令习惯是「域名 IP」，两种都收。
+        val (domainPart, addressPart) = when {
+            !isIpLiteral(parts[0]) && isIpLiteral(parts[1]) -> parts[0] to parts[1]
+            isIpLiteral(parts[0]) && !isIpLiteral(parts[1]) -> parts[1] to parts[0]
+            isIpLiteral(parts[0]) && isIpLiteral(parts[1]) ->
+                throw IllegalArgumentException("第 ${index + 1} 行：两段都是 IP，没有域名")
+            else -> parts[0] to parts[1]
+        }
+        localDnsDomainError(domainPart)?.let { throw IllegalArgumentException("第 ${index + 1} 行：$it") }
+        localDnsAddressError(addressPart)?.let { throw IllegalArgumentException("第 ${index + 1} 行：$it") }
+        val domain = normalizeLocalDnsDomain(domainPart)
+        entries.remove(domain)
+        entries[domain] = LocalDnsEntry(domain = domain, address = normalizeLocalDnsAddress(addressPart))
+    }
+    if (entries.size > limit) {
+        throw IllegalArgumentException("最多 $limit 条映射，当前 ${entries.size} 条")
+    }
+    return entries.values.toList()
+}
+
+/** 解析结果回写成编辑框文本，保证「打开编辑器不改动」时是等价的一行一条。 */
+fun localDnsEntriesToText(entries: List<LocalDnsEntry>): String =
+    entries.joinToString("\n") { "${it.domain} ${it.address}" }
+
+/** 只保留仍然合法的那几条：配置是外部文本存下来的，读回来时不该信任。 */
+fun sanitizeLocalDnsEntries(
+    entries: List<LocalDnsEntry>,
+    limit: Int = LOCAL_DNS_MAX_ENTRIES,
+): List<LocalDnsEntry> {
+    val result = LinkedHashMap<String, LocalDnsEntry>()
+    entries.forEach { entry ->
+        val domain = normalizeLocalDnsDomain(entry.domain)
+        val address = normalizeLocalDnsAddress(entry.address)
+        if (localDnsDomainError(domain) != null || localDnsAddressError(address) != null) return@forEach
+        result.remove(domain)
+        result[domain] = LocalDnsEntry(domain, address)
+    }
+    return result.values.take(limit).toList()
+}
+
 data class AppState(
     val running: Boolean = false,
     val busy: Boolean = false,
@@ -204,6 +386,15 @@ data class AppState(
     val localProxyEnabled: Boolean = false,
     val localProxyPort: Int = DEFAULT_LOCAL_PROXY_PORT,
     val localProxyActualPort: Int = 0,
+    // 本地 DNS 映射（自定义域名 → IP）：写进内核的 hosts DNS 服务器，
+    // 让 TUN 接管的所有应用都能按域名找到局域网里的服务。
+    val localDnsEntries: List<LocalDnsEntry> = emptyList(),
+    // 当前档案接管的 App（包名）。空 = 接管全部 App。它是**档案的属性**，
+    // 存在档案清单里而不是这份配置里，这里只是读取时的快照，不落盘。
+    val tunPackages: List<String> = emptyList(),
+    // 本地 CA / 叶证书的状态（给工具箱的证书卡片）：文件才是事实来源，这里只是快照，
+    // 不落盘 —— 每次生成/重签后由 ViewModel 刷新。
+    val localCert: LocalCertStatus = LocalCertStatus(),
     val error: String = "",
 )
 

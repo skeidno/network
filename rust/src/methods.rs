@@ -30,6 +30,7 @@ fn setting_key(key: &str) -> String {
         ("dnsPort", "dns_port"),
         ("serverProxyPort", "server_proxy_port"),
         ("strictRoute", "strict_route"),
+        ("dnsMode", "dns_mode"),
         ("startOnLaunch", "start_on_launch"),
         ("closeToTray", "close_to_tray"),
         ("startWithWindows", "start_with_windows"),
@@ -904,6 +905,112 @@ pub async fn dispatch(
                 }
             }
             apply(state)
+        }
+        "saveLocalDns" => {
+            // 收编辑器里的多行文本：解析 → 校验 → 落盘。有非法行就整条拒绝并回错误，
+            // 不存半截配置（否则用户以为存上了，实际少了几条映射）。
+            let entries = match crate::models::local_dns_entries_from_text(&text(&args, 0)) {
+                Ok(entries) => entries,
+                Err(reason) => {
+                    state.notify("error", reason);
+                    return Ok(json!(null));
+                }
+            };
+            let count = entries.len();
+            let running = state.core.is_running();
+            state.config.local_dns = entries;
+            apply(state)?;
+
+            // 映射一改，叶证书该覆盖的名字就变了，顺手同步到位 —— 否则新加的域名一访问
+            // 就报「名字对不上」。清空映射时**不动**已有证书：那多半只是编辑中途，
+            // 而且用户可能正用着这套证书跑本地服务，文件不该凭空消失。
+            let cert_note = if count > 0 {
+                match crate::localca::ensure(&state.config) {
+                    Ok(ensured) => {
+                        let covered = ensured
+                            .status
+                            .get("names")
+                            .and_then(Value::as_array)
+                            .map(|names| names.len())
+                            .unwrap_or(0);
+                        if ensured.ca_created {
+                            format!(
+                                "已新建本地 CA，{covered} 个名字写进了证书，要浏览器不报红还得把 CA 装进系统信任库"
+                            )
+                        } else if ensured.leaf_generated {
+                            format!("证书已更新，覆盖 {covered} 个名字")
+                        } else {
+                            format!("证书无需更新，覆盖 {covered} 个名字")
+                        }
+                    }
+                    Err(err) => {
+                        state.notify("error", format!("本地 DNS 已保存，但证书更新失败：{err}"));
+                        String::new()
+                    }
+                }
+            } else {
+                String::new()
+            };
+
+            // 内核不热重载：运行中改映射要重新接管才生效，这里必须说清楚，
+            // 不然用户会以为保存没起作用。
+            let dns_note = if count == 0 {
+                "已清空本地 DNS 映射".to_string()
+            } else if running {
+                format!("已保存 {count} 条本地 DNS 映射，重新接管后生效")
+            } else {
+                format!("已保存 {count} 条本地 DNS 映射")
+            };
+            state.notify(
+                "success",
+                if cert_note.is_empty() {
+                    dns_note
+                } else {
+                    format!("{dns_note}；{cert_note}")
+                },
+            );
+            Ok(json!({
+                "count": count,
+                "text": crate::models::local_dns_entries_to_text(&state.config.local_dns),
+                "localCert": crate::localca::status(&state.config),
+            }))
+        }
+        "localCertStatus" => Ok(crate::localca::status(&state.config)),
+        "generateLocalCerts" => {
+            // 手动触发：本地 DNS 为空时也允许生成（有用户就是先备好证书再写映射），
+            // 所以这里不做「有没有映射」的前置判断。
+            let ensured = crate::localca::ensure(&state.config)?;
+            let covered = ensured
+                .status
+                .get("names")
+                .and_then(Value::as_array)
+                .map(|names| names.len())
+                .unwrap_or(0);
+            state.notify(
+                "success",
+                if ensured.ca_created {
+                    format!("已生成根证书与叶证书，叶证书覆盖 {covered} 个名字，有效期 {days} 天", days = crate::localca::LEAF_VALIDITY_DAYS)
+                } else if ensured.leaf_generated {
+                    format!("已更新叶证书，覆盖 {covered} 个名字")
+                } else {
+                    format!("证书已是最新，覆盖 {covered} 个名字")
+                },
+            );
+            Ok(ensured.status)
+        }
+        "installLocalCa" => {
+            let detail = crate::localca::install_ca()?;
+            state.notify("success", detail.clone());
+            Ok(json!({ "detail": detail, "localCert": crate::localca::status(&state.config) }))
+        }
+        "uninstallLocalCa" => {
+            let detail = crate::localca::uninstall_ca()?;
+            state.notify("success", detail.clone());
+            Ok(json!({ "detail": detail, "localCert": crate::localca::status(&state.config) }))
+        }
+        "openLocalCertDir" => {
+            crate::localca::open_dir()?;
+            Ok(json!(true))
         }
         "saveSources" => {
             let patch = payload(&args, 0)?;

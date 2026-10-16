@@ -2,6 +2,7 @@ package com.skeidno.networkmanager.vpn
 
 import com.skeidno.networkmanager.data.AppState
 import com.skeidno.networkmanager.data.FallbackTarget
+import com.skeidno.networkmanager.data.LOCAL_DNS_WILDCARD_PREFIX
 import com.skeidno.networkmanager.data.PortableRule
 import com.skeidno.networkmanager.data.ProxyNode
 import com.skeidno.networkmanager.data.RoutingMode
@@ -26,8 +27,16 @@ object SingBoxConfigBuilder {
      */
     const val localInboundTag = "local-in"
 
-    private val lanDomainSuffixes = listOf("lan", "local", "home.arpa")
-    private val lanCidrs = listOf(
+    /**
+     * 本地 DNS 映射用的 hosts 服务器 tag（sing-box 1.12+ 的 `type: "hosts"`）。
+     * 工具箱的规则预判要按同一份定义判定，所以这里是 internal。
+     */
+    internal const val localDnsServerTag = "local-dns"
+
+    // 工具箱的「规则命中预判」要按同一份局域网定义来判定，所以这里是 internal
+    // 而不是 private —— 两处各写一份迟早会走偏。
+    internal val lanDomainSuffixes = listOf("lan", "local", "home.arpa")
+    internal val lanCidrs = listOf(
         "0.0.0.0/8",
         "10.0.0.0/8",
         "100.64.0.0/10",
@@ -123,8 +132,28 @@ object SingBoxConfigBuilder {
                 state.fallbackTarget == FallbackTarget.Proxy && orderedNodes.isNotEmpty()
             ) "proxy" else "direct"
         }
+        // 本地 DNS 映射（自定义域名 → 固定 IP）。精确域名用 sing-box 自带的 hosts 服务器：
+        // 它是查表返回，不会真的往外发查询，所以局域网里的自建服务能被稳定命中，
+        // 也不会因为上游 DNS 的缓存或劫持而时好时坏。
+        val localDnsEntries = state.localDnsEntries
+            .filter { it.domain.isNotBlank() && it.address.isNotBlank() }
+        val exactDnsEntries = localDnsEntries.filterNot { it.isWildcard }
+        val wildcardDnsEntries = localDnsEntries.filter { it.isWildcard }
         val dnsServers = JSONArray()
-            .put(JSONObject().put("type", "local").put("tag", "local"))
+        if (exactDnsEntries.isNotEmpty()) {
+            dnsServers.put(
+                JSONObject()
+                    .put("type", "hosts")
+                    .put("tag", localDnsServerTag)
+                    .put(
+                        "predefined",
+                        JSONObject().apply {
+                            exactDnsEntries.forEach { entry -> put(entry.domain, entry.address) }
+                        },
+                    ),
+            )
+        }
+        dnsServers.put(JSONObject().put("type", "local").put("tag", "local"))
         if (orderedNodes.isNotEmpty()) {
             dnsServers.put(remoteDnsServer("remote-proxy", "proxy"))
             if (state.mode == RoutingMode.Smart) {
@@ -132,12 +161,46 @@ object SingBoxConfigBuilder {
             }
         }
         val dnsRules = JSONArray()
-            .put(
+        if (exactDnsEntries.isNotEmpty()) {
+            // 必须排在最前面：内置的局域网规则里有 .lan / .local 这类后缀，
+            // 配成 nas.lan 也会命中它，先命中先算，映射得排在前面才不会被抢走。
+            dnsRules.put(
                 JSONObject()
-                    .put("domain_suffix", JSONArray(lanDomainSuffixes))
+                    .put("domain", JSONArray(exactDnsEntries.map { it.domain }))
                     .put("action", "route")
-                    .put("server", "local"),
+                    .put("server", localDnsServerTag),
             )
+        }
+        // 通配条目：hosts 服务器只认精确域名，所以走 DNS 规则的 `predefined` 动作。
+        // 记录名写成 `*.baidu.com` 时 sing-box 会把它换成实际查询的域名（rewriteRecords），
+        // 响应里的名字和查询名一致，系统解析器／浏览器才肯收下。
+        // `domain_suffix` 是含顶级域自身的，所以要配两条：精确的管 baidu.com，
+        // 带 `*.` 的管子域 —— 少了精确那条，访问 `https://baidu.com` 会漏出去。
+        wildcardDnsEntries.forEach { entry ->
+            val suffix = entry.wildcardSuffix ?: return@forEach
+            val recordType = if (':' in entry.address) "AAAA" else "A"
+            dnsRules.put(
+                JSONObject()
+                    .put("domain", JSONArray().put(suffix))
+                    .put("action", "predefined")
+                    .put("answer", JSONArray().put("$suffix. IN $recordType ${entry.address}")),
+            )
+            dnsRules.put(
+                JSONObject()
+                    .put("domain_suffix", JSONArray().put(suffix))
+                    .put("action", "predefined")
+                    .put(
+                        "answer",
+                        JSONArray().put("$LOCAL_DNS_WILDCARD_PREFIX$suffix. IN $recordType ${entry.address}"),
+                    ),
+            )
+        }
+        dnsRules.put(
+            JSONObject()
+                .put("domain_suffix", JSONArray(lanDomainSuffixes))
+                .put("action", "route")
+                .put("server", "local"),
+        )
         enabledPortableRules.filter { it.type == "package_name" }
             .mapNotNull { rule -> toDnsRule(rule, orderedNodes.isNotEmpty()) }
             .forEach(dnsRules::put)
@@ -164,17 +227,23 @@ object SingBoxConfigBuilder {
             ) "remote-proxy" else "local"
         }
 
-        val inbounds = JSONArray().put(
-            JSONObject()
-                .put("type", "tun")
-                .put("tag", "tun-in")
-                .put("address", JSONArray().put("172.19.0.1/30"))
-                .put("mtu", 9000)
-                .put("auto_route", true)
-                .put("route_exclude_address", JSONArray(lanCidrs))
-                .put("strict_route", false)
-                .put("stack", "mixed"),
-        )
+        // 档案限定「只接管这几个 App」时下发白名单：libbox 会把它落到
+        // VpnService.Builder.addAllowedApplication，名单外的 App 完全不进 TUN。
+        // 空名单**不下发**这个字段 —— 那就是原来的全局接管。
+        val tunInbound = JSONObject()
+            .put("type", "tun")
+            .put("tag", "tun-in")
+            .put("address", JSONArray().put("172.19.0.1/30"))
+            .put("mtu", 9000)
+            .put("auto_route", true)
+            .put("route_exclude_address", JSONArray(lanCidrs))
+            .put("strict_route", false)
+            .put("stack", "mixed")
+        if (state.tunPackages.isNotEmpty()) {
+            tunInbound.put("include_package", JSONArray(state.tunPackages))
+        }
+
+        val inbounds = JSONArray().put(tunInbound)
         if (probeEnabled) {
             inbounds.put(
                 JSONObject()

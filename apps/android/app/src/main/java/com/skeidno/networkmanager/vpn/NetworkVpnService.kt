@@ -150,13 +150,20 @@ class NetworkVpnService : VpnService(), CommandServerHandler {
             if (route6.isNotEmpty()) route6.forEach { builder.addRoute(it.address(), it.prefix()) }
         }
 
-        options.includePackage.toList().forEach { packageName ->
+        val includePackages = options.includePackage.toList()
+        val excludePackages = options.excludePackage.toList()
+        // 只有非空名单才有意义（空 = 全局接管）。打出来是为了排障时能一眼确认
+        // 「档案的 App 白名单」到底有没有下发到 VpnService。
+        if (includePackages.isNotEmpty() || excludePackages.isNotEmpty()) {
+            Log.d(LOG_TAG, "TUN 应用名单 include=$includePackages exclude=$excludePackages")
+        }
+        includePackages.forEach { packageName ->
             try {
                 builder.addAllowedApplication(packageName)
             } catch (_: NameNotFoundException) {
             }
         }
-        options.excludePackage.toList().forEach { packageName ->
+        excludePackages.forEach { packageName ->
             try {
                 builder.addDisallowedApplication(packageName)
             } catch (_: NameNotFoundException) {

@@ -36,6 +36,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Rule
 import androidx.compose.material.icons.filled.AccountTree
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ContentCopy
@@ -128,16 +129,19 @@ import com.skeidno.networkmanager.data.DEFAULT_PROXY_DOMAINS
 import com.skeidno.networkmanager.data.FallbackTarget
 import com.skeidno.networkmanager.data.InstalledApp
 import com.skeidno.networkmanager.data.LatencyStatus
+import com.skeidno.networkmanager.data.LocalDnsEntry
 import com.skeidno.networkmanager.data.PortableRule
 import com.skeidno.networkmanager.data.ProxyNode
 import com.skeidno.networkmanager.data.RoutingMode
 import com.skeidno.networkmanager.data.Subscription
+import com.skeidno.networkmanager.data.localDnsEntriesToText
 import kotlin.math.max
 
 private enum class AppPage(val label: String, val icon: ImageVector) {
     Overview("概览", Icons.Default.Home),
     Rules("规则", Icons.AutoMirrored.Filled.Rule),
     Nodes("节点", Icons.Default.Dns),
+    Toolbox("工具箱", Icons.Default.Build),
     Settings("设置", Icons.Default.Settings),
 }
 
@@ -152,6 +156,9 @@ fun NetworkManagerApp(
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val installedApps by viewModel.installedApps.collectAsStateWithLifecycle()
+    val profiles by viewModel.profiles.collectAsStateWithLifecycle()
+    // 当前档案名挂在标题下面常驻显示：档案是「数据隔离」的开关，切过去之后必须一眼能看出来。
+    val activeProfileName = profiles.firstOrNull { it.active }?.name.orEmpty()
     val snackbar = remember { SnackbarHostState() }
     var page by rememberSaveable { mutableStateOf(AppPage.Overview) }
 
@@ -175,12 +182,22 @@ fun NetworkManagerApp(
             topBar = {
                 TopAppBar(
                     title = {
-                        Text(
-                            page.label,
-                            modifier = Modifier.testTag("page-title"),
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold,
-                        )
+                        Column {
+                            Text(
+                                page.label,
+                                modifier = Modifier.testTag("page-title"),
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            if (activeProfileName.isNotEmpty()) {
+                                Text(
+                                    "档案：$activeProfileName",
+                                    modifier = Modifier.testTag("active-profile-name"),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(
                         containerColor = MaterialTheme.colorScheme.surface,
@@ -243,10 +260,28 @@ fun NetworkManagerApp(
                             onTest = viewModel::testAllNodes,
                             onTestNode = viewModel::testNode,
                         )
+                        AppPage.Toolbox -> ToolboxPage(
+                            state = state,
+                            profiles = profiles,
+                            installedApps = installedApps,
+                            onTestExit = viewModel::testExit,
+                            onGenerateLocalCert = viewModel::generateLocalCerts,
+                            onInstallLocalCa = viewModel::localCaInstallIntent,
+                            onInstallLocalCaWithRoot = viewModel::installLocalCaWithRoot,
+                            onExportLocalCa = viewModel::exportLocalCa,
+                            onRefreshProfiles = viewModel::refreshProfiles,
+                            onCreateProfile = viewModel::createProfile,
+                            onDuplicateProfile = viewModel::duplicateActiveProfile,
+                            onSwitchProfile = viewModel::switchProfile,
+                            onRenameProfile = viewModel::renameProfile,
+                            onDeleteProfile = viewModel::deleteProfile,
+                            onSetProfilePackages = viewModel::setActiveProfilePackages,
+                        )
                         AppPage.Settings -> SettingsPage(
                             state = state,
                             onLocalProxyEnabled = viewModel::setLocalProxyEnabled,
                             onLocalProxyPort = viewModel::setLocalProxyPort,
+                            onLocalDns = viewModel::setLocalDnsText,
                             onImportConfiguration = onImportConfiguration,
                             onExportConfiguration = onExportConfiguration,
                         )
@@ -1524,10 +1559,12 @@ private fun SettingsPage(
     state: AppState,
     onLocalProxyEnabled: (Boolean) -> Unit,
     onLocalProxyPort: (Int) -> Unit,
+    onLocalDns: (String) -> Boolean,
     onImportConfiguration: () -> Unit,
     onExportConfiguration: () -> Unit,
 ) {
     var showPortEditor by rememberSaveable { mutableStateOf(false) }
+    var showLocalDnsEditor by rememberSaveable { mutableStateOf(false) }
     val actual = state.localProxyActualPort
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -1585,6 +1622,25 @@ private fun SettingsPage(
                 }
             }
         }
+        item { SectionHeader("本地 DNS") }
+        item {
+            PreferenceGroup {
+                ListItem(
+                    modifier = Modifier.clickable { showLocalDnsEditor = true },
+                    headlineContent = { Text("自定义域名映射") },
+                    supportingContent = {
+                        Text(
+                            state.localDnsEntries.firstOrNull()?.let { first ->
+                                val more = state.localDnsEntries.size - 1
+                                "${first.domain} → ${first.address}" + if (more > 0) " 等 ${state.localDnsEntries.size} 条" else ""
+                            } ?: "未配置 · 让局域网服务能用域名访问",
+                        )
+                    },
+                    leadingContent = { PrefIcon(Icons.Default.Public) },
+                    trailingContent = { TrailingChevron() },
+                )
+            }
+        }
         item { SectionHeader("跨设备配置") }
         item {
             PreferenceGroup {
@@ -1635,6 +1691,70 @@ private fun SettingsPage(
             onDismiss = { showPortEditor = false },
         )
     }
+    if (showLocalDnsEditor) {
+        LocalDnsEditorDialog(
+            entries = state.localDnsEntries,
+            onSave = onLocalDns,
+            onDismiss = { showLocalDnsEditor = false },
+        )
+    }
+}
+
+/**
+ * 本地 DNS 映射编辑器。
+ *
+ * 做成多行文本而不是一行一条的列表，理由有两个：一是和「编辑常用海外站点」
+ * 用同一套交互，二是这一块经常是直接把服务器的 /etc/hosts 粘过来改，
+ * 文本形态最省事。
+ */
+@Composable
+private fun LocalDnsEditorDialog(
+    entries: List<LocalDnsEntry>,
+    onSave: (String) -> Boolean,
+    onDismiss: () -> Unit,
+) {
+    var text by remember(entries) { mutableStateOf(localDnsEntriesToText(entries)) }
+    val lines = text.lineSequence()
+        .map { it.substringBefore('#').trim() }
+        .filter(String::isNotBlank)
+        .toList()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("本地 DNS 映射") },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    label = { Text("一行一条，域名和 IP 顺序随意") },
+                    placeholder = { Text("nas.lan 192.168.1.10\n*.baidu.com 10.0.2.2") },
+                    minLines = 6,
+                    maxLines = 12,
+                    modifier = Modifier.fillMaxWidth().testTag("local-dns-values"),
+                )
+                Text(
+                    if (lines.isEmpty()) "当前没有映射" else "共 ${lines.size} 条",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "写成 nas.lan 只匹配这一个名字；写成 *.baidu.com 则 baidu.com 本身和它" +
+                        "的所有子域都算。地址属于内网网段时会自动直连；" +
+                        "要在局域网里用 HTTPS，证书里的名字得和这里的域名一致——" +
+                        "自签证书还要把 CA 装进设备信任库，可以用工具箱的「证书检测」确认。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { if (onSave(text)) onDismiss() }) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }
 
 /** 移动端设置项的一张分组卡片：一组 [ListItem] 用细分割线串起来。 */
@@ -1767,14 +1887,16 @@ private fun <T> ChoiceDialog(
     )
 }
 
-private fun copyToClipboard(context: Context, value: String) {
+// internal 而非 private：工具箱页（ToolboxPage.kt）在同一包里，复用同一套交互件，
+// 免得复制一份出来两边慢慢走样。
+internal fun copyToClipboard(context: Context, value: String) {
     val manager = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
     manager?.setPrimaryClip(ClipData.newPlainText("proxy-address", value))
     Toast.makeText(context, "已复制 $value", Toast.LENGTH_SHORT).show()
 }
 
 @Composable
-private fun <T> SegmentedChoice(
+internal fun <T> SegmentedChoice(
     options: List<T>,
     selected: T,
     label: (T) -> String,

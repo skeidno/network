@@ -15,7 +15,7 @@ if (signingPropertiesFile.isFile) {
 // The release pipeline pins the version so the APK metadata, the Windows
 // installer, the Linux tarballs and the git tag all carry the same X.Y.Z.
 // Local builds fall back to the values below.
-val appVersionName = (project.findProperty("appVersionName") as String?) ?: "0.6.11"
+val appVersionName = (project.findProperty("appVersionName") as String?) ?: "0.6.12"
 val appVersionCode = ((project.findProperty("appVersionCode") as String?) ?: "9").toInt()
 
 android {
@@ -82,6 +82,11 @@ android {
             "META-INF/DEPENDENCIES",
             "META-INF/LICENSE*",
             "META-INF/NOTICE*",
+            // BouncyCastle 的 bcprov / bcutil / bcpkix 三个 jar 以及 jspecify
+            // 都带同一份多版本 jar 描述符，打包时会撞路径。
+            "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
+            "META-INF/versions/9/module-info.class",
+            "META-INF/versions/9/*.class",
         )
     }
 }
@@ -101,6 +106,11 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("org.yaml:snakeyaml:2.4")
+    // 本地 CA / 叶证书生成：Android 自带的 JCA 只能验证书、不能签，
+    // X.509 的构造要用 BouncyCastle（bcpkix + bcprov 一起，bcutil 是它们的公共依赖）。
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.79")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.79")
+    implementation("org.bouncycastle:bcutil-jdk18on:1.79")
     implementation(files("libs/libbox.aar"))
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
 

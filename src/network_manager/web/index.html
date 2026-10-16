@@ -311,6 +311,30 @@
               </div>
             </section>
             <section class="panel settings-section">
+              <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/database.svg')"></span></div><div><h2>本地 DNS</h2><p>DNS 应答模式与自定义域名映射</p></div></div>
+              <div class="switch-list">
+                <label class="switch-row"><span><strong>DNS 兼容模式（redir-host）</strong><small>默认关闭（fake-ip）：除内网、校时、连通性探测等少数域名外，其余域名都返回 198.18.x.x 假地址，由内核按域名分流，最快；开启后所有域名都返回真实 IP，域名匹配交给连接嗅探 —— 遇到「开着接管就有应用异常」时用它兜底，代价是每次连接多一次解析延迟。<b>改完要重新接管才生效。</b></small></span><input id="setting-dns-compat" type="checkbox"><i></i></label>
+              </div>
+              <label class="local-dns-field"><span>映射列表（一行一条，域名和 IP 顺序随意）</span><textarea id="setting-local-dns" rows="6" spellcheck="false" placeholder="nas.lan 192.168.1.10"></textarea><span class="rule-value-toolbar"><small id="setting-local-dns-summary">当前没有映射</small><span><button id="save-local-dns" type="button" class="text-button">保存映射</button></span></span></label>
+              <p class="settings-note">写进内核的 hosts 表，命中即返回，不会往外发查询 —— 局域网里的 NAS、路由器、自建站点因此能直接用域名访问。<strong>写成 <code>*.baidu.com</code> 就是通配</strong>：baidu.com 本身和它的所有子域都算，只写 <code>nas.lan</code> 则只匹配这一个名字；地址属于内网网段时会自动直连。要在局域网里跑 HTTPS，证书里的名字得和这里的域名一致 —— 下面的「本地证书」会按这张表自动签，不用自己去开 openssl。浏览器与系统的「安全 DNS / 私人 DNS」会绕过这张表，属于预期行为。</p>
+            </section>
+            <section class="panel settings-section">
+              <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/key-round.svg')"></span></div><div><h2>本地证书</h2><p>按上面的映射自动签一套 CA 与叶证书</p></div></div>
+              <div class="local-cert-grid">
+                <div class="local-cert-row"><span>根证书</span><div id="local-cert-ca" class="local-cert-value">加载中…</div></div>
+                <div class="local-cert-row"><span>叶证书</span><div id="local-cert-leaf" class="local-cert-value">加载中…</div></div>
+                <div class="local-cert-row"><span>系统信任</span><div id="local-cert-trust" class="local-cert-value">加载中…</div></div>
+                <div class="local-cert-row"><span>存放位置</span><div id="local-cert-dir" class="local-cert-value local-cert-path"></div></div>
+              </div>
+              <div class="local-cert-actions">
+                <button id="generate-local-cert" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span><span>生成或更新证书</span></button>
+                <button id="install-local-cert" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/shield-alert.svg')"></span><span>信任 CA</span></button>
+                <button id="uninstall-local-cert" type="button" class="text-button">取消信任</button>
+                <button id="open-local-cert-dir" type="button" class="text-button">打开目录</button>
+              </div>
+              <p class="settings-note">映射一改，叶证书会自动重签（通配条目连裸域一起写进 SAN，映射里的 IP 也会写进去）。<strong>叶证书有效期固定 397 天</strong>：Chrome / Edge 对任何证书都执行 398 天上限，本机私有根签的也不例外，超一天就是 <code>ERR_CERT_VALIDITY_TOO_LONG</code>；根证书给 10 年，装一次信任库能一直用。<strong>信任 CA 只装进当前用户</strong>的证书库（<code>certutil -user</code>），不需要管理员，也不会影响别的账户 —— 装不装由你决定，不装的话浏览器依旧会报红。私钥不参与「跨设备配置」导出，只留在本机。</p>
+            </section>
+            <section class="panel settings-section">
               <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/settings.svg')"></span></div><div><h2>运行行为</h2><p>启动、路由与托盘设置</p></div></div>
               <div class="switch-list">
                 <label class="switch-row"><span><strong>严格路由</strong><small>减少 DNS 和流量泄漏</small></span><input id="setting-strict-route" type="checkbox"><i></i></label>

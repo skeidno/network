@@ -862,6 +862,9 @@ function renderSshSelectionOnly() {
 }
 
 function renderSettings() {
+  // 证书卡片不受 settingsInitialized 影响：信任状态、覆盖的名字都可能在别处变化
+  // （保存映射、装了证书），要跟着每轮状态刷新。
+  renderLocalCert();
   if (settingsInitialized || byId("settings-form").contains(document.activeElement)) return;
   const settings = appState.settings;
   byId("setting-mixed-port").value = settings.mixedPort;
@@ -869,10 +872,112 @@ function renderSettings() {
   byId("setting-dns-port").value = settings.dnsPort;
   byId("setting-server-proxy-port").value = settings.serverProxyPort || DEFAULT_SERVER_PROXY_PORT;
   byId("setting-strict-route").checked = settings.strictRoute;
+  // 兼容模式是「非默认值才勾选」：老配置里没有 dnsMode 字段时按 fake-ip 处理。
+  byId("setting-dns-compat").checked = settings.dnsMode === "redir-host";
   byId("setting-start-on-launch").checked = settings.startOnLaunch;
   byId("setting-close-to-tray").checked = settings.closeToTray;
   byId("setting-start-with-windows").checked = settings.startWithWindows;
+  byId("setting-local-dns").value =
+    settings.localDnsText || localDnsTextFromEntries(settings.localDns || []);
+  updateLocalDnsSummary();
   settingsInitialized = true;
+}
+
+/** 已经落盘的映射用 Rust 回写的文本表示；界面只做兜底拼接。 */
+function localDnsTextFromEntries(entries) {
+  return entries.map((entry) => `${entry.domain} ${entry.address}`).join("\n");
+}
+
+/** 摘要只数「去掉注释后还有内容的行」，和真正保存时的解析口径一致。 */
+function localDnsLineCount(text) {
+  return text
+    .split("\n")
+    .map((line) => line.split("#")[0].trim())
+    .filter(Boolean).length;
+}
+
+function updateLocalDnsSummary(text) {
+  const summary = byId("setting-local-dns-summary");
+  if (!summary) return;
+  const dirty = text !== undefined;
+  const value = dirty ? text : byId("setting-local-dns").value;
+  const count = localDnsLineCount(value);
+  summary.textContent = count ? `共 ${count} 条映射${dirty ? "（未保存）" : ""}` : "当前没有映射";
+  summary.classList.toggle("has-warning", dirty && count > 0);
+}
+
+/** 指纹太长，卡片里只露前 6 组字节，够用来和证书管理器里看到的那串对上。 */
+function shortFingerprint(value) {
+  if (!value) return "";
+  return `${value.split(":").slice(0, 6).join(":")}…`;
+}
+
+function setLocalCertLine(element, text, tone) {
+  if (!element) return;
+  element.textContent = text;
+  element.classList.toggle("is-ok", tone === "ok");
+  element.classList.toggle("is-warn", tone === "warn");
+}
+
+/**
+ * 本地证书卡片。状态全部来自 Rust 侧（含带缓存的信任查询），这里只负责措辞 ——
+ * 值的判断逻辑放在 Rust 里，桌面端和 Android 端才不会各说各话。
+ */
+function renderLocalCert() {
+  const cert = appState && appState.settings ? appState.settings.localCert : null;
+  const ca = byId("local-cert-ca");
+  const leaf = byId("local-cert-leaf");
+  const trust = byId("local-cert-trust");
+  const dir = byId("local-cert-dir");
+  if (!ca || !leaf || !trust || !dir) return;
+
+  if (!cert) {
+    setLocalCertLine(ca, "无法读取证书状态", "warn");
+    setLocalCertLine(leaf, "—");
+    setLocalCertLine(trust, "—");
+    dir.textContent = "";
+    return;
+  }
+
+  setLocalCertLine(
+    ca,
+    cert.caExists
+      ? `已生成 · 指纹 ${shortFingerprint(cert.caFingerprint)} · 有效期 ${cert.caValidityDays} 天`
+      : "尚未生成",
+    cert.caExists ? null : "warn",
+  );
+
+  if (!cert.leafExists) {
+    setLocalCertLine(leaf, "尚未生成", "warn");
+  } else if (cert.namesInSync) {
+    setLocalCertLine(
+      leaf,
+      `覆盖 ${cert.names.length} 个名字 · 有效期至 ${cert.leafNotAfter}（剩 ${cert.leafDaysLeft} 天）`,
+    );
+  } else {
+    setLocalCertLine(
+      leaf,
+      `证书里是 ${cert.certifiedNames.length} 个名字，当前映射需要 ${cert.names.length} 个 —— 保存映射或点「生成或更新证书」`,
+      "warn",
+    );
+  }
+
+  if (!cert.canInstallTrust) {
+    setLocalCertLine(trust, "当前平台请手动把 ca.crt 导入系统根证书库", "warn");
+  } else if (cert.caTrusted === true) {
+    setLocalCertLine(trust, "已装入当前用户的受信任根证书颁发机构", "ok");
+  } else if (cert.caTrusted === false) {
+    setLocalCertLine(trust, "未信任 —— 浏览器仍会报证书警告", "warn");
+  } else {
+    setLocalCertLine(trust, "状态未知", "warn");
+  }
+
+  dir.textContent = cert.dir || "";
+
+  byId("install-local-cert").disabled = !cert.caExists || !cert.canInstallTrust;
+  byId("uninstall-local-cert").disabled = !cert.canInstallTrust;
+  byId("install-local-cert").hidden = !cert.canInstallTrust;
+  byId("uninstall-local-cert").hidden = !cert.canInstallTrust;
 }
 
 async function refreshLogs() {
@@ -1844,12 +1949,48 @@ function bindEvents() {
       dnsPort: Number(byId("setting-dns-port").value),
       serverProxyPort: Number(byId("setting-server-proxy-port").value),
       strictRoute: byId("setting-strict-route").checked,
+      dnsMode: byId("setting-dns-compat").checked ? "redir-host" : "fake-ip",
       startOnLaunch: byId("setting-start-on-launch").checked,
       closeToTray: byId("setting-close-to-tray").checked,
       startWithWindows: byId("setting-start-with-windows").checked,
     }));
     settingsInitialized = false;
   });
+  // 本地 DNS 映射：独立保存，不跟「保存设置」一起提交 —— 它是多行文本，
+  // 解析失败要能单独报错并把编辑框留着，混进表单里会让整组设置一起白改。
+  byId("setting-local-dns").addEventListener("input", (event) => {
+    updateLocalDnsSummary(event.target.value);
+  });
+  byId("save-local-dns").addEventListener("click", async () => {
+    const result = await invoke("saveLocalDns", byId("setting-local-dns").value);
+    if (!result) return; // 失败时已经提示过，输入内容保持原样让用户改
+    byId("setting-local-dns").value = result.text || "";
+    updateLocalDnsSummary();
+    settingsInitialized = false;
+  });
+  // 证书按钮：动作本身在 Rust 里做（生成、certutil 装/卸、打开目录），
+  // 这里只负责在各方法之间做「先有证书才能装」这一层顺序约束。
+  byId("generate-local-cert").addEventListener("click", () => invoke("generateLocalCerts"));
+  byId("install-local-cert").addEventListener("click", () => invoke("installLocalCa"));
+  byId("uninstall-local-cert").addEventListener("click", () =>
+    // 不用 confirmAction：那个封装把确认按钮写死成「删除」，放这儿措辞不对。
+    openModal(
+      "取消信任本地 CA",
+      "<p>浏览器和系统随即不再信任这套证书签出来的站点，需要时再点「信任 CA」即可恢复。确定继续？</p>",
+      [
+        { label: "取消", kind: "secondary", action: closeModal },
+        {
+          label: "取消信任",
+          kind: "danger",
+          action: () => {
+            closeModal();
+            invoke("uninstallLocalCa");
+          },
+        },
+      ],
+    ),
+  );
+  byId("open-local-cert-dir").addEventListener("click", () => invoke("openLocalCertDir"));
   byId("setting-random-server-proxy-port").addEventListener("click", () => {
     const values = new Uint32Array(1);
     crypto.getRandomValues(values);

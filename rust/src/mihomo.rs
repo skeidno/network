@@ -1,7 +1,9 @@
 use serde_json::{json, Value};
 use std::net::IpAddr;
 
-use crate::models::{AppConfig, RoutingRule, NODE_DIALER_POLICY_KEY, NODE_DIALER_PROXY_KEY};
+use crate::models::{
+    AppConfig, LocalDnsEntry, RoutingRule, NODE_DIALER_POLICY_KEY, NODE_DIALER_PROXY_KEY,
+};
 
 const TARGET_NAMES: &[(&str, &str)] = &[
     ("CLASH", "UPSTREAM-CLASH"),
@@ -63,6 +65,120 @@ const LAN_IPV4_CIDRS: &[&str] = &[
 ];
 
 const LAN_IPV6_CIDRS: &[&str] = &["::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"];
+
+/// fake-ip 黑名单：名单里的域名永远回真实 IP，不发 198.18.x.x 假地址。
+///
+/// 收三类域名：
+/// - 本机/局域网：本就不该出网，假地址毫无意义；
+/// - 系统级服务：NTP 校时（UDP/123，不过 HTTPS）、Windows/Apple/Google 的连通性探测
+///   （探测结果决定托盘图标和 captive portal 弹窗），拿到假地址会直接坏；
+/// - 会校验对端地址的公共服务（验证码类），假地址段会被拒。
+///
+/// 国内直连站点**不进**这张表：那不是黑名单能穷尽的，一律回真实 IP 的诉求
+/// 由设置里的「DNS 兼容模式」（redir-host）兜底，见 AppConfig::dns_mode。
+const FAKE_IP_FILTER: &[&str] = &[
+    // 本机与局域网
+    "localhost",
+    "+.lan",
+    "+.local",
+    "+.home.arpa",
+    "+.internal",
+    "+.localhost",
+    // NTP 校时
+    "time.windows.com",
+    "time.nist.gov",
+    "time.apple.com",
+    "+.pool.ntp.org",
+    "+.ntp.org.cn",
+    "ntp.aliyun.com",
+    "ntp.tencent.com",
+    "time1.google.com",
+    "time2.google.com",
+    "time3.google.com",
+    "time4.google.com",
+    // 系统连通性探测与推送
+    "+.msftconnecttest.com",
+    "+.msftncsi.com",
+    "+.msftdns.net",
+    "captive.apple.com",
+    "+.push.apple.com",
+    "connectivitycheck.gstatic.com",
+    "connectivitycheck.platform.hicloud.com",
+    // 验证码（会校验对端地址段）
+    "challenges.cloudflare.com",
+    "+.hcaptcha.com",
+    "+.recaptcha.net",
+    // QQ 快速登录组件
+    "localhost.ptlogin2.qq.com",
+];
+
+/// 判断地址是否落在某个 CIDR 里。只用来做「这个映射是不是指向内网」这一个判断，
+/// 所以不引第三方库，前缀位运算就够了。
+fn cidr_contains(cidr: &str, address: IpAddr) -> bool {
+    let Some((network, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let (Ok(network), Ok(prefix)) = (network.parse::<IpAddr>(), prefix.parse::<u8>()) else {
+        return false;
+    };
+    match (network, address) {
+        (IpAddr::V4(net), IpAddr::V4(addr)) if prefix <= 32 => {
+            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            u32::from(net) & mask == u32::from(addr) & mask
+        }
+        (IpAddr::V6(net), IpAddr::V6(addr)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(net) & mask == u128::from(addr) & mask
+        }
+        _ => false,
+    }
+}
+
+/// 映射目标是不是内网地址。
+///
+/// 和 Android 端用的是同一份局域网网段清单（那里叫 `lanCidrs`），判定口径要一致，
+/// 否则同一个映射在手机和电脑上会走向不同的出口。
+fn is_lan_address(address: &str) -> bool {
+    let Some(parsed) = crate::models::parse_ip_literal(address) else {
+        return false;
+    };
+    LAN_IPV4_CIDRS
+        .iter()
+        .chain(LAN_IPV6_CIDRS.iter())
+        .any(|cidr| cidr_contains(cidr, parsed))
+}
+
+/// 本地 DNS 映射里指向内网地址的那几条，生成显式直连规则。
+///
+/// 局域网里的服务交给节点毫无意义，而兜底的 `IP-CIDR` 规则在这个场景下不一定命中：
+/// TUN 开着嗅探、`override-destination` 又是 true 时，规则匹配看到的是域名而不是 IP。
+/// 这里补一条域名规则，让「映射到内网」= 「直连」这个结论和 Android 端完全一致。
+fn local_dns_direct_rules(config: &AppConfig) -> Vec<String> {
+    config
+        .local_dns
+        .iter()
+        .filter(|entry| !entry.domain.is_empty() && is_lan_address(&entry.address))
+        .map(|entry| match entry.wildcard_suffix() {
+            Some(suffix) => format!("DOMAIN-SUFFIX,{},DIRECT", suffix.to_lowercase()),
+            None => format!("DOMAIN,{},DIRECT", entry.domain.to_lowercase()),
+        })
+        .collect()
+}
+
+/// hosts 表的键。通配条目翻译成 `+.domain`，不是 `*.domain`。
+///
+/// 实测（mihomo v1.19.32）：`*.demo.test` 只命中 `a.demo.test`，查询 `demo.test` 本身会漏；
+/// `+.demo.test` 才是「自身 + 所有子域」，正好对上 `*.baidu.com` 在两端定下的语义。
+fn local_dns_hosts_key(entry: &LocalDnsEntry) -> String {
+    match entry.wildcard_suffix() {
+        Some(suffix) => format!("+.{suffix}"),
+        None => entry.domain.clone(),
+    }
+}
 
 fn target_name(target: &str) -> String {
     TARGET_NAMES
@@ -162,6 +278,53 @@ fn dialer_route_rules(config: &AppConfig) -> Vec<String> {
     rules
 }
 
+/// DNS 段。
+///
+/// 应答模式由 `dns_mode` 决定：
+/// - `fake-ip`（默认）：不在 [`FAKE_IP_FILTER`] 里的域名一律回 198.18.x.x 假地址，
+///   靠 TUN 还原域名、再按规则匹配（最快）；
+/// - `redir-host`：所有域名都回真实 IP，域名匹配交给连接时的嗅探器。这是给
+///   「黑名单永远堵不全」准备的兼容模式 —— 某些应用会把假地址缓存、上报或拿去做
+///   不走 TUN 的连接，开启接管后就会异常，切到这个模式能救回来。
+///
+/// 两种模式共用的解析器策略：
+/// - `default-nameserver` 只负责解析下面那几个 DoH 的域名本身，必须是无域名依赖的纯 IP；
+/// - `nameserver` 是主解析器，国内 DoH 优先、境外兜底；
+/// - `respect-rules: true` 让解析也按规则表分流（配合 `direct-nameserver`）：
+///   命中直连的域名用国内 DNS 拿真实 IP，更快也不容易被污染；
+/// - `proxy-server-nameserver` 固定节点服务器域名的解析器，
+///   避免「要先连上节点才能解析节点域名」的死循环。
+fn dns_section(config: &AppConfig) -> Value {
+    let compat = config.dns_mode.eq_ignore_ascii_case("redir-host");
+    let mut dns = json!({
+        "enable": true,
+        "listen": format!("127.0.0.1:{}", config.dns_port),
+        "ipv6": false,
+        "enhanced-mode": if compat { "redir-host" } else { "fake-ip" },
+        "default-nameserver": ["223.5.5.5", "119.29.29.29"],
+        "nameserver": [
+            "https://223.5.5.5/dns-query",
+            "https://doh.pub/dns-query",
+            "https://1.1.1.1/dns-query"
+        ],
+        "respect-rules": true,
+        "direct-nameserver": [
+            "https://223.5.5.5/dns-query",
+            "https://119.29.29.29/dns-query"
+        ],
+        "proxy-server-nameserver": [
+            "https://223.5.5.5/dns-query",
+            "https://119.29.29.29/dns-query"
+        ],
+    });
+    // redir-host 下不分配假地址，这两个字段没有意义，留着反而会让内核读到不一致的状态。
+    if !compat {
+        dns["fake-ip-range"] = json!("198.18.0.1/16");
+        dns["fake-ip-filter"] = json!(FAKE_IP_FILTER);
+    }
+    dns
+}
+
 pub fn build(config: &AppConfig) -> Value {
     let mut proxies: Vec<Value> = Vec::new();
     if config.clash.enabled {
@@ -237,6 +400,9 @@ pub fn build(config: &AppConfig) -> Value {
     );
     rules.push("DST-PORT,22,DIRECT".into());
     rules.extend(dialer_route_rules(config));
+    // 本地 DNS 映射里指向内网的域名排在局域网后缀规则之前，和用户自建规则相比也是
+    // 先命中先算 —— 映射是用户明确写下的意图，优先级应当高于后面的通用规则。
+    rules.extend(local_dns_direct_rules(config));
     rules.extend(
         ["lan", "local", "home.arpa"]
             .iter()
@@ -318,22 +484,7 @@ pub fn build(config: &AppConfig) -> Value {
             },
             "skip-domain": ["Mijia Cloud", "+.push.apple.com"],
         },
-        "dns": {
-            "enable": true,
-            "listen": format!("127.0.0.1:{}", config.dns_port),
-            "ipv6": false,
-            "enhanced-mode": "fake-ip",
-            "fake-ip-range": "198.18.0.1/16",
-            "fake-ip-filter": [
-                "+.lan", "+.local", "localhost.ptlogin2.qq.com",
-                "time.windows.com", "time.nist.gov"
-            ],
-            "default-nameserver": ["223.5.5.5", "1.1.1.1"],
-            "nameserver": [
-                "https://dns.alidns.com/dns-query",
-                "https://1.1.1.1/dns-query"
-            ],
-        },
+        "dns": dns_section(config),
         "proxies": proxies,
         "rules": rules,
         // 只给出口检测用的入站：绑定回环，外部访问不到，也不参与 TUN。
@@ -346,6 +497,20 @@ pub fn build(config: &AppConfig) -> Value {
             }
         ],
     });
+
+    // 本地 DNS 映射（自定义域名 → 固定 IP）。`hosts` 是内核查表，命中就返回写死的
+    // 地址、不往外发查询，所以局域网里的自建服务不会被上游 DNS 的缓存/劫持带偏。
+    // 通配条目在这里翻译成 `+.domain`（见 local_dns_hosts_key）。
+    // 只在真的有映射时才写这个键：没有映射的用户拿到的配置和以前逐字节一致。
+    if !config.local_dns.is_empty() {
+        result["hosts"] = Value::Object(
+            config
+                .local_dns
+                .iter()
+                .map(|entry| (local_dns_hosts_key(entry), Value::String(entry.address.clone())))
+                .collect(),
+        );
+    }
 
     if !config.imported_nodes.is_empty() {
         let mut node_names: Vec<String> = config.imported_nodes.iter().map(|n| n.name()).collect();
@@ -375,4 +540,202 @@ pub fn build(config: &AppConfig) -> Value {
 pub fn render_yaml(config: &AppConfig) -> Result<String, String> {
     let value = build(config);
     serde_yaml::to_string(&value).map_err(|err| format!("生成配置失败：{err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::LocalDnsEntry;
+
+    fn config_with(entries: &[(&str, &str)]) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.local_dns = entries
+            .iter()
+            .map(|(domain, address)| LocalDnsEntry {
+                domain: (*domain).into(),
+                address: (*address).into(),
+            })
+            .collect();
+        config
+    }
+
+    fn rules_of(value: &Value) -> Vec<String> {
+        value["rules"]
+            .as_array()
+            .expect("rules 应当是数组")
+            .iter()
+            .map(|rule| rule.as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn filter_of(value: &Value) -> Vec<String> {
+        value["dns"]["fake-ip-filter"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_config_without_mappings_looks_exactly_as_before() {
+        // 没用这个功能的用户，生成的配置不该多出 hosts 键。
+        let value = build(&AppConfig::default());
+        assert!(value.get("hosts").is_none());
+        // 默认必须是 fake-ip 模式，且带上 fake-ip 段。
+        assert_eq!(value["dns"]["enhanced-mode"], "fake-ip");
+        assert_eq!(value["dns"]["fake-ip-range"], "198.18.0.1/16");
+        assert!(!filter_of(&value).is_empty());
+    }
+
+    #[test]
+    fn fake_ip_filter_keeps_the_system_critical_classes() {
+        // 黑名单要覆盖三类「拿到假地址就会坏」的域名：本机/局域网、NTP 校时、连通性探测。
+        let filter = filter_of(&build(&AppConfig::default()));
+        for expected in [
+            "+.lan",
+            "+.local",
+            "time.windows.com",
+            "time.apple.com",
+            "+.msftconnecttest.com",
+            "captive.apple.com",
+            "connectivitycheck.gstatic.com",
+        ] {
+            assert!(filter.contains(&expected.to_string()), "缺少 {expected}：{filter:?}");
+        }
+    }
+
+    #[test]
+    fn dns_resolution_follows_the_rules() {
+        // respect-rules 与两个按角色区分的解析器：直连用国内 DNS，节点域名也用国内 DNS
+        // （否则「要连上节点才能解析节点域名」就成了死循环）。
+        let value = build(&AppConfig::default());
+        assert_eq!(value["dns"]["respect-rules"], true);
+        assert!(value["dns"]["direct-nameserver"].is_array());
+        assert!(value["dns"]["proxy-server-nameserver"].is_array());
+        // default-nameserver 只能是无域名依赖的纯 IP，否则自举解析会打转。
+        for server in value["dns"]["default-nameserver"].as_array().unwrap() {
+            assert!(
+                server.as_str().unwrap().parse::<IpAddr>().is_ok(),
+                "default-nameserver 必须是纯 IP：{server}"
+            );
+        }
+    }
+
+    #[test]
+    fn redir_host_mode_drops_the_fake_ip_bits() {
+        // 兼容模式：所有域名都回真实 IP，fake-ip 的两个字段都不该出现。
+        let mut config = AppConfig::default();
+        config.dns_mode = "redir-host".into();
+        let value = build(&config);
+        assert_eq!(value["dns"]["enhanced-mode"], "redir-host");
+        assert!(value["dns"].get("fake-ip-range").is_none());
+        assert!(value["dns"].get("fake-ip-filter").is_none());
+    }
+
+    #[test]
+    fn unknown_dns_mode_falls_back_to_fake_ip() {
+        let mut config = AppConfig::default();
+        config.dns_mode = "nonsense".into();
+        assert_eq!(build(&config)["dns"]["enhanced-mode"], "fake-ip");
+    }
+
+    #[test]
+    fn mappings_become_a_hosts_table() {
+        let value = build(&config_with(&[("nas.lan", "192.168.1.10")]));
+        assert_eq!(value["hosts"]["nas.lan"], "192.168.1.10");
+    }
+
+    #[test]
+    fn wildcard_mappings_are_translated_to_the_plus_syntax() {
+        // `*.baidu.com` 要翻成 `+.baidu.com`：实测 mihomo 的 `*.x` 不含 x 本身。
+        let value = build(&config_with(&[("*.baidu.com", "127.0.0.1")]));
+        assert_eq!(value["hosts"]["+.baidu.com"], "127.0.0.1");
+        assert!(value["hosts"].get("*.baidu.com").is_none());
+    }
+
+    #[test]
+    fn wildcard_lan_mappings_become_domain_suffix_rules() {
+        let value = build(&config_with(&[("*.baidu.com", "10.0.2.2")]));
+        assert!(
+            rules_of(&value).contains(&"DOMAIN-SUFFIX,baidu.com,DIRECT".to_string()),
+            "{:?}",
+            rules_of(&value)
+        );
+    }
+
+    #[test]
+    fn wildcard_public_mappings_keep_normal_routing() {
+        let value = build(&config_with(&[("*.cdn.example.com", "1.1.1.1")]));
+        assert!(!rules_of(&value).contains(&"DOMAIN-SUFFIX,cdn.example.com,DIRECT".to_string()));
+    }
+
+    #[test]
+    fn fake_ip_filter_is_left_alone() {
+        // `hosts` 命中就返回固定 IP，fake-ip 阶段根本轮不到它 —— 不往 filter 里塞域名，
+        // 免得哪天 hosts 那条路没走上时，反而把一个只存在于内网的域名推给公网 DNS。
+        let value = build(&config_with(&[("nas.lan", "192.168.1.10")]));
+        let filter = filter_of(&value);
+        assert!(!filter.contains(&"nas.lan".to_string()), "{filter:?}");
+    }
+
+    #[test]
+    fn lan_mappings_are_forced_direct() {
+        // 各网段各挑一个，确保内网判定用的是和 Android 端同一份清单。
+        for address in ["192.168.1.10", "10.0.0.5", "172.16.3.4", "127.0.0.1", "fd00::5"] {
+            let value = build(&config_with(&[("nas.lan", address)]));
+            assert!(
+                rules_of(&value).contains(&"DOMAIN,nas.lan,DIRECT".to_string()),
+                "{address} 应当被判成内网地址"
+            );
+        }
+    }
+
+    #[test]
+    fn public_mappings_keep_normal_routing() {
+        // 映射到公网地址只是钉住解析结果，走哪个出口仍然交给分流规则决定。
+        let value = build(&config_with(&[("cdn.example.com", "1.1.1.1")]));
+        assert!(!rules_of(&value).contains(&"DOMAIN,cdn.example.com,DIRECT".to_string()));
+    }
+
+    #[test]
+    fn lan_mappings_win_over_user_rules() {
+        // 用户给同一个域名写了「走节点」的规则：映射是更明确的一条，先命中先算，
+        // 所以映射的直连规则必须排在用户规则前面。
+        let mut config = config_with(&[("nas.lan", "192.168.1.10")]);
+        config.rules = vec![crate::models::RoutingRule {
+            rule_type: "DOMAIN-SUFFIX".into(),
+            value: "nas.lan".into(),
+            target: "CLASH".into(),
+            ..Default::default()
+        }];
+        let rules = rules_of(&build(&config));
+        let mapping = rules
+            .iter()
+            .position(|rule| rule == "DOMAIN,nas.lan,DIRECT")
+            .expect("应当有映射直连规则");
+        let user_rule = rules
+            .iter()
+            .position(|rule| rule == "DOMAIN-SUFFIX,nas.lan,UPSTREAM-CLASH")
+            .expect("应当有用户规则");
+        assert!(mapping < user_rule, "映射规则要排在用户规则之前：{rules:?}");
+    }
+
+    #[test]
+    fn cidr_matching_agrees_with_the_lan_list() {
+        let address = |text: &str| text.parse::<IpAddr>().expect("测试用的都是字面量");
+        assert!(is_lan_address("192.168.1.10"));
+        assert!(is_lan_address("100.64.0.1"));
+        assert!(is_lan_address("fd00::5"));
+        assert!(!is_lan_address("8.8.8.8"));
+        assert!(!is_lan_address("2001:4860:4860::8888"));
+        // 不能把域名字符串当成 IP（那会触发真实解析），这里必须是 false。
+        assert!(!is_lan_address("router.lan"));
+        assert!(cidr_contains("192.168.0.0/16", address("192.168.255.254")));
+        assert!(!cidr_contains("192.168.0.0/16", address("192.169.0.1")));
+        assert!(cidr_contains("0.0.0.0/0", address("8.8.8.8")));
+    }
 }

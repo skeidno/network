@@ -10,6 +10,15 @@ desktop process rules, local listening ports, controller secrets, and
 platform startup preferences. Importing a portable file preserves those local
 settings on the receiving desktop.
 
+The local DNS map (custom domain to fixed IP) is excluded for the same reason:
+the addresses it points at are only meaningful on one network. Desktop keeps it
+in `local_dns` inside `settings.json`, Android keeps it in its own preferences,
+and both ends share the same text format — one `domain IP` pair per line, field
+order free, `#` starts a comment. A `*.example.com` domain matches the apex
+domain plus every subdomain; a bare `example.com` matches that one name only.
+Reaching an HTTPS service through the map requires a certificate the device
+trusts; see [`local-dns-and-tls.md`](local-dns-and-tls.md).
+
 `routing.mode` accepts `rule`, `global`, `smart`, or `direct`. `smart` is
 portable across desktop and mobile clients and uses periodic health checks to
 select a low-latency node without carrying any SSH state.

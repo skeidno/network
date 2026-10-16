@@ -1,8 +1,9 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::net::IpAddr;
 
-pub const CONFIG_VERSION: i32 = 12;
+pub const CONFIG_VERSION: i32 = 13;
 pub const DEFAULT_SERVER_PROXY_PORT: i32 = 24443;
 pub const COMMON_OVERSEAS_GROUP: &str = "common-overseas";
 pub const NODE_DIALER_PROXY_KEY: &str = "_network-manager-dialer-proxy";
@@ -254,6 +255,15 @@ pub struct AppConfig {
     pub ssh_servers: Vec<SshServerProfile>,
     pub selected_ssh_server: String,
     pub rules: Vec<RoutingRule>,
+    /// 本地 DNS 映射（自定义域名 → 固定 IP）。设备本地配置，不进跨设备导入导出。
+    pub local_dns: Vec<LocalDnsEntry>,
+    /// DNS 应答模式："fake-ip"（默认，快）或 "redir-host"（兼容）。
+    ///
+    /// fake-ip 下不在过滤名单里的域名都回 198.18.x.x 假地址，靠 TUN 还原域名再匹配
+    /// 规则；个别应用会把假地址缓存、上报或拿去做不走 TUN 的连接，表现为「开着接管
+    /// 就异常」。redir-host 下所有域名都回真实 IP，域名匹配交给连接时的嗅探器，
+    /// 兼容性最好，代价是每次连接多一次真实解析的延迟。
+    pub dns_mode: String,
 }
 
 impl Default for AppConfig {
@@ -285,6 +295,8 @@ impl Default for AppConfig {
             ssh_servers: Vec::new(),
             selected_ssh_server: String::new(),
             rules: default_routing_rules(),
+            local_dns: Vec::new(),
+            dns_mode: "fake-ip".into(),
         }
     }
 }
@@ -545,6 +557,266 @@ pub const PROXY_DOMAINS_V11: &[&str] = &[
     "steampowered.com",
 ];
 
+// ---------------------------------------------------------------------------
+// 本地 DNS 映射
+// ---------------------------------------------------------------------------
+
+/// 映射条数上限：够盖住一个局域网，也不至于把内核规则撑到没法看。
+pub const LOCAL_DNS_MAX_ENTRIES: usize = 200;
+
+/// 本地 DNS 映射的一条：把自定义域名固定指向某个 IP。
+///
+/// 用途和平台无关：在局域网里用域名访问 NAS、路由器、自建站点，不用每台设备各
+/// 记一套 IP；域名和服务端证书里的名字对上了，HTTPS 才有机会通过校验。
+///
+/// 域名支持两种写法：
+///
+/// - `nas.lan`：**精确**匹配这一个名字；
+/// - `*.baidu.com`：**后缀**匹配，`baidu.com` 本身和它的所有子域都算（`www.baidu.com`、
+///   `tieba.baidu.com`……）。适合「一个站点有几十个子域，全都要指到同一台机器」。
+///
+/// 通配是用 `*.` 而不是裸后缀，是因为裸后缀太容易误伤（写个 `com` 就等于接管整个 .com）。
+/// 两端内核给通配留了不同的口子，所以 `*.x` 的含义在这里定死，由各自的生成器翻译：
+/// mihomo 的 `hosts` 用 `+.baidu.com`；sing-box 没有通配查表，改用 `predefined` 动作的
+/// 「记录名以 `*` 开头时替换成实际查询名」这条规则（见 SingBoxConfigBuilder）。
+///
+/// 字段带 `#[serde(default)]`：settings.json 是允许手改的，缺一个字段不该让整份
+/// 配置反序列化失败（那会把用户所有配置一起隔离掉）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LocalDnsEntry {
+    pub domain: String,
+    pub address: String,
+}
+
+/// 通配前缀。写成 `*.baidu.com` 表示「baidu.com 及其所有子域」。
+pub const LOCAL_DNS_WILDCARD_PREFIX: &str = "*.";
+
+impl LocalDnsEntry {
+    /// 通配条目的后缀部分：`*.baidu.com` → `Some("baidu.com")`；精确条目 → `None`。
+    pub fn wildcard_suffix(&self) -> Option<&str> {
+        self.domain
+            .strip_prefix(LOCAL_DNS_WILDCARD_PREFIX)
+            .filter(|suffix| !suffix.is_empty())
+    }
+
+    /// 与内核规则一致的命中判断：精确条目比较全名，通配条目按后缀（含自身）比较。
+    ///
+    /// 程序本身不做域名解析（那是内核的事），留着它是为了在测试里钉住这套
+    /// 通配语义 —— 证书要覆盖哪些名字、内核的 hosts 会不会命中，都以它为准。
+    #[cfg(test)]
+    pub fn matches_domain(&self, host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_lowercase();
+        match self.wildcard_suffix() {
+            Some(suffix) => host == suffix || host.ends_with(&format!(".{suffix}")),
+            None => host == self.domain,
+        }
+    }
+}
+
+/// 只认**字面量** IP。
+///
+/// 绝不用 `ToSocketAddrs` / `getaddrinfo` 去碰主机名 —— 它收到 `example.com` 会真的
+/// 发起 DNS 查询，让一次纯字符串判断变成一次网络往返。`IpAddr::from_str` 只解析字面量，
+/// 且拒绝前导零这类歧义写法。
+pub fn parse_ip_literal(text: &str) -> Option<IpAddr> {
+    let value = text
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split('%')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if value.is_empty() {
+        return None;
+    }
+    value.parse::<IpAddr>().ok()
+}
+
+pub fn is_ip_literal(text: &str) -> bool {
+    parse_ip_literal(text).is_some()
+}
+
+/// 域名归一：能贴 `https://nas.lan/admin` 也能贴 `nas.lan`，末尾的点去掉，统一小写。
+/// 通配前缀 `*.` 保留在最前面 —— 它是要落到内核规则里的语义，不能被当成普通字符丢掉。
+pub fn normalize_local_dns_domain(raw: &str) -> String {
+    let text = raw.trim();
+    let (wildcard, rest) = match text.strip_prefix(LOCAL_DNS_WILDCARD_PREFIX) {
+        Some(rest) => (true, rest.trim()),
+        None => (false, text),
+    };
+    let host = match url::Url::parse(rest) {
+        Ok(parsed) if parsed.host_str().is_some() => parsed.host_str().unwrap_or("").to_string(),
+        _ => rest.to_string(),
+    };
+    let domain = host
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase()
+        .trim_end_matches('.')
+        .to_string();
+    if wildcard {
+        format!("{LOCAL_DNS_WILDCARD_PREFIX}{domain}")
+    } else {
+        domain
+    }
+}
+
+/// 存下来的地址统一成不带方括号的字面量。
+///
+/// 内核的 hosts 表要的是 `fd00::5`，而用户从 URL 或别处粘过来的多半是 `[fd00::5]`。
+/// 校验仍然在带括号的原串上做（两种写法都认），落盘只留一种，免得同一个地址
+/// 在配置里出现两种写法。
+fn normalize_address_literal(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim()
+        .to_string()
+}
+
+/// 返回 None 表示合法，否则是直接给用户看的失败原因。
+pub fn local_dns_domain_error(raw: &str) -> Option<String> {
+    let domain = normalize_local_dns_domain(raw);
+    let checked = domain
+        .strip_prefix(LOCAL_DNS_WILDCARD_PREFIX)
+        .unwrap_or(&domain);
+    if checked.is_empty() {
+        return Some("域名不能为空".into());
+    }
+    if checked.contains('*') {
+        return Some(format!(
+            "通配只能写在最前面，例如 {LOCAL_DNS_WILDCARD_PREFIX}baidu.com"
+        ));
+    }
+    if checked.chars().any(char::is_whitespace) {
+        return Some("域名里不能有空格".into());
+    }
+    if checked.contains(':') {
+        return Some("这里只填域名，不要带端口 —— 端口由访问方决定".into());
+    }
+    if !checked.contains('.') {
+        return Some("请输入完整域名，例如 nas.lan".into());
+    }
+    if !is_valid_domain(checked) {
+        return Some("域名里有非法字符".into());
+    }
+    None
+}
+
+fn is_valid_domain(domain: &str) -> bool {
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() < 2 {
+        return false;
+    }
+    labels.iter().all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            && label.chars().next().map(|c| c.is_ascii_alphanumeric()) == Some(true)
+            && label.chars().last().map(|c| c.is_ascii_alphanumeric()) == Some(true)
+    })
+}
+
+pub fn local_dns_address_error(raw: &str) -> Option<String> {
+    let address = raw.trim();
+    if address.is_empty() {
+        return Some("IP 不能为空".into());
+    }
+    if !is_ip_literal(address) {
+        return Some(format!(
+            "「{address}」不是合法的 IP（只支持 IPv4 / IPv6 字面量）"
+        ));
+    }
+    None
+}
+
+/// 解析「域名 IP」多行文本。做成纯函数，界面与单测共用同一套规则。
+///
+/// - 空行、`#` 注释行忽略；行尾 `#` 之后也算注释（所以能把 hosts 文件直接粘进来）
+/// - 一行的两个字段顺序随意：`nas.lan 192.168.1.10` 和 `192.168.1.10 nas.lan` 等价
+/// - 同一域名重复出现时后写的覆盖先写的
+/// - 任何一行有问题都直接返回错误（带行号），避免存半截配置
+pub fn local_dns_entries_from_text(text: &str) -> Result<Vec<LocalDnsEntry>, String> {
+    let mut entries: Vec<LocalDnsEntry> = Vec::new();
+    for (index, raw_line) in text.lines().enumerate() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.len() < 2 {
+            return Err(format!(
+                "第 {} 行：一行要写「域名 IP」两段内容，例如 nas.lan 192.168.1.10",
+                index + 1
+            ));
+        }
+        // 字段顺序随意：hosts 文件是「IP 域名」，命令行习惯是「域名 IP」，两种都收。
+        let (domain_part, address_part) = match (is_ip_literal(parts[0]), is_ip_literal(parts[1])) {
+            (false, true) => (parts[0], parts[1]),
+            (true, false) => (parts[1], parts[0]),
+            (true, true) => return Err(format!("第 {} 行：两段都是 IP，没有域名", index + 1)),
+            (false, false) => (parts[0], parts[1]),
+        };
+        if let Some(reason) = local_dns_domain_error(domain_part) {
+            return Err(format!("第 {} 行：{reason}", index + 1));
+        }
+        if let Some(reason) = local_dns_address_error(address_part) {
+            return Err(format!("第 {} 行：{reason}", index + 1));
+        }
+        let domain = normalize_local_dns_domain(domain_part);
+        if let Some(position) = entries.iter().position(|entry| entry.domain == domain) {
+            entries.remove(position);
+        }
+        entries.push(LocalDnsEntry {
+            domain,
+            address: normalize_address_literal(address_part),
+        });
+    }
+    if entries.len() > LOCAL_DNS_MAX_ENTRIES {
+        return Err(format!(
+            "最多 {LOCAL_DNS_MAX_ENTRIES} 条映射，当前 {} 条",
+            entries.len()
+        ));
+    }
+    Ok(entries)
+}
+
+/// 解析结果回写成编辑框文本，保证「打开编辑器不改动」时是等价的一行一条。
+pub fn local_dns_entries_to_text(entries: &[LocalDnsEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| format!("{} {}", entry.domain, entry.address))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 只保留仍然合法的那几条：配置是外部文本存下来的，读回来时不该信任。
+pub fn sanitize_local_dns_entries(entries: Vec<LocalDnsEntry>) -> Vec<LocalDnsEntry> {
+    let mut result: Vec<LocalDnsEntry> = Vec::new();
+    for entry in entries {
+        let domain = normalize_local_dns_domain(&entry.domain);
+        let address = normalize_address_literal(&entry.address);
+        if local_dns_domain_error(&domain).is_some() || local_dns_address_error(&address).is_some() {
+            continue;
+        }
+        if let Some(position) = result.iter().position(|item| item.domain == domain) {
+            result.remove(position);
+        }
+        result.push(LocalDnsEntry { domain, address });
+    }
+    result.truncate(LOCAL_DNS_MAX_ENTRIES);
+    result
+}
+
 pub fn server_proxy_port_error(port: i32, ssh_port: i32) -> String {
     if !(1..=65535).contains(&port) {
         return "远端代理端口必须在 1 到 65535 之间".into();
@@ -556,4 +828,212 @@ pub fn server_proxy_port_error(port: i32, ssh_port: i32) -> String {
         return "远端代理端口建议使用 1024 以上的端口".into();
     }
     String::new()
+}
+
+#[cfg(test)]
+mod local_dns_tests {
+    use super::*;
+
+    fn parsed(text: &str) -> Vec<LocalDnsEntry> {
+        local_dns_entries_from_text(text).expect("应当解析成功")
+    }
+
+    #[test]
+    fn accepts_both_field_orders_and_urls() {
+        let entries = parsed(
+            "nas.lan 192.168.1.10\n192.168.1.11 router.lan\nhttps://git.lan/admin 10.0.0.7\n",
+        );
+        assert_eq!(
+            entries,
+            vec![
+                LocalDnsEntry {
+                    domain: "nas.lan".into(),
+                    address: "192.168.1.10".into()
+                },
+                LocalDnsEntry {
+                    domain: "router.lan".into(),
+                    address: "192.168.1.11".into()
+                },
+                LocalDnsEntry {
+                    domain: "git.lan".into(),
+                    address: "10.0.0.7".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_blank_lines_and_comments() {
+        // 直接把 /etc/hosts 粘进来：整行注释、行尾注释、空行都要吃掉。
+        let text = "# 家里的服务\n\n\nnas.lan 192.168.1.10   # NAS\n\n";
+        assert_eq!(parsed(text).len(), 1);
+    }
+
+    #[test]
+    fn later_duplicate_wins_and_keeps_one_entry() {
+        let entries = parsed("nas.lan 192.168.1.10\nNAS.lan 192.168.1.99");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].domain, "nas.lan");
+        assert_eq!(entries[0].address, "192.168.1.99");
+    }
+
+    #[test]
+    fn accepts_ipv6_literals_and_drops_the_brackets() {
+        // 粘 URL 写法要认，但落盘只留一种：hosts 表里需要的是 `fd00::5`。
+        let entries = parsed("nas.lan [fd00::5]");
+        assert_eq!(entries[0].address, "fd00::5");
+    }
+
+    #[test]
+    fn rejects_a_line_with_only_one_field() {
+        let error = local_dns_entries_from_text("nas.lan").expect_err("应当报错");
+        assert!(error.starts_with("第 1 行："), "{error}");
+        assert!(error.contains("nas.lan 192.168.1.10"), "{error}");
+    }
+
+    #[test]
+    fn rejects_two_ip_addresses_without_a_domain() {
+        let error = local_dns_entries_from_text("nas.lan 192.168.1.10\n192.168.1.10 192.168.1.11")
+            .expect_err("应当报错");
+        assert!(error.starts_with("第 2 行："), "{error}");
+        assert!(error.contains("没有域名"), "{error}");
+    }
+
+    #[test]
+    fn accepts_wildcard_entries() {
+        let entries = parsed("*.baidu.com 127.0.0.1");
+        assert_eq!(entries[0].domain, "*.baidu.com");
+        assert_eq!(entries[0].wildcard_suffix(), Some("baidu.com"));
+    }
+
+    #[test]
+    fn wildcard_normalization_keeps_the_prefix() {
+        // 大小写、末尾的点、整条 URL 都要能贴进来，前缀不能被吃掉。
+        assert_eq!(normalize_local_dns_domain("*.BAIDU.com."), "*.baidu.com");
+        assert_eq!(normalize_local_dns_domain(" *.baidu.com "), "*.baidu.com");
+    }
+
+    #[test]
+    fn wildcard_matches_the_apex_and_every_subdomain() {
+        let entry = LocalDnsEntry {
+            domain: "*.baidu.com".into(),
+            address: "127.0.0.1".into(),
+        };
+        assert!(entry.matches_domain("baidu.com"));
+        assert!(entry.matches_domain("www.baidu.com"));
+        assert!(entry.matches_domain("tieba.baidu.com"));
+        assert!(entry.matches_domain("WWW.BAIDU.COM."));
+        // 后缀匹配要按标签来，不能被同尾字符串蹭到。
+        assert!(!entry.matches_domain("notbaidu.com"));
+        assert!(!entry.matches_domain("baidu.com.cn"));
+    }
+
+    #[test]
+    fn exact_entries_stay_exact() {
+        let entry = LocalDnsEntry {
+            domain: "nas.lan".into(),
+            address: "192.168.1.10".into(),
+        };
+        assert!(entry.matches_domain("nas.lan"));
+        assert!(!entry.matches_domain("www.nas.lan"));
+        assert!(!entry.matches_domain("other.lan"));
+    }
+
+    #[test]
+    fn rejects_bad_wildcards_and_missing_dots() {
+        // 通配只认最前面的 `*.`，且后面必须是一个完整域名（`*.com` 这类会接管整个顶级域）。
+        assert!(local_dns_entries_from_text("nas.*.lan 192.168.1.10").is_err());
+        assert!(local_dns_entries_from_text("*.com 192.168.1.10").is_err());
+        assert!(local_dns_entries_from_text("*.lan 192.168.1.10").is_err());
+        assert!(local_dns_entries_from_text("nas 192.168.1.10").is_err());
+        assert!(local_dns_entries_from_text("nas.lan:8080 192.168.1.10").is_err());
+    }
+
+    #[test]
+    fn rejects_hostnames_as_addresses() {
+        // 地址只认字面量：写域名的话，判断本身会变成一次真实 DNS 查询。
+        let error = local_dns_entries_from_text("nas.lan router.lan").expect_err("应当报错");
+        assert!(error.contains("不是合法的 IP"), "{error}");
+        assert!(local_dns_entries_from_text("nas.lan 192.168.1.256").is_err());
+        assert!(local_dns_entries_from_text("nas.lan 10.0.0").is_err());
+    }
+
+    #[test]
+    fn text_round_trip_is_stable() {
+        let text = "nas.lan 192.168.1.10\nrouter.lan 192.168.1.1";
+        assert_eq!(local_dns_entries_to_text(&parsed(text)), text);
+    }
+
+    #[test]
+    fn sanitize_drops_invalid_and_duplicate_entries() {
+        let entries = vec![
+            LocalDnsEntry {
+                domain: "NAS.lan".into(),
+                address: " 192.168.1.10 ".into(),
+            },
+            LocalDnsEntry {
+                domain: "nas.lan".into(),
+                address: "192.168.1.99".into(),
+            },
+            LocalDnsEntry {
+                domain: "*.com".into(),
+                address: "192.168.1.1".into(),
+            },
+            LocalDnsEntry {
+                domain: "ok.lan".into(),
+                address: "router.lan".into(),
+            },
+            LocalDnsEntry {
+                domain: String::new(),
+                address: "192.168.1.1".into(),
+            },
+        ];
+        assert_eq!(
+            sanitize_local_dns_entries(entries),
+            vec![LocalDnsEntry {
+                domain: "nas.lan".into(),
+                address: "192.168.1.99".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_more_entries_than_the_limit() {
+        let text = (0..LOCAL_DNS_MAX_ENTRIES + 1)
+            .map(|index| format!("host{index}.lan 192.168.1.1"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = local_dns_entries_from_text(&text).expect_err("应当报错");
+        assert!(error.contains("最多"), "{error}");
+    }
+
+    #[test]
+    fn config_without_local_dns_field_still_loads() {
+        // 老配置文件里没有 local_dns：不能因此整份配置被隔离掉。
+        let json = serde_json::json!({"mode": "RULE", "mixed_port": 17897});
+        let config: AppConfig = serde_json::from_value(json).expect("应当能读回");
+        assert!(config.local_dns.is_empty());
+    }
+
+    #[test]
+    fn config_without_dns_mode_falls_back_to_fake_ip() {
+        // dns_mode 是后加的字段：升级用户的 settings.json 里没有它，
+        // 读回来必须还是默认的 fake-ip，而不是整份配置加载失败。
+        let json = serde_json::json!({"mode": "RULE", "mixed_port": 17897});
+        let config: AppConfig = serde_json::from_value(json).expect("应当能读回");
+        assert_eq!(config.dns_mode, "fake-ip");
+    }
+
+    #[test]
+    fn entry_with_missing_address_does_not_break_the_config() {
+        // 手改 settings.json 时少写一个字段，只应当丢掉这一条。
+        let json = serde_json::json!({
+            "mode": "RULE",
+            "local_dns": [{"domain": "nas.lan"}, {"domain": "router.lan", "address": "192.168.1.1"}],
+        });
+        let config: AppConfig = serde_json::from_value(json).expect("应当能读回");
+        let sanitized = sanitize_local_dns_entries(config.local_dns);
+        assert_eq!(sanitized.len(), 1);
+        assert_eq!(sanitized[0].domain, "router.lan");
+    }
 }
