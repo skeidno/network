@@ -870,6 +870,18 @@ label > small { display: block; margin-top: 5px; color: var(--text-3); font-size
 .settings-note { max-width: 78ch; margin: 10px 0 0; color: var(--text-3); font-size: 11px; line-height: 1.55; }
 .settings-note strong { color: var(--text-2); font-weight: 600; }
 
+/* 本地证书卡片：左边一列固定宽度的标签，右边是可能很长（指纹、路径）的值，
+   所以值这一列必须能换行，否则窗口一窄就把卡片撑破。 */
+.local-cert-grid { display: grid; gap: 8px; margin-bottom: 14px; }
+.local-cert-row { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 10px; align-items: baseline; }
+.local-cert-row > span { color: var(--text-3); font-size: 12px; }
+.local-cert-value { min-width: 0; color: var(--text-2); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.local-cert-value.is-ok { color: var(--green-text); }
+.local-cert-value.is-warn { color: var(--amber-text); }
+.local-cert-path { font-family: Consolas, "Microsoft YaHei UI", monospace; font-size: 11px; color: var(--text-3); }
+.local-cert-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.local-cert-actions .button { min-height: 34px; }
+
 /* ==========================================================================
    Logs
    ========================================================================== */

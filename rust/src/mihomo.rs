@@ -66,6 +66,52 @@ const LAN_IPV4_CIDRS: &[&str] = &[
 
 const LAN_IPV6_CIDRS: &[&str] = &["::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"];
 
+/// fake-ip 黑名单：名单里的域名永远回真实 IP，不发 198.18.x.x 假地址。
+///
+/// 收三类域名：
+/// - 本机/局域网：本就不该出网，假地址毫无意义；
+/// - 系统级服务：NTP 校时（UDP/123，不过 HTTPS）、Windows/Apple/Google 的连通性探测
+///   （探测结果决定托盘图标和 captive portal 弹窗），拿到假地址会直接坏；
+/// - 会校验对端地址的公共服务（验证码类），假地址段会被拒。
+///
+/// 国内直连站点**不进**这张表：那不是黑名单能穷尽的，一律回真实 IP 的诉求
+/// 由设置里的「DNS 兼容模式」（redir-host）兜底，见 AppConfig::dns_mode。
+const FAKE_IP_FILTER: &[&str] = &[
+    // 本机与局域网
+    "localhost",
+    "+.lan",
+    "+.local",
+    "+.home.arpa",
+    "+.internal",
+    "+.localhost",
+    // NTP 校时
+    "time.windows.com",
+    "time.nist.gov",
+    "time.apple.com",
+    "+.pool.ntp.org",
+    "+.ntp.org.cn",
+    "ntp.aliyun.com",
+    "ntp.tencent.com",
+    "time1.google.com",
+    "time2.google.com",
+    "time3.google.com",
+    "time4.google.com",
+    // 系统连通性探测与推送
+    "+.msftconnecttest.com",
+    "+.msftncsi.com",
+    "+.msftdns.net",
+    "captive.apple.com",
+    "+.push.apple.com",
+    "connectivitycheck.gstatic.com",
+    "connectivitycheck.platform.hicloud.com",
+    // 验证码（会校验对端地址段）
+    "challenges.cloudflare.com",
+    "+.hcaptcha.com",
+    "+.recaptcha.net",
+    // QQ 快速登录组件
+    "localhost.ptlogin2.qq.com",
+];
+
 /// 判断地址是否落在某个 CIDR 里。只用来做「这个映射是不是指向内网」这一个判断，
 /// 所以不引第三方库，前缀位运算就够了。
 fn cidr_contains(cidr: &str, address: IpAddr) -> bool {
@@ -232,6 +278,53 @@ fn dialer_route_rules(config: &AppConfig) -> Vec<String> {
     rules
 }
 
+/// DNS 段。
+///
+/// 应答模式由 `dns_mode` 决定：
+/// - `fake-ip`（默认）：不在 [`FAKE_IP_FILTER`] 里的域名一律回 198.18.x.x 假地址，
+///   靠 TUN 还原域名、再按规则匹配（最快）；
+/// - `redir-host`：所有域名都回真实 IP，域名匹配交给连接时的嗅探器。这是给
+///   「黑名单永远堵不全」准备的兼容模式 —— 某些应用会把假地址缓存、上报或拿去做
+///   不走 TUN 的连接，开启接管后就会异常，切到这个模式能救回来。
+///
+/// 两种模式共用的解析器策略：
+/// - `default-nameserver` 只负责解析下面那几个 DoH 的域名本身，必须是无域名依赖的纯 IP；
+/// - `nameserver` 是主解析器，国内 DoH 优先、境外兜底；
+/// - `respect-rules: true` 让解析也按规则表分流（配合 `direct-nameserver`）：
+///   命中直连的域名用国内 DNS 拿真实 IP，更快也不容易被污染；
+/// - `proxy-server-nameserver` 固定节点服务器域名的解析器，
+///   避免「要先连上节点才能解析节点域名」的死循环。
+fn dns_section(config: &AppConfig) -> Value {
+    let compat = config.dns_mode.eq_ignore_ascii_case("redir-host");
+    let mut dns = json!({
+        "enable": true,
+        "listen": format!("127.0.0.1:{}", config.dns_port),
+        "ipv6": false,
+        "enhanced-mode": if compat { "redir-host" } else { "fake-ip" },
+        "default-nameserver": ["223.5.5.5", "119.29.29.29"],
+        "nameserver": [
+            "https://223.5.5.5/dns-query",
+            "https://doh.pub/dns-query",
+            "https://1.1.1.1/dns-query"
+        ],
+        "respect-rules": true,
+        "direct-nameserver": [
+            "https://223.5.5.5/dns-query",
+            "https://119.29.29.29/dns-query"
+        ],
+        "proxy-server-nameserver": [
+            "https://223.5.5.5/dns-query",
+            "https://119.29.29.29/dns-query"
+        ],
+    });
+    // redir-host 下不分配假地址，这两个字段没有意义，留着反而会让内核读到不一致的状态。
+    if !compat {
+        dns["fake-ip-range"] = json!("198.18.0.1/16");
+        dns["fake-ip-filter"] = json!(FAKE_IP_FILTER);
+    }
+    dns
+}
+
 pub fn build(config: &AppConfig) -> Value {
     let mut proxies: Vec<Value> = Vec::new();
     if config.clash.enabled {
@@ -391,22 +484,7 @@ pub fn build(config: &AppConfig) -> Value {
             },
             "skip-domain": ["Mijia Cloud", "+.push.apple.com"],
         },
-        "dns": {
-            "enable": true,
-            "listen": format!("127.0.0.1:{}", config.dns_port),
-            "ipv6": false,
-            "enhanced-mode": "fake-ip",
-            "fake-ip-range": "198.18.0.1/16",
-            "fake-ip-filter": [
-                "+.lan", "+.local", "localhost.ptlogin2.qq.com",
-                "time.windows.com", "time.nist.gov"
-            ],
-            "default-nameserver": ["223.5.5.5", "1.1.1.1"],
-            "nameserver": [
-                "https://dns.alidns.com/dns-query",
-                "https://1.1.1.1/dns-query"
-            ],
-        },
+        "dns": dns_section(config),
         "proxies": proxies,
         "rules": rules,
         // 只给出口检测用的入站：绑定回环，外部访问不到，也不参与 TUN。
@@ -490,27 +568,79 @@ mod tests {
             .collect()
     }
 
+    fn filter_of(value: &Value) -> Vec<String> {
+        value["dns"]["fake-ip-filter"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
     fn a_config_without_mappings_looks_exactly_as_before() {
         // 没用这个功能的用户，生成的配置不该多出 hosts 键。
         let value = build(&AppConfig::default());
         assert!(value.get("hosts").is_none());
-        let filter: Vec<&str> = value["dns"]["fake-ip-filter"]
-            .as_array()
-            .expect("fake-ip-filter 应当是数组")
-            .iter()
-            .map(|item| item.as_str().unwrap_or_default())
-            .collect();
-        assert_eq!(
-            filter,
-            vec![
-                "+.lan",
-                "+.local",
-                "localhost.ptlogin2.qq.com",
-                "time.windows.com",
-                "time.nist.gov"
-            ]
-        );
+        // 默认必须是 fake-ip 模式，且带上 fake-ip 段。
+        assert_eq!(value["dns"]["enhanced-mode"], "fake-ip");
+        assert_eq!(value["dns"]["fake-ip-range"], "198.18.0.1/16");
+        assert!(!filter_of(&value).is_empty());
+    }
+
+    #[test]
+    fn fake_ip_filter_keeps_the_system_critical_classes() {
+        // 黑名单要覆盖三类「拿到假地址就会坏」的域名：本机/局域网、NTP 校时、连通性探测。
+        let filter = filter_of(&build(&AppConfig::default()));
+        for expected in [
+            "+.lan",
+            "+.local",
+            "time.windows.com",
+            "time.apple.com",
+            "+.msftconnecttest.com",
+            "captive.apple.com",
+            "connectivitycheck.gstatic.com",
+        ] {
+            assert!(filter.contains(&expected.to_string()), "缺少 {expected}：{filter:?}");
+        }
+    }
+
+    #[test]
+    fn dns_resolution_follows_the_rules() {
+        // respect-rules 与两个按角色区分的解析器：直连用国内 DNS，节点域名也用国内 DNS
+        // （否则「要连上节点才能解析节点域名」就成了死循环）。
+        let value = build(&AppConfig::default());
+        assert_eq!(value["dns"]["respect-rules"], true);
+        assert!(value["dns"]["direct-nameserver"].is_array());
+        assert!(value["dns"]["proxy-server-nameserver"].is_array());
+        // default-nameserver 只能是无域名依赖的纯 IP，否则自举解析会打转。
+        for server in value["dns"]["default-nameserver"].as_array().unwrap() {
+            assert!(
+                server.as_str().unwrap().parse::<IpAddr>().is_ok(),
+                "default-nameserver 必须是纯 IP：{server}"
+            );
+        }
+    }
+
+    #[test]
+    fn redir_host_mode_drops_the_fake_ip_bits() {
+        // 兼容模式：所有域名都回真实 IP，fake-ip 的两个字段都不该出现。
+        let mut config = AppConfig::default();
+        config.dns_mode = "redir-host".into();
+        let value = build(&config);
+        assert_eq!(value["dns"]["enhanced-mode"], "redir-host");
+        assert!(value["dns"].get("fake-ip-range").is_none());
+        assert!(value["dns"].get("fake-ip-filter").is_none());
+    }
+
+    #[test]
+    fn unknown_dns_mode_falls_back_to_fake_ip() {
+        let mut config = AppConfig::default();
+        config.dns_mode = "nonsense".into();
+        assert_eq!(build(&config)["dns"]["enhanced-mode"], "fake-ip");
     }
 
     #[test]
@@ -548,14 +678,8 @@ mod tests {
         // `hosts` 命中就返回固定 IP，fake-ip 阶段根本轮不到它 —— 不往 filter 里塞域名，
         // 免得哪天 hosts 那条路没走上时，反而把一个只存在于内网的域名推给公网 DNS。
         let value = build(&config_with(&[("nas.lan", "192.168.1.10")]));
-        let filter: Vec<&str> = value["dns"]["fake-ip-filter"]
-            .as_array()
-            .expect("fake-ip-filter 应当是数组")
-            .iter()
-            .map(|item| item.as_str().unwrap_or_default())
-            .collect();
-        assert_eq!(filter.len(), 5);
-        assert!(!filter.contains(&"nas.lan"), "{filter:?}");
+        let filter = filter_of(&value);
+        assert!(!filter.contains(&"nas.lan".to_string()), "{filter:?}");
     }
 
     #[test]

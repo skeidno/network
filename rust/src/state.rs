@@ -494,6 +494,7 @@ pub fn build(state: &mut AppState) -> Value {
             "dnsPort": config.dns_port,
             "serverProxyPort": config.server_proxy_port,
             "strictRoute": config.strict_route,
+            "dnsMode": config.dns_mode,
             "startOnLaunch": config.start_on_launch,
             "closeToTray": config.close_to_tray,
             "startWithWindows": config.start_with_windows,
@@ -504,6 +505,9 @@ pub fn build(state: &mut AppState) -> Value {
                 "address": entry.address,
             })).collect::<Vec<Value>>(),
             "localDnsText": crate::models::local_dns_entries_to_text(&config.local_dns),
+            // 本地证书状态：给设置页的证书卡片用。只读几个小文件，信任查询带缓存，
+            // 放在每轮状态里也不会拖慢轮询。
+            "localCert": crate::localca::status(config),
         },
         "toasts": toasts,
     })

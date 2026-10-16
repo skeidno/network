@@ -15,6 +15,7 @@ mod gui;
 mod gui;
 mod gui_common;
 mod importers;
+mod localca;
 mod methods;
 mod mihomo;
 mod models;

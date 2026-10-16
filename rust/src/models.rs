@@ -257,6 +257,13 @@ pub struct AppConfig {
     pub rules: Vec<RoutingRule>,
     /// 本地 DNS 映射（自定义域名 → 固定 IP）。设备本地配置，不进跨设备导入导出。
     pub local_dns: Vec<LocalDnsEntry>,
+    /// DNS 应答模式："fake-ip"（默认，快）或 "redir-host"（兼容）。
+    ///
+    /// fake-ip 下不在过滤名单里的域名都回 198.18.x.x 假地址，靠 TUN 还原域名再匹配
+    /// 规则；个别应用会把假地址缓存、上报或拿去做不走 TUN 的连接，表现为「开着接管
+    /// 就异常」。redir-host 下所有域名都回真实 IP，域名匹配交给连接时的嗅探器，
+    /// 兼容性最好，代价是每次连接多一次真实解析的延迟。
+    pub dns_mode: String,
 }
 
 impl Default for AppConfig {
@@ -289,6 +296,7 @@ impl Default for AppConfig {
             selected_ssh_server: String::new(),
             rules: default_routing_rules(),
             local_dns: Vec::new(),
+            dns_mode: "fake-ip".into(),
         }
     }
 }
@@ -592,11 +600,11 @@ impl LocalDnsEntry {
             .filter(|suffix| !suffix.is_empty())
     }
 
-    pub fn is_wildcard(&self) -> bool {
-        self.wildcard_suffix().is_some()
-    }
-
     /// 与内核规则一致的命中判断：精确条目比较全名，通配条目按后缀（含自身）比较。
+    ///
+    /// 程序本身不做域名解析（那是内核的事），留着它是为了在测试里钉住这套
+    /// 通配语义 —— 证书要覆盖哪些名字、内核的 hosts 会不会命中，都以它为准。
+    #[cfg(test)]
     pub fn matches_domain(&self, host: &str) -> bool {
         let host = host.trim().trim_end_matches('.').to_lowercase();
         match self.wildcard_suffix() {
@@ -895,7 +903,6 @@ mod local_dns_tests {
     fn accepts_wildcard_entries() {
         let entries = parsed("*.baidu.com 127.0.0.1");
         assert_eq!(entries[0].domain, "*.baidu.com");
-        assert!(entries[0].is_wildcard());
         assert_eq!(entries[0].wildcard_suffix(), Some("baidu.com"));
     }
 
@@ -1006,6 +1013,15 @@ mod local_dns_tests {
         let json = serde_json::json!({"mode": "RULE", "mixed_port": 17897});
         let config: AppConfig = serde_json::from_value(json).expect("应当能读回");
         assert!(config.local_dns.is_empty());
+    }
+
+    #[test]
+    fn config_without_dns_mode_falls_back_to_fake_ip() {
+        // dns_mode 是后加的字段：升级用户的 settings.json 里没有它，
+        // 读回来必须还是默认的 fake-ip，而不是整份配置加载失败。
+        let json = serde_json::json!({"mode": "RULE", "mixed_port": 17897});
+        let config: AppConfig = serde_json::from_value(json).expect("应当能读回");
+        assert_eq!(config.dns_mode, "fake-ip");
     }
 
     #[test]
