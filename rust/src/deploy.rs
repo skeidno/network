@@ -6,7 +6,7 @@
 use serde_json::{json, Value};
 
 use crate::core::DeployTask;
-use crate::models::{ImportedNode, NODE_DIALER_POLICY_KEY, NODE_DIALER_PROXY_KEY};
+use crate::models::ImportedNode;
 use crate::server::Shared;
 use crate::ssh;
 
@@ -282,16 +282,6 @@ pub async fn run(shared: Shared, args: Vec<Value>) -> Result<Value, String> {
         suffix += 1;
     }
     node_config["name"] = json!(node_name);
-    if let Some(current) = current.as_ref() {
-        let dialer = current.dialer_proxy();
-        if !dialer.is_empty() {
-            node_config[NODE_DIALER_PROXY_KEY] = json!(dialer);
-        }
-        let policy = current.dialer_policy();
-        if !policy.is_empty() {
-            node_config[NODE_DIALER_POLICY_KEY] = json!(policy);
-        }
-    }
 
     let node = ImportedNode {
         node_id: current
@@ -355,7 +345,6 @@ pub async fn run(shared: Shared, args: Vec<Value>) -> Result<Value, String> {
 
     // 干完了：清掉进度状态，界面回到「已部署」。
     state.deployments.remove(&profile_id);
-    apply_automatic_node_dialers(&mut state.config.imported_nodes);
     let _ = state.apply_config();
     let running = state.core.is_running();
     if running {
@@ -404,74 +393,5 @@ fn reused_result(
     }
 }
 
-/// Bind authenticated HTTP proxies to the preferred deployed relay.
-pub fn apply_automatic_node_dialers(nodes: &mut [ImportedNode]) -> bool {
-    let relay_name = nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, node)| node.source_id.starts_with("server-deployment:"))
-        .min_by_key(|(index, node)| relay_preference(node, *index))
-        .map(|(_, node)| node.name());
-    let relay_name = relay_name.unwrap_or_default();
-    let mut changed = false;
-    for node in nodes.iter_mut() {
-        let eligible = node.protocol().to_lowercase() == "http"
-            && !node
-                .config
-                .get("username")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .is_empty()
-            && !node
-                .config
-                .get("password")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .is_empty()
-            && !node.source_id.starts_with("server-deployment:");
-        if !eligible || matches!(node.dialer_policy().as_str(), "manual" | "direct") {
-            continue;
-        }
-        if !node.dialer_proxy().is_empty() && node.dialer_policy() != "auto" {
-            continue;
-        }
-        if !relay_name.is_empty() {
-            if node.dialer_proxy() != relay_name || node.dialer_policy() != "auto" {
-                node.config[NODE_DIALER_PROXY_KEY] = json!(relay_name);
-                node.config[NODE_DIALER_POLICY_KEY] = json!("auto");
-                changed = true;
-            }
-        } else if node.dialer_policy() == "auto" {
-            node.config
-                .as_object_mut()
-                .map(|map| map.remove(NODE_DIALER_PROXY_KEY));
-            node.config
-                .as_object_mut()
-                .map(|map| map.remove(NODE_DIALER_POLICY_KEY));
-            changed = true;
-        }
-    }
-    changed
-}
 
-fn relay_preference(node: &ImportedNode, index: usize) -> (usize, usize) {
-    let label = format!("{} {} {}", node.name(), node.source, node.group).to_lowercase();
-    let priorities: &[&[&str]] = &[
-        &["香港", "hong kong", "hongkong", " hk "],
-        &["海外", "overseas"],
-        &["新加坡", "singapore", "日本", "japan", "东京", "tokyo"],
-        &["美国", "usa", "united states"],
-    ];
-    for (priority, keywords) in priorities.iter().enumerate() {
-        if keywords
-            .iter()
-            .any(|keyword| format!(" {label} ").contains(keyword))
-        {
-            return (priority, index);
-        }
-    }
-    (priorities.len(), index)
-}
 

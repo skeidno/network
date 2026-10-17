@@ -543,7 +543,7 @@ pub fn import_portable_config(current: &AppConfig, payload: &Value) -> Result<Ap
     }
     imported.rules = [process_rules, common_rules, portable_rules].concat();
 
-    crate::deploy::apply_automatic_node_dialers(&mut imported.imported_nodes);
+
     let errors = validate_config(&imported);
     if let Some(first) = errors.first() {
         return Err(first.clone());

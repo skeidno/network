@@ -154,24 +154,6 @@ impl ImportedNode {
             .unwrap_or("unknown")
             .to_string()
     }
-
-    pub fn dialer_proxy(&self) -> String {
-        self.config
-            .get(NODE_DIALER_PROXY_KEY)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string()
-    }
-
-    pub fn dialer_policy(&self) -> String {
-        self.config
-            .get(NODE_DIALER_POLICY_KEY)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +242,13 @@ pub struct AppConfig {
     pub clash: Upstream,
     pub v2ray: Upstream,
     pub selected_node: String,
+    /// 统一中转：所有出站都先经过它再连真正的节点。
+    ///
+    /// 中转通常是自己买的服务器或 ISP —— 本地直连某些节点会被掐、被限或直接连不上，
+    /// 但中转那台机器能连上。开启后程序里所有流量（包括节点测速）都先过中转一趟。
+    pub relay_enabled: bool,
+    /// 中转节点的名字，取自 `imported_nodes`。空或名字不存在时不生效。
+    pub relay_node: String,
     pub imported_nodes: Vec<ImportedNode>,
     pub node_groups: Vec<String>,
     pub subscriptions: Vec<SubscriptionSource>,
@@ -300,6 +289,8 @@ impl Default for AppConfig {
             clash: default_clash(),
             v2ray: default_v2ray(),
             selected_node: String::new(),
+            relay_enabled: false,
+            relay_node: String::new(),
             imported_nodes: Vec::new(),
             node_groups: Vec::new(),
             subscriptions: Vec::new(),

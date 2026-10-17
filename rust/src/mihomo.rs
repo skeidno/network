@@ -212,10 +212,30 @@ fn rule_line(rule: &RoutingRule) -> String {
     )
 }
 
+/// 统一中转是否真的生效：开了开关、且中转节点确实还在节点列表里。
+pub fn relay_is_active(config: &AppConfig) -> bool {
+    !global_relay(config).is_empty()
+}
+
+/// 当前生效的统一中转节点名；没开或名字不存在则返回空。
+fn global_relay(config: &AppConfig) -> String {
+    if !config.relay_enabled {
+        return String::new();
+    }
+    let name = config.relay_node.trim();
+    if name.is_empty() || !config.imported_nodes.iter().any(|n| n.name() == name) {
+        return String::new();
+    }
+    name.to_string()
+}
+
 fn route_exclusions(config: &AppConfig) -> Vec<String> {
     let mut hosts = vec![config.clash.host.clone(), config.v2ray.host.clone()];
+    let relay = global_relay(config);
     for node in &config.imported_nodes {
-        if node.dialer_proxy().is_empty() {
+        // 开了统一中转，本机唯一需要直连的就是中转自己 —— 其余节点的连接都
+        // 是中转替我们发出去的，本机根本不会碰它们，没必要也不可能在这里路由排除。
+        if relay.is_empty() || node.name() == relay {
             hosts.push(
                 node.config
                     .get("server")
@@ -239,43 +259,6 @@ fn route_exclusions(config: &AppConfig) -> Vec<String> {
         }
     }
     exclusions
-}
-
-fn dialer_route_rules(config: &AppConfig) -> Vec<String> {
-    let names: Vec<String> = config.imported_nodes.iter().map(|n| n.name()).collect();
-    let mut rules: Vec<String> = Vec::new();
-    let mut seen: Vec<(String, String)> = Vec::new();
-    for node in &config.imported_nodes {
-        let relay = node.dialer_proxy();
-        let host = node
-            .config
-            .get("server")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .trim_matches(|c| c == '[' || c == ']')
-            .trim_end_matches('.')
-            .to_string();
-        let key = (host.to_lowercase(), relay.clone());
-        if host.is_empty()
-            || !names.contains(&relay)
-            || relay == node.name()
-            || seen.contains(&key)
-        {
-            continue;
-        }
-        seen.push(key);
-        match host.parse::<IpAddr>() {
-            Err(_) => rules.push(format!("DOMAIN,{},{relay}", host.to_lowercase())),
-            Ok(IpAddr::V6(address)) => {
-                rules.push(format!("IP-CIDR6,{address}/128,{relay},no-resolve"))
-            }
-            Ok(IpAddr::V4(address)) => {
-                rules.push(format!("IP-CIDR,{address}/32,{relay},no-resolve"))
-            }
-        }
-    }
-    rules
 }
 
 /// DNS 段。
@@ -364,23 +347,21 @@ pub fn build(config: &AppConfig) -> Value {
             "udp": false,
         }));
     }
-    let imported_names: Vec<String> = config.imported_nodes.iter().map(|n| n.name()).collect();
+    let relay = global_relay(config);
     for node in &config.imported_nodes {
         if let Value::Object(map) = &node.config {
             let mut proxy = serde_json::Map::new();
-            let mut dialer = String::new();
             for (key, value) in map {
-                if key == NODE_DIALER_PROXY_KEY {
-                    dialer = value.as_str().unwrap_or("").trim().to_string();
-                    continue;
-                }
-                if key == NODE_DIALER_POLICY_KEY {
+                // 老版本存在节点上的前置设置一律作废：中转现在是全局一个，
+                // 混着用只会出现「有的节点有前置、有的没有」这种最难排查的情况。
+                if key == NODE_DIALER_PROXY_KEY || key == NODE_DIALER_POLICY_KEY {
                     continue;
                 }
                 proxy.insert(key.clone(), value.clone());
             }
-            if imported_names.contains(&dialer) && dialer != node.name() {
-                proxy.insert("dialer-proxy".into(), Value::String(dialer));
+            // 中转自己不能挂自己，否则握手时会无限找拨号代理。
+            if !relay.is_empty() && relay != node.name() {
+                proxy.insert("dialer-proxy".into(), Value::String(relay.clone()));
             }
             proxies.push(Value::Object(proxy));
         }
@@ -399,7 +380,6 @@ pub fn build(config: &AppConfig) -> Value {
             .map(|name| format!("PROCESS-NAME,{name},DIRECT")),
     );
     rules.push("DST-PORT,22,DIRECT".into());
-    rules.extend(dialer_route_rules(config));
     // 本地 DNS 映射里指向内网的域名排在局域网后缀规则之前，和用户自建规则相比也是
     // 先命中先算 —— 映射是用户明确写下的意图，优先级应当高于后面的通用规则。
     rules.extend(local_dns_direct_rules(config));
@@ -724,6 +704,75 @@ mod tests {
             .position(|rule| rule == "DOMAIN-SUFFIX,nas.lan,UPSTREAM-CLASH")
             .expect("应当有用户规则");
         assert!(mapping < user_rule, "映射规则要排在用户规则之前：{rules:?}");
+    }
+
+    fn relay_config(names: &[&str]) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.imported_nodes = names
+            .iter()
+            .map(|name| {
+                let mut map = serde_json::Map::new();
+                map.insert("name".into(), Value::String((*name).into()));
+                map.insert("type".into(), Value::String("http".into()));
+                map.insert("server".into(), Value::String("1.2.3.4".into()));
+                map.insert("port".into(), json!(8080));
+                crate::models::ImportedNode {
+                    config: Value::Object(map),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        config
+    }
+
+    #[test]
+    fn global_relay_chains_every_other_outbound() {
+        let mut config = relay_config(&["中转", "节点 A", "节点 B"]);
+        config.relay_enabled = true;
+        config.relay_node = "中转".into();
+        let proxies = build(&config)["proxies"].as_array().expect("proxies").clone();
+        let dialer = |name: &str| {
+            proxies
+                .iter()
+                .find(|proxy| proxy["name"] == Value::String(name.into()))
+                .and_then(|proxy| proxy.get("dialer-proxy"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        };
+        assert_eq!(dialer("节点 A").as_deref(), Some("中转"));
+        assert_eq!(dialer("节点 B").as_deref(), Some("中转"));
+        // 中转自己不能挂自己，否则握手时会无限找拨号代理。
+        assert_eq!(dialer("中转"), None);
+    }
+
+    #[test]
+    fn relay_off_or_missing_node_changes_nothing() {
+        let mut config = relay_config(&["节点 A", "节点 B"]);
+        // 没开开关。
+        let proxies = build(&config)["proxies"].as_array().expect("proxies").clone();
+        assert!(!proxies.iter().any(|proxy| proxy.get("dialer-proxy").is_some()));
+        // 开了但名字对不上节点列表：算没生效，不能把 dialer-proxy 指向一个不存在的出站。
+        config.relay_enabled = true;
+        config.relay_node = "查无此节点".into();
+        assert!(!crate::mihomo::relay_is_active(&config));
+        let proxies = build(&config)["proxies"].as_array().expect("proxies").clone();
+        assert!(!proxies.iter().any(|proxy| proxy.get("dialer-proxy").is_some()));
+    }
+
+    #[test]
+    fn stale_per_node_relay_settings_are_dropped() {
+        let mut config = relay_config(&["节点 A"]);
+        if let Value::Object(map) = &mut config.imported_nodes[0].config {
+            map.insert(
+                super::NODE_DIALER_PROXY_KEY.into(),
+                Value::String("某个旧前置".into()),
+            );
+        }
+        let proxies = build(&config)["proxies"].as_array().expect("proxies").clone();
+        assert!(
+            !proxies.iter().any(|proxy| proxy.get("dialer-proxy").is_some()),
+            "节点上残留的旧前置设置必须作废：{proxies:?}"
+        );
     }
 
     #[test]

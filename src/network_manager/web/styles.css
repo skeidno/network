@@ -705,6 +705,8 @@ tbody tr.is-selected:hover { background: var(--blue-soft); }
 .fallback-label { color: var(--blue); font-weight: 700; }
 .ssh-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .wide-field { grid-column: 1 / -1; }
+.relay-node-field select:disabled { opacity: .55; cursor: not-allowed; }
+.relay-node-field #setting-relay-hint.is-warning { color: var(--amber-text); }
 .proxy-relay-editor { padding-top: 14px; border-top: 1px solid var(--line-hairline); }
 .proxy-relay-editor > strong { display: block; overflow: hidden; margin-bottom: 10px; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .proxy-relay-fields { display: grid; grid-template-columns: minmax(180px, 1fr) 95px minmax(180px, 1fr); gap: 10px; }

@@ -958,19 +958,6 @@ fn rules_from_patch(patch: &Value) -> Result<Vec<RoutingRule>, String> {
         .collect())
 }
 
-/// 清掉指向已删除节点的中转引用。
-pub fn clear_node_dialer_references(nodes: &mut [ImportedNode], removed: &[String]) {
-    for node in nodes.iter_mut() {
-        let dialer = node.dialer_proxy();
-        if !dialer.is_empty() && removed.iter().any(|name| name == &dialer) {
-            if let Value::Object(map) = &mut node.config {
-                map.remove(crate::models::NODE_DIALER_PROXY_KEY);
-                map.remove(crate::models::NODE_DIALER_POLICY_KEY);
-            }
-        }
-    }
-}
-
 /// 当前选中节点被删掉后，回落到第一个可用节点。
 pub fn repair_selected_node(state: &mut AppState, removed: &[String]) {
     if removed
@@ -1027,8 +1014,6 @@ async fn download_subscription(
     let (nodes, _errors) = parse_import_content(&response)?;
 
     let mut previous_groups: Vec<(String, String)> = Vec::new();
-    let mut previous_dialers: Vec<(String, String)> = Vec::new();
-    let mut previous_policies: Vec<(String, String)> = Vec::new();
     let mut previous_names: Vec<String> = Vec::new();
     for node in state
         .config
@@ -1039,14 +1024,6 @@ async fn download_subscription(
         previous_names.push(node.name());
         if !node.group.is_empty() {
             previous_groups.push((node.name(), node.group.clone()));
-        }
-        let dialer = node.dialer_proxy();
-        if !dialer.is_empty() {
-            previous_dialers.push((node.name(), dialer));
-        }
-        let policy = node.dialer_policy();
-        if !policy.is_empty() {
-            previous_policies.push((node.name(), policy));
         }
     }
     let remaining: Vec<ImportedNode> = state
@@ -1077,26 +1054,11 @@ async fn download_subscription(
         } else {
             node.group = source.group.clone();
         }
-        if let Some(dialer) = previous_dialers
-            .iter()
-            .find(|(key, _)| *key == name)
-            .map(|(_, value)| value.clone())
-        {
-            node.config[crate::models::NODE_DIALER_PROXY_KEY] = json!(dialer);
-        }
-        if let Some(policy) = previous_policies
-            .iter()
-            .find(|(key, _)| *key == name)
-            .map(|(_, value)| value.clone())
-        {
-            node.config[crate::models::NODE_DIALER_POLICY_KEY] = json!(policy);
-        }
     }
     let gone: Vec<String> = previous_names
         .into_iter()
         .filter(|name| !fresh.contains(name))
         .collect();
-    clear_node_dialer_references(&mut state.config.imported_nodes, &gone);
     repair_selected_node(state, &gone);
     if state.config.selected_node.is_empty() {
         state.config.selected_node = state
@@ -1219,6 +1181,30 @@ pub async fn dispatch(
                 return Ok(json!(null));
             }
             state.config.default_target = target;
+            apply(state)
+        }
+        "setRelay" => {
+            // 中转是全局一个：开/关 + 选哪个节点。只改这两个字段，其它一概不动。
+            let patch = payload(&args, 0).unwrap_or(json!({}));
+            let enabled = patch
+                .get("enabled")
+                .map(|value| matches!(value, Value::Bool(flag) if *flag))
+                .unwrap_or(state.config.relay_enabled);
+            let node = patch
+                .get("node")
+                .and_then(|value| value.as_str())
+                .map(|value| value.trim().to_string())
+                .unwrap_or_else(|| state.config.relay_node.clone());
+            if !node.is_empty() && !state.config.imported_nodes.iter().any(|n| n.name() == node) {
+                state.notify("error", format!("中转节点「{node}」已不在节点列表里"));
+                return Ok(json!(null));
+            }
+            if enabled && node.is_empty() {
+                state.notify("error", "启用中转前先选一个中转节点");
+                return Ok(json!(null));
+            }
+            state.config.relay_enabled = enabled;
+            state.config.relay_node = node;
             apply(state)
         }
         "selectNode" => {
@@ -1819,7 +1805,6 @@ pub async fn dispatch(
                     .config
                     .imported_nodes
                     .retain(|node| node.source_id != source.source_id);
-                clear_node_dialer_references(&mut state.config.imported_nodes, &removed);
                 state.config.subscriptions.remove(index);
                 repair_selected_node(state, &removed);
             }

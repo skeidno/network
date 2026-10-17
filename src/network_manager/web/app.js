@@ -569,21 +569,6 @@ function renderRules() {
         </td>
       </tr>`;
     }
-    if (rule.kind === "relay") {
-      const relayStatus = rule.automatic
-        ? "自动启用"
-        : rule.partiallyEnabled
-          ? "部分配置"
-          : rule.enabled ? "启用" : "直连";
-      return `<tr class="system-rule-row">
-        <td><span class="rule-status${statusClass}">${relayStatus}</span></td>
-        <td><span class="fallback-label">${escapeHtml(rule.ruleTypeLabel)}</span></td>
-        <td title="${escapeHtml(rule.detail)}"><button type="button" class="rule-edit-link" data-rule-action="edit" data-rule-kind="relay" aria-label="编辑代理入口域名和前置节点"><span><strong>代理入口域名 / IP</strong><small>${rule.count} 个入口</small></span>${icon("square-pen")}</button></td>
-        <td><span class="chip">${escapeHtml(rule.targetLabel)}</span></td>
-        <td title="${escapeHtml(rule.note)}">${escapeHtml(rule.note)}</td>
-        <td class="actions"><button class="mini-button" data-rule-action="edit" data-rule-kind="relay" title="编辑代理域名前置">${icon("square-pen")}</button></td>
-      </tr>`;
-    }
     return `<tr>
       <td><span class="rule-status${statusClass}">${statusText}</span></td>
       <td title="${escapeHtml(rule.ruleType)}">${escapeHtml(rule.ruleTypeLabel)}</td>
@@ -700,13 +685,12 @@ function renderNodes() {
           <strong title="${escapeHtml(node.name)}">${escapeHtml(node.name)}</strong>
           <div class="node-card-actions">
             <span class="node-latency ${latencyLevel}" title="${escapeHtml(node.latencyMessage || latencyText)}">${latencyText}</span>
-            <button class="mini-button${node.dialerProxy ? " active" : ""}" data-node-dialer="${escapeHtml(node.name)}" title="设置前置/中转节点" aria-label="设置前置/中转节点">${icon("link")}</button>
             <button class="mini-button" data-node-test="${node.index}" title="测试该节点" aria-label="测试该节点"${node.latencyStatus === "testing" ? " disabled" : ""}>${icon("wifi")}</button>
             <button class="mini-button" data-node-group="${escapeHtml(node.name)}" title="移动到分组" aria-label="移动到分组">${icon("folder-open")}</button>
             <button class="mini-button danger" data-node-delete="${node.index}" title="删除节点" aria-label="删除节点">${icon("trash-2")}</button>
           </div>
         </div>
-        <div class="node-card-meta"><span class="node-badge">${escapeHtml(node.protocol)}</span>${node.region ? `<span class="node-badge region">${escapeHtml(node.region)}</span>` : ""}${node.dialerProxy ? `<span class="node-badge chain" title="${node.dialerPolicy === "auto" ? "自动选择" : "手动设置"}前置节点：${escapeHtml(node.dialerProxy)}">${icon("link")}${node.dialerPolicy === "auto" ? "自动经" : "经"} ${escapeHtml(node.dialerProxy)}</span>` : ""}</div>
+        <div class="node-card-meta"><span class="node-badge">${escapeHtml(node.protocol)}</span>${node.region ? `<span class="node-badge region">${escapeHtml(node.region)}</span>` : ""}${node.isRelay ? `<span class="node-badge chain" title="当前作为统一中转使用">${icon("link")}中转</span>` : ""}</div>
         <div class="node-card-foot">
           <span title="${escapeHtml(node.source)}">${escapeHtml(node.source || "手动导入")}</span>
           <span title="${escapeHtml(node.server)}">${escapeHtml(node.server)}</span>
@@ -865,6 +849,7 @@ function renderSettings() {
   // 证书卡片不受 settingsInitialized 影响：信任状态、覆盖的名字都可能在别处变化
   // （保存映射、装了证书），要跟着每轮状态刷新。
   renderLocalCert();
+  renderRelay();
   if (settingsInitialized || byId("settings-form").contains(document.activeElement)) return;
   const settings = appState.settings;
   byId("setting-mixed-port").value = settings.mixedPort;
@@ -881,6 +866,36 @@ function renderSettings() {
     settings.localDnsText || localDnsTextFromEntries(settings.localDns || []);
   updateLocalDnsSummary();
   settingsInitialized = true;
+}
+
+/** 统一中转：整份配置只有一个中转节点，改完立刻生效，不用等「保存设置」。 */
+function renderRelay() {
+  const relay = appState.relay || { enabled: false, node: "", active: false };
+  const select = byId("setting-relay-node");
+  const enabled = byId("setting-relay-enabled");
+  if (!select || !enabled) return;
+  // 用户正开着这个下拉框时别重建选项，否则选到一半会被打断。
+  if (select === document.activeElement) return;
+  const nodes = appState.nodes || [];
+  const options = [
+    `<option value=""${relay.node ? "" : " selected"}>未选择</option>`,
+    ...(!relay.node || nodes.some((node) => node.name === relay.node)
+      ? []
+      : [`<option value="${escapeHtml(relay.node)}" selected>${escapeHtml(relay.node)}（已不在节点列表）</option>`]),
+    ...nodes.map((node) => `<option value="${escapeHtml(node.name)}"${node.name === relay.node ? " selected" : ""}>${escapeHtml(node.name)} · ${escapeHtml(node.protocol)}</option>`),
+  ].join("");
+  select.innerHTML = options;
+  select.disabled = !relay.enabled;
+  enabled.checked = relay.enabled;
+  const hint = byId("setting-relay-hint");
+  if (hint) {
+    hint.textContent = !relay.enabled
+      ? "未启用，节点全部直接连接。"
+      : relay.active
+        ? "已生效：所有出站（含节点测速）都先经过它再连节点。"
+        : "已勾选但没生效：所选节点不在节点列表里，请重新选择。";
+    hint.classList.toggle("is-warning", relay.enabled && !relay.active);
+  }
 }
 
 /** 已经落盘的映射用 Rust 回写的文本表示；界面只做兜底拼接。 */
@@ -1442,80 +1457,6 @@ function openNodeGroupDialog(node) {
   ]);
 }
 
-function openNodeDialerDialog(node) {
-  const candidates = appState.nodes.filter((item) => item.name !== node.name);
-  const currentExists = candidates.some((item) => item.name === node.dialerProxy);
-  const options = [
-    `<option value=""${node.dialerProxy ? "" : " selected"}>直接连接</option>`,
-    ...(!currentExists && node.dialerProxy
-      ? [`<option value="${escapeHtml(node.dialerProxy)}" selected>${escapeHtml(node.dialerProxy)}（当前不可用）</option>`]
-      : []),
-    ...candidates.map((item) => `<option value="${escapeHtml(item.name)}"${node.dialerProxy === item.name ? " selected" : ""}>${escapeHtml(item.name)} · ${escapeHtml(item.protocol)}</option>`),
-  ].join("");
-  openModal("设置中转节点", `
-    <div class="form-grid">
-      <div class="group-dialog-summary"><strong>${escapeHtml(node.name)}</strong><span>${escapeHtml(node.server)}</span></div>
-      <label><span>前置/中转节点</span><select id="modal-node-dialer">${options}</select></label>
-    </div>`, [
-    { label: "取消", kind: "secondary", action: closeModal },
-    { label: "应用", kind: "primary", action: () => {
-      invoke("setNodeDialerProxy", node.name, byId("modal-node-dialer").value);
-      closeModal();
-    } },
-  ]);
-}
-
-function openProxyRelayRuleDialog(rule) {
-  const entries = Array.isArray(rule?.entries) ? rule.entries : [];
-  if (!entries.length) {
-    showToast("error", "没有可配置的代理入口");
-    return;
-  }
-  const fields = entries.map((entry, index) => {
-    const candidates = (appState.nodes || []).filter((node) => node.name !== entry.node);
-    const currentValue = entry.policy === "auto"
-      ? "__AUTO__"
-      : entry.relay || "__DIRECT__";
-    const options = [
-      `<option value="__AUTO__"${currentValue === "__AUTO__" ? " selected" : ""}>自动选择（香港 / 海外优先）</option>`,
-      `<option value="__DIRECT__"${currentValue === "__DIRECT__" ? " selected" : ""}>直连，不使用前置节点</option>`,
-      ...candidates.map((node) => `<option value="${escapeHtml(node.name)}"${currentValue === node.name ? " selected" : ""}>${escapeHtml(node.name)} · ${escapeHtml(node.protocol)}</option>`),
-    ].join("");
-    return `<section class="proxy-relay-editor wide-field">
-      <strong>${escapeHtml(entry.node)}</strong>
-      <div class="proxy-relay-fields">
-        <label class="proxy-relay-host"><span>入口域名 / IP</span><input id="modal-proxy-server-${index}" value="${escapeHtml(entry.endpoint)}" placeholder="例如 proxy.example.com" required></label>
-        <label><span>端口</span><input id="modal-proxy-port-${index}" type="number" min="1" max="65535" value="${Number(entry.port) || ""}" required></label>
-        <label class="proxy-relay-target"><span>前置节点</span><select id="modal-proxy-relay-${index}" data-proxy-entry="${escapeHtml(entry.node)}">${options}</select></label>
-      </div>
-    </section>`;
-  }).join("");
-  openModal("编辑代理域名前置", `
-    <div class="form-grid">
-      <div class="group-dialog-summary wide-field"><strong>第 2 阶段</strong><span>入口域名和端口会同步更新对应代理节点；代码或应用直接使用该地址时，也按所选前置节点转发。</span></div>
-      ${fields}
-    </div>`, [
-    { label: "取消", kind: "secondary", action: closeModal },
-    { label: "保存前置规则", kind: "primary", action: () => {
-      const assignments = entries.map((entry, index) => {
-        const value = byId(`modal-proxy-relay-${index}`).value;
-        const server = byId(`modal-proxy-server-${index}`).value.trim();
-        const port = Number(byId(`modal-proxy-port-${index}`).value);
-        const endpoint = { node: entry.node, server, port };
-        if (value === "__AUTO__") return { ...endpoint, mode: "auto", dialer: "" };
-        if (value === "__DIRECT__") return { ...endpoint, mode: "direct", dialer: "" };
-        return { ...endpoint, mode: "manual", dialer: value };
-      });
-      const invalid = assignments.find((entry) => !entry.server || !Number.isInteger(entry.port) || entry.port < 1 || entry.port > 65535);
-      if (invalid) {
-        showToast("error", "请填写有效的代理入口域名 / IP 和端口");
-        return;
-      }
-      invoke("saveProxyRelayRules", JSON.stringify({ assignments }));
-      closeModal();
-    } },
-  ]);
-}
 
 function openPasteDialog() {
   const groupOptions = [
@@ -1765,11 +1706,6 @@ function bindEvents() {
     const button = event.target.closest("[data-rule-action]");
     if (!button) return;
     const action = button.dataset.ruleAction;
-    if (button.dataset.ruleKind === "relay") {
-      const relayRule = appState.rules.find((rule) => rule.kind === "relay");
-      if (action === "edit") openProxyRelayRuleDialog(relayRule);
-      return;
-    }
     const groupId = button.dataset.ruleGroup;
     if (groupId) {
       const group = appState.rules.find((rule) => rule.groupId === groupId);
@@ -1839,13 +1775,6 @@ function bindEvents() {
       event.stopPropagation();
       const node = appState.nodes.find((item) => item.name === groupButton.dataset.nodeGroup);
       if (node) openNodeGroupDialog(node);
-      return;
-    }
-    const dialerButton = event.target.closest("[data-node-dialer]");
-    if (dialerButton) {
-      event.stopPropagation();
-      const node = appState.nodes.find((item) => item.name === dialerButton.dataset.nodeDialer);
-      if (node) openNodeDialerDialog(node);
       return;
     }
     const button = event.target.closest("[data-node-delete]");
@@ -1955,6 +1884,17 @@ function bindEvents() {
       startWithWindows: byId("setting-start-with-windows").checked,
     }));
     settingsInitialized = false;
+  });
+  // 统一中转改完立刻生效：中转会影响每一条出去的连接，攒到「保存设置」一起提交
+  // 会让用户在改完到点保存之间拿到的还是老链路。
+  byId("setting-relay-enabled").addEventListener("change", async (event) => {
+    const node = byId("setting-relay-node").value;
+    const result = await invoke("setRelay", JSON.stringify({ enabled: event.target.checked, node }));
+    if (!result) renderRelay(); // 被拒绝时把界面拉回实际状态
+  });
+  byId("setting-relay-node").addEventListener("change", async (event) => {
+    const result = await invoke("setRelay", JSON.stringify({ enabled: true, node: event.target.value }));
+    if (!result) renderRelay();
   });
   // 本地 DNS 映射：独立保存，不跟「保存设置」一起提交 —— 它是多行文本，
   // 解析失败要能单独报错并把编辑框留着，混进表单里会让整组设置一起白改。

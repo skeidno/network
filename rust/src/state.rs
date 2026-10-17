@@ -161,77 +161,6 @@ fn rule_states(config: &AppConfig) -> Vec<Value> {
         }));
     }
 
-    let relay_entries: Vec<Value> = config
-        .imported_nodes
-        .iter()
-        .filter(|node| {
-            node.protocol().to_lowercase() == "http"
-                && !node.source_id.starts_with("server-deployment:")
-                && !node
-                    .config
-                    .get("server")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .is_empty()
-        })
-        .map(|node| {
-            let relay = node.dialer_proxy();
-            let policy = node.dialer_policy();
-            json!({
-                "node": node.name(),
-                "endpoint": node.config.get("server").and_then(|v| v.as_str()).unwrap_or(""),
-                "port": node.config.get("port").and_then(|v| v.as_i64()).unwrap_or(0),
-                "relay": relay.clone(),
-                "policy": if policy.is_empty() { if relay.is_empty() { "direct".to_string() } else { "manual".to_string() } } else { policy },
-            })
-        })
-        .collect();
-
-    if !relay_entries.is_empty() {
-        let relays: Vec<String> = relay_entries
-            .iter()
-            .filter_map(|entry| entry.get("relay").and_then(|v| v.as_str()))
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_string())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let configured_count = relay_entries
-            .iter()
-            .filter(|entry| {
-                entry
-                    .get("relay")
-                    .and_then(|v| v.as_str())
-                    .map(|value| !value.is_empty())
-                    .unwrap_or(false)
-            })
-            .count();
-        let automatic_count = relay_entries
-            .iter()
-            .filter(|entry| entry.get("policy").and_then(|v| v.as_str()) == Some("auto"))
-            .count();
-        let detail = relay_entries
-            .iter()
-            .filter_map(|entry| entry.get("endpoint").and_then(|v| v.as_str()))
-            .collect::<Vec<_>>()
-            .join("、");
-        states.push(json!({
-            "kind": "relay",
-            "enabled": configured_count == relay_entries.len(),
-            "partiallyEnabled": 0 < configured_count && configured_count < relay_entries.len(),
-            "automatic": automatic_count == relay_entries.len(),
-            "ruleType": "PROXY-ENDPOINT",
-            "ruleTypeLabel": label(RULE_LABELS, "PROXY-ENDPOINT"),
-            "value": format!("{} 个代理入口", relay_entries.len()),
-            "detail": detail,
-            "entries": relay_entries,
-            "target": if relays.len() == 1 { relays[0].clone() } else if relays.is_empty() { "DIRECT".to_string() } else { "MULTIPLE".to_string() },
-            "targetLabel": if relays.len() == 1 { format!("经 {}", relays[0]) } else if relays.is_empty() { "直连".to_string() } else { format!("经 {} 个前置节点", relays.len()) },
-            "note": "第 2 阶段；可编辑，代码直接使用代理域名时同样生效",
-            "count": relay_entries.len(),
-        }));
-    }
     states
 }
 
@@ -321,8 +250,9 @@ pub fn build(state: &mut AppState) -> Value {
                 "latencyStatus": delay.status,
                 "latency": delay.delay,
                 "latencyMessage": delay.message,
-                "dialerProxy": node.dialer_proxy(),
-                "dialerPolicy": node.dialer_policy(),
+                // 中转现在整份配置只有一个，挂在节点上的是哪个已经没有意义，
+                // 但先留着这两个键，免得前端读 undefined 崩。
+                "isRelay": node.name() == config.relay_node && config.relay_enabled,
             })
         })
         .collect();
@@ -486,6 +416,12 @@ pub fn build(state: &mut AppState) -> Value {
         "subscriptions": subscriptions,
         "sshServers": ssh_servers,
         "selectedNode": config.selected_node,
+        "relay": {
+            "enabled": config.relay_enabled,
+            "node": config.relay_node,
+            // 开着但名字对不上节点列表时算「没生效」，界面要能看出这个区别。
+            "active": crate::mihomo::relay_is_active(config),
+        },
         "runningProcesses": running_process_names(),
         "importing": state.importing,
         "settings": {
