@@ -312,6 +312,95 @@ class SingBoxConfigBuilderTest {
     }
 
     @Test
+    fun relayHangsEveryOtherNodeOffTheRelayButNeverTheRelayItself() {
+        val relay = ProxyNode(
+            id = "relay",
+            name = "Relay",
+            sourceId = "test",
+            sourceName = "Test",
+            rawJson = """{"type":"http","server":"relay.example.com","port":8080}""",
+        )
+        val second = ProxyNode(
+            id = "second",
+            name = "Second",
+            sourceId = "test",
+            sourceName = "Test",
+            rawJson = """{"type":"vless","server":"other.example.com","port":443,"uuid":"id"}""",
+        )
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(
+                AppState(
+                    selectedNodeId = second.id,
+                    nodes = listOf(relay, second),
+                    relayEnabled = true,
+                    relayNodeId = relay.id,
+                ),
+            ),
+        )
+
+        val outbounds = config.getJSONArray("outbounds")
+        val byTag = (0 until outbounds.length())
+            .map { outbounds.getJSONObject(it) }
+            .associateBy { it.getString("tag") }
+        assertEquals("relay", byTag["second"]!!.getString("detour"))
+        // 中转挂自己会无限找拨号器，必须留空。
+        assertTrue(!byTag["relay"]!!.has("detour"))
+    }
+
+    @Test
+    fun relayLeavesLoopbackNodesAloneAndStaysOffWhenDisabledOrUnresolvable() {
+        val relay = ProxyNode(
+            id = "relay",
+            name = "Relay",
+            sourceId = "test",
+            sourceName = "Test",
+            rawJson = """{"type":"http","server":"relay.example.com","port":8080}""",
+        )
+        // 落在本机回环的节点：中转在远端，连的是它自己那台机器的 127.0.0.1。
+        val loopback = ProxyNode(
+            id = "local",
+            name = "Local",
+            sourceId = "test",
+            sourceName = "Test",
+            rawJson = """{"type":"http","server":"127.0.0.1","port":7897}""",
+        )
+        val built = { state: AppState ->
+            val config = JSONObject(SingBoxConfigBuilder.build(state))
+            val outbounds = config.getJSONArray("outbounds")
+            (0 until outbounds.length())
+                .map { outbounds.getJSONObject(it) }
+                .associateBy { it.getString("tag") }
+        }
+        val on = built(
+            AppState(
+                nodes = listOf(relay, loopback),
+                relayEnabled = true,
+                relayNodeId = relay.id,
+            ),
+        )
+        assertTrue(!on["local"]!!.has("detour"))
+
+        // 开关关着：选了节点也不该挂。
+        val off = built(
+            AppState(
+                nodes = listOf(relay, loopback),
+                relayEnabled = false,
+                relayNodeId = relay.id,
+            ),
+        )
+        assertTrue(!off["local"]!!.has("detour"))
+        // 指向一个已经不存在的节点：算没开，不能把 detour 指到一个不存在的出站。
+        val stale = built(
+            AppState(
+                nodes = listOf(relay, loopback),
+                relayEnabled = true,
+                relayNodeId = "gone",
+            ),
+        )
+        assertTrue(!stale["local"]!!.has("detour"))
+    }
+
+    @Test
     fun nativeSingBoxTlsObjectSurvivesInsteadOfBeingSilentlyDropped() {
         val nativeNode = ProxyNode(
             id = "native-node",

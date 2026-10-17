@@ -282,6 +282,7 @@ fun NetworkManagerApp(
                             onLocalProxyEnabled = viewModel::setLocalProxyEnabled,
                             onLocalProxyPort = viewModel::setLocalProxyPort,
                             onLocalDns = viewModel::setLocalDnsText,
+                            onRelay = viewModel::setRelay,
                             onImportConfiguration = onImportConfiguration,
                             onExportConfiguration = onExportConfiguration,
                         )
@@ -1560,11 +1561,14 @@ private fun SettingsPage(
     onLocalProxyEnabled: (Boolean) -> Unit,
     onLocalProxyPort: (Int) -> Unit,
     onLocalDns: (String) -> Boolean,
+    onRelay: (Boolean, String) -> Unit,
     onImportConfiguration: () -> Unit,
     onExportConfiguration: () -> Unit,
 ) {
     var showPortEditor by rememberSaveable { mutableStateOf(false) }
     var showLocalDnsEditor by rememberSaveable { mutableStateOf(false) }
+    var showRelayPicker by rememberSaveable { mutableStateOf(false) }
+    val relayNode = state.nodes.firstOrNull { it.id == state.relayNodeId }
     val actual = state.localProxyActualPort
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -1620,6 +1624,52 @@ private fun SettingsPage(
                         )
                     }
                 }
+            }
+        }
+        item { SectionHeader("统一中转") }
+        item {
+            PreferenceGroup {
+                ListItem(
+                    headlineContent = { Text("所有节点都先经过中转") },
+                    supportingContent = {
+                        Text(
+                            when {
+                                state.nodes.isEmpty() -> "先在节点页添加节点"
+                                relayNode == null -> "未选中转节点"
+                                state.relayEnabled -> "已开启 · 除中转自己以外的节点都走它"
+                                else -> "已关闭"
+                            },
+                        )
+                    },
+                    leadingContent = { PrefIcon(Icons.Default.AccountTree) },
+                    trailingContent = {
+                        Switch(
+                            checked = state.relayEnabled,
+                            enabled = relayNode != null,
+                            onCheckedChange = { onRelay(it, state.relayNodeId) },
+                        )
+                    },
+                )
+                HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                ListItem(
+                    modifier = Modifier.clickable { if (state.nodes.isNotEmpty()) showRelayPicker = true },
+                    headlineContent = { Text("中转节点") },
+                    supportingContent = {
+                        Text(
+                            relayNode?.name
+                                ?: if (state.nodes.isEmpty()) "没有可用节点" else "未选择",
+                        )
+                    },
+                    leadingContent = { PrefIcon(Icons.Default.Public) },
+                    trailingContent = { TrailingChevron() },
+                )
+                Text(
+                    "中转节点自己不走中转；落在本机回环（127.0.0.1）的节点也不会挂中转 —— " +
+                        "中转在远端，连的是它自己那台机器的回环地址。",
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
         item { SectionHeader("本地 DNS") }
@@ -1689,6 +1739,16 @@ private fun SettingsPage(
             current = state.localProxyPort.toString(),
             onConfirm = onLocalProxyPort,
             onDismiss = { showPortEditor = false },
+        )
+    }
+    if (showRelayPicker && state.nodes.isNotEmpty()) {
+        ChoiceDialog(
+            title = "选择中转节点",
+            options = state.nodes,
+            selected = relayNode ?: state.nodes.first(),
+            label = { "${it.name} · ${it.protocol}" },
+            onSelected = { onRelay(state.relayEnabled, it.id) },
+            onDismiss = { showRelayPicker = false },
         )
     }
     if (showLocalDnsEditor) {

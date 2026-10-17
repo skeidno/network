@@ -205,6 +205,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         applyConfigurationIfRunning()
     }
 
+    /** detour 是写进出站里的，改完必须重载内核才生效，所以这里和改分流模式一样要 apply。 */
+    fun setRelay(enabled: Boolean, nodeId: String): Boolean = runCatching {
+        repository.setRelay(enabled, nodeId)
+    }.fold(
+        onSuccess = {
+            applyConfigurationIfRunning()
+            true
+        },
+        onFailure = {
+            mutableMessages.tryEmit(it.message ?: "统一中转设置失败")
+            false
+        },
+    )
+
     fun setRuleGroupEnabled(enabled: Boolean) {
         repository.setRuleGroupEnabled(enabled)
         applyConfigurationIfRunning()
