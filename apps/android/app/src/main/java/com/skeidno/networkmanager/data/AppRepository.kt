@@ -2,6 +2,7 @@ package com.skeidno.networkmanager.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
 import com.skeidno.networkmanager.vpn.SingBoxConfigBuilder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -750,13 +751,17 @@ class AppRepository private constructor(private val context: Context) {
      */
     private fun testEndpoint(node: ProxyNode): ProxyNode {
         if (mutableState.value.running) {
-            val delay = runCatching { requestCoreDelay(node.id) }.getOrNull()
+            val delay = runCatching { requestCoreDelay(node.id) }
+                .onFailure { Log.w(PROBE_TAG, "probe ${node.id} core request threw: ${it.message}") }
+                .getOrNull()
+            Log.d(PROBE_TAG, "probe ${node.id} via core -> $delay")
             return if (delay == null) {
                 node.copy(latencyMs = null, latencyStatus = LatencyStatus.Error)
             } else {
                 node.copy(latencyMs = delay, latencyStatus = LatencyStatus.Available)
             }
         }
+        Log.d(PROBE_TAG, "probe ${node.id} via tcp handshake (core not running)")
         val started = System.nanoTime()
         return try {
             Socket().use { socket -> socket.connect(InetSocketAddress(node.server, node.port), 4_000) }
@@ -772,7 +777,10 @@ class AppRepository private constructor(private val context: Context) {
     /** 借内核的延迟测试：它走的是节点自己的完整链路（含 detour 中转链）。 */
     private fun requestCoreDelay(outboundTag: String): Int? {
         val port = clashApiPort
-        if (port <= 0) return null
+        if (port <= 0) {
+            Log.w(PROBE_TAG, "no clash api port allocated, tag=$outboundTag")
+            return null
+        }
         val target = java.net.URLEncoder.encode(
             "http://www.gstatic.com/generate_204",
             Charsets.UTF_8.name(),
@@ -790,8 +798,10 @@ class AppRepository private constructor(private val context: Context) {
             connection.connectTimeout = 6_000
             connection.readTimeout = 6_000
             val code = connection.responseCode
+            Log.d(PROBE_TAG, "core delay $outboundTag -> HTTP $code")
             if (code !in 200..299) return null
             val body = connection.inputStream.bufferedReader().readText()
+            Log.d(PROBE_TAG, "core delay $outboundTag body=$body")
             JSONObject(body).optInt("delay", -1).takeIf { it >= 0 }
         } finally {
             connection.disconnect()
@@ -981,6 +991,9 @@ class AppRepository private constructor(private val context: Context) {
         }
     }
 }
+
+/** 测速链路的排查日志 tag：判断一次测速到底问的是内核还是本机握手。 */
+private const val PROBE_TAG = "NMProbe"
 
 private fun RoutingMode.portableValue(): String = when (this) {
     RoutingMode.Rule -> "rule"
