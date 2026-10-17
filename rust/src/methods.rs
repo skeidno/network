@@ -522,17 +522,137 @@ fn parse_ipv4_at(bytes: &[u8], start: usize) -> Option<(String, usize)> {
 
 /// 节点的「可用性/延迟」用一次 TCP 握手衡量：够轻，且不依赖内核是否在跑。
 async fn measure_delay(host: &str, port: u16) -> Result<i64, String> {
+    let start = Instant::now();
+    let stream = connect_timeout(host, port).await?;
+    drop(stream);
+    Ok(start.elapsed().as_millis() as i64)
+}
+
+/// 一个待测节点：地址 + 协议 + 账号。
+///
+/// 带上协议和账号是因为不同协议能验到的层次不一样：http/socks 在本机就能完成
+/// 真实握手，必须验到「能代理」；vless/vmess/trojan/ss 是端到端加密的，本机
+/// 没有密钥，只能确认端口可达。
+#[derive(Clone)]
+struct TestTarget {
+    name: String,
+    host: String,
+    port: u16,
+    protocol: String,
+    username: String,
+    password: String,
+}
+
+fn test_target(node: &ImportedNode) -> TestTarget {
+    let (host, port) = node_endpoint(node);
+    let pick = |key: &str| {
+        node.config
+            .get(key)
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    TestTarget {
+        name: node.name(),
+        host,
+        port,
+        protocol: node.protocol(),
+        username: pick("username"),
+        password: pick("password"),
+    }
+}
+
+/// 验证「代理能不能真的把连接递出去」时连的目标。
+///
+/// 用 IP 而不是域名：本机 DNS 未必能解析外网域名，解析失败会污染代理本身的结论。
+/// 只要对端能建立隧道就算通过，不关心它返回什么。
+const PROBE_TARGET: &str = "1.1.1.1:443";
+/// 单次探测的超时。握手 + 读响应两段各自计时，最坏 6 秒。
+const PROBE_TIMEOUT: Duration = Duration::from_millis(3000);
+
+/// 对 HTTP 代理做一次真实的 CONNECT 握手。
+///
+/// 只做 TCP 握手会得出误导性的结论：代理商批发出来的住宅代理端口一律开着，
+/// 握手毫秒级成功，可一旦发 CONNECT 就被对端 reset 掉。用户看到的就是
+/// 「批量测速全是通的，实际一个都上不了网」。所以 http 类型必须走到 CONNECT
+/// 这一层才算数——握手成功才代表这个节点真的能代理。
+async fn probe_http_connect(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+) -> Result<i64, String> {
+    use base64::Engine;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let start = Instant::now();
+    let mut stream = connect_timeout(host, port).await?;
+
+    let mut request = format!("CONNECT {PROBE_TARGET} HTTP/1.1\r\nHost: {PROBE_TARGET}\r\n");
+    if !username.is_empty() {
+        let token = base64::engine::general_purpose::STANDARD
+            .encode(format!("{username}:{password}"));
+        request.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
+    }
+    request.push_str("\r\n");
+
+    if let Err(err) = stream.write_all(request.as_bytes()).await {
+        return Err(format!("代理握手失败：{err}"));
+    }
+    let mut buffer = [0u8; 256];
+    let read = match tokio::time::timeout(PROBE_TIMEOUT, stream.read(&mut buffer)).await {
+        Ok(Ok(0)) | Err(_) => return Err("代理握手后无响应".into()),
+        Ok(Ok(size)) => size,
+        Ok(Err(err)) => return Err(format!("代理直接关闭了连接：{err}")),
+    };
+    let head = String::from_utf8_lossy(&buffer[..read]);
+    // 200/2xx 都算隧道建起来了；407 是认证被拒，其余按原始状态报出来。
+    let status = head.split_whitespace().nth(1).unwrap_or("").to_string();
+    if status.starts_with('2') {
+        Ok(start.elapsed().as_millis() as i64)
+    } else if status == "407" {
+        Err("代理拒绝了账号（HTTP 407）".into())
+    } else if status.is_empty() {
+        Err("代理返回了无法识别的响应".into())
+    } else {
+        Err(format!("代理拒绝握手（HTTP {status}）"))
+    }
+}
+
+/// 对 SOCKS5 代理做一次握手，确认它不是「端口开着但不干活」。
+async fn probe_socks5(host: &str, port: u16) -> Result<i64, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let start = Instant::now();
+    let mut stream = connect_timeout(host, port).await?;
+    // 只声明「无认证」一种方法：能协商出方法就说明 socks 服务真的在。
+    if let Err(err) = stream.write_all(&[0x05, 0x01, 0x00]).await {
+        return Err(format!("SOCKS5 握手失败：{err}"));
+    }
+    let mut buffer = [0u8; 2];
+    let read = match tokio::time::timeout(PROBE_TIMEOUT, stream.read(&mut buffer)).await {
+        Ok(Ok(0)) | Err(_) => return Err("SOCKS5 握手无响应".into()),
+        Ok(Ok(size)) => size,
+        Ok(Err(err)) => return Err(format!("SOCKS5 连接被关闭：{err}")),
+    };
+    if read < 2 || buffer[0] != 0x05 {
+        return Err("返回的不是 SOCKS5 响应".into());
+    }
+    if buffer[1] == 0xFF {
+        return Err("SOCKS5 不接受匿名连接".into());
+    }
+    Ok(start.elapsed().as_millis() as i64)
+}
+
+/// 带超时的 TCP 连接，测速里的几种探测都从这里起步。
+async fn connect_timeout(host: &str, port: u16) -> Result<TcpStream, String> {
     if host.is_empty() || port == 0 {
         return Err("节点缺少地址或端口".into());
     }
-    let address = format!("{host}:{port}");
-    let start = Instant::now();
-    let stream = tokio::time::timeout(Duration::from_millis(3000), TcpStream::connect(&address))
+    tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(format!("{host}:{port}")))
         .await
         .map_err(|_| "连接超时".to_string())?
-        .map_err(|err| format!("连接失败：{err}"))?;
-    drop(stream);
-    Ok(start.elapsed().as_millis() as i64)
+        .map_err(|err| format!("连接失败：{err}"))
 }
 
 /// 解析这次要测速的节点下标。
@@ -601,15 +721,16 @@ pub async fn run_node_tests(shared: Shared, indices: Vec<usize>) {
     const MAX_PARALLEL: usize = 16;
 
     // 先把目标快照出来，避免整个测速期间反复持有状态锁。
-    let targets: Vec<(String, String, u16)> = {
+    let targets: Vec<TestTarget> = {
         let state = shared.lock().await;
         indices
             .iter()
             .filter_map(|index| {
-                state.config.imported_nodes.get(*index).map(|node| {
-                    let (host, port) = node_endpoint(node);
-                    (node.name(), host, port)
-                })
+                state
+                    .config
+                    .imported_nodes
+                    .get(*index)
+                    .map(test_target)
             })
             .collect()
     };
@@ -636,8 +757,17 @@ pub async fn run_node_tests(shared: Shared, indices: Vec<usize>) {
 }
 
 /// 单个节点的测速任务，独立成函数是为了能丢进 `JoinSet` 并发跑。
-async fn measure_node((name, host, port): (String, String, u16)) -> (String, NodeDelay) {
-    let delay = match measure_delay(&host, port).await {
+async fn measure_node(target: TestTarget) -> (String, NodeDelay) {
+    let outcome = match target.protocol.to_lowercase().as_str() {
+        // 「端口开着」不等于「能代理」：这两类必须走完真实握手才算通过。
+        "http" | "https" => {
+            probe_http_connect(&target.host, target.port, &target.username, &target.password).await
+        }
+        "socks5" | "socks" => probe_socks5(&target.host, target.port).await,
+        // 加密协议本机没有密钥，握不了手，只能确认端口可达。
+        _ => measure_delay(&target.host, target.port).await,
+    };
+    let delay = match outcome {
         Ok(delay) => NodeDelay {
             status: "ok".into(),
             delay: Some(delay),
@@ -649,7 +779,7 @@ async fn measure_node((name, host, port): (String, String, u16)) -> (String, Nod
             message: error,
         },
     };
-    (name, delay)
+    (target.name, delay)
 }
 
 /// 常用海外站点规则组在 `rules` 中的下标。
