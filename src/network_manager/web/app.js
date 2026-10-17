@@ -690,7 +690,7 @@ function renderNodes() {
             <button class="mini-button danger" data-node-delete="${node.index}" title="删除节点" aria-label="删除节点">${icon("trash-2")}</button>
           </div>
         </div>
-        <div class="node-card-meta"><span class="node-badge">${escapeHtml(node.protocol)}</span>${node.region ? `<span class="node-badge region">${escapeHtml(node.region)}</span>` : ""}${node.isRelay ? `<span class="node-badge chain" title="当前作为统一中转使用">${icon("link")}中转</span>` : ""}</div>
+        <div class="node-card-meta"><span class="node-badge">${escapeHtml(node.protocol)}</span>${node.region ? `<span class="node-badge region">${escapeHtml(node.region)}</span>` : ""}${node.isRelay ? `<span class="node-badge chain" title="当前作为统一中转使用">${icon("link")}中转</span>` : ""}${node.viaRelay ? `<span class="node-badge chain is-via" title="该节点的连接与测速都会先经过统一中转">${icon("link")}经中转</span>` : ""}</div>
         <div class="node-card-foot">
           <span title="${escapeHtml(node.source)}">${escapeHtml(node.source || "手动导入")}</span>
           <span title="${escapeHtml(node.server)}">${escapeHtml(node.server)}</span>

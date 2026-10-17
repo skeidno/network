@@ -603,6 +603,9 @@ td.actions { text-align: right; overflow: visible; }
 .node-badge.region { color: var(--green-text); border-color: var(--green-line); background: var(--green-soft); text-transform: none; }
 .node-badge.chain { max-width: 55%; gap: 4px; overflow: hidden; color: var(--amber-text); border-color: var(--amber-line); background: var(--amber-soft); text-overflow: ellipsis; text-transform: none; white-space: nowrap; }
 .node-badge.chain .icon { width: 11px; height: 11px; flex: 0 0 auto; }
+/* 「经中转」是常态（除了中转自己、本机端口节点，其余都走中转），
+   不该跟「中转」这个身份标识抢眼，用中性色区分一下。 */
+.node-badge.chain.is-via { color: var(--text-3); border-color: var(--line); background: var(--surface-2); }
 .node-card-actions .mini-button.active { color: var(--amber-text); border-color: var(--amber-line); background: var(--amber-soft); }
 .node-badge.selected { color: var(--blue-text); border-color: var(--blue); background: var(--blue-soft); }
 .node-card-foot { display: flex; justify-content: space-between; gap: 12px; color: var(--text-3); font-size: 10px; }

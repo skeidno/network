@@ -36,8 +36,31 @@ const RULE_LABELS: &[(&str, &str)] = &[
     ("PROXY-ENDPOINT", "代理域名前置"),
 ];
 
-fn label(table: &[(&str, &str)], key: &str) -> String {
-    table
+/// 字节数转成人看的单位。界面上的「↑ 0.00 / ↓ 0.00」要的是数值和单位分开的文本
+/// （`12.3 KB/s`），所以这里只负责拼成「数值 + 空格 + 单位」。
+fn format_bytes(value: f64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut amount = value.max(0.0);
+    let mut index = 0;
+    while amount >= 1024.0 && index < UNITS.len() - 1 {
+        amount /= 1024.0;
+        index += 1;
+    }
+    let precision = if index == 0 || amount >= 100.0 {
+        0
+    } else if amount >= 10.0 {
+        1
+    } else {
+        2
+    };
+    format!("{amount:.precision$} {}", UNITS[index])
+}
+
+fn format_rate(bytes_per_second: f64) -> String {
+    format!("{}/s", format_bytes(bytes_per_second))
+}
+
+fn label(table: &[(&str, &str)], key: &str) -> String {    table
         .iter()
         .find(|(name, _)| *name == key)
         .map(|(_, text)| (*text).to_string())
@@ -181,6 +204,8 @@ fn running_process_names() -> Vec<String> {
 }
 
 pub fn build(state: &mut AppState) -> Value {
+    // 拉状态时顺手采一次流量：界面就是靠这一路把速度、累计和曲线刷出来的。
+    state.sample_traffic();
     let config = &state.config;
     let running = state.core.is_running();
     let busy = state.busy;
@@ -207,6 +232,8 @@ pub fn build(state: &mut AppState) -> Value {
         })
         .collect();
 
+    let relay_active = crate::mihomo::relay_is_active(config);
+
     let nodes: Vec<Value> = config
         .imported_nodes
         .iter()
@@ -229,6 +256,11 @@ pub fn build(state: &mut AppState) -> Value {
                     message: String::new(),
                 });
             let is_server_deployment = node.source_id.starts_with("server-deployment:");
+            // 这个节点的连接（包括测速）是不是要绕一遍中转：
+            // 中转自己不用绕，server 落在本机的节点也不绕（远端中转连不到我们本机）。
+            let via_relay = relay_active
+                && node.name() != config.relay_node
+                && !crate::mihomo::is_loopback_server(&server);
             let region = server_regions
                 .iter()
                 .find(|(source_id, _)| *source_id == node.source_id)
@@ -253,6 +285,7 @@ pub fn build(state: &mut AppState) -> Value {
                 // 中转现在整份配置只有一个，挂在节点上的是哪个已经没有意义，
                 // 但先留着这两个键，免得前端读 undefined 崩。
                 "isRelay": node.name() == config.relay_node && config.relay_enabled,
+                "viaRelay": via_relay,
             })
         })
         .collect();
@@ -393,13 +426,13 @@ pub fn build(state: &mut AppState) -> Value {
         },
         "traffic": {
             "status": if running { "实时更新" } else { "接管停止" },
-            "downloadRate": "0 B/s",
-            "uploadRate": "0 B/s",
-            "downloadTotal": "0 B",
-            "uploadTotal": "0 B",
-            "connections": "0",
-            "downloadSamples": vec![0.0f64; 60],
-            "uploadSamples": vec![0.0f64; 60],
+            "downloadRate": format_rate(state.traffic_download_rate),
+            "uploadRate": format_rate(state.traffic_upload_rate),
+            "downloadTotal": format_bytes(state.traffic_download_total as f64),
+            "uploadTotal": format_bytes(state.traffic_upload_total as f64),
+            "connections": state.traffic_connections.to_string(),
+            "downloadSamples": state.traffic_download_samples,
+            "uploadSamples": state.traffic_upload_samples,
             "memoryMb": memory_mb().round() as i64,
         },
         "exitIp": state.exit_ip,

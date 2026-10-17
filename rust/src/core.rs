@@ -13,11 +13,76 @@ use crate::mihomo::render_yaml;
 use crate::models::AppConfig;
 use crate::paths::{core_binary, core_log_path, generated_config_path};
 
+/// 界面上那条曲线是「最近 60 秒」，采样窗口就得对上。
+const TRAFFIC_WINDOW: usize = 60;
+/// 推进一格曲线所需的最小间隔。界面每秒来拉一次状态，间隔会抖；
+/// 不设这道闸，同一个计数会被切成忽长忽短的格子，曲线抖成锯齿。
+const TRAFFIC_STEP: Duration = Duration::from_millis(900);
+
 #[derive(Debug, Clone)]
 pub struct NodeDelay {
     pub status: String,
     pub delay: Option<i64>,
     pub message: String,
+}
+
+/// 内核累计流量快照（mihomo `/connections` 的汇总字段）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrafficSnapshot {
+    pub download: u64,
+    pub upload: u64,
+    pub connections: u32,
+}
+
+fn push_traffic_sample(samples: &mut Vec<f64>, value: f64) {
+    if samples.len() >= TRAFFIC_WINDOW {
+        samples.remove(0);
+    }
+    samples.push(value);
+}
+
+/// 把内核返回的 HTTP 响应体读出来。
+///
+/// mihomo 的接口既可能给 Content-Length，也可能走 chunked；只按其中一种读，
+/// 另一种就会解析失败，看着像「接口不返回东西」。
+fn read_http_body(mut stream: std::net::TcpStream) -> Result<String, String> {
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|err| format!("读取内核响应失败：{err}"))?;
+    let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Err("内核响应不完整".into());
+    };
+    let head = String::from_utf8_lossy(&raw[..split]).to_lowercase();
+    if !head.starts_with("http/1.1 200") && !head.starts_with("http/1.0 200") {
+        let status = head.lines().next().unwrap_or("").trim().to_string();
+        return Err(format!("内核拒绝请求：{status}"));
+    }
+    let body = &raw[split + 4..];
+    if head.contains("transfer-encoding: chunked") {
+        return decode_chunked(body);
+    }
+    Ok(String::from_utf8_lossy(body).into_owned())
+}
+
+fn decode_chunked(mut body: &[u8]) -> Result<String, String> {
+    let mut out = Vec::new();
+    loop {
+        let Some(line_end) = body.windows(2).position(|window| window == b"\r\n") else {
+            break;
+        };
+        let size_line = String::from_utf8_lossy(&body[..line_end]);
+        let size_text = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_text, 16)
+            .map_err(|_| "内核响应分块长度非法".to_string())?;
+        body = &body[line_end + 2..];
+        if size == 0 || body.len() < size {
+            break;
+        }
+        out.extend_from_slice(&body[..size]);
+        body = &body[(size + 2).min(body.len())..];
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// 服务器代理的部署/检查进度。
@@ -232,6 +297,57 @@ impl CoreProcess {
             && TcpStream::connect(format!("127.0.0.1:{}", config.controller_port)).is_ok()
     }
 
+    /// 读内核的累计流量与连接数。
+    ///
+    /// 流量只有内核自己知道：它按连接记 uploads / downloads 累计，我们在外面
+    /// 既看不到每条连接，也不该自己去抓包，只能问它。之前界面上的速率和曲线
+    /// 是写死的 0，看着就像「图表没了」。
+    pub fn traffic(&self, config: &AppConfig) -> Result<TrafficSnapshot, String> {
+        let body = self.controller_get(config, "/connections")?;
+        let value: Value =
+            serde_json::from_str(&body).map_err(|err| format!("内核流量数据无法解析：{err}"))?;
+        Ok(TrafficSnapshot {
+            download: value
+                .get("downloadTotal")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            upload: value.get("uploadTotal").and_then(Value::as_u64).unwrap_or(0),
+            connections: value
+                .get("connections")
+                .and_then(Value::as_array)
+                .map(|list| list.len() as u32)
+                .unwrap_or(0),
+        })
+    }
+
+    /// 向内核控制接口发一个 GET，返回响应体。
+    fn controller_get(&self, config: &AppConfig, path: &str) -> Result<String, String> {
+        use std::io::Write;
+        use std::net::TcpStream;
+
+        if self.child.is_none() {
+            return Err("内核没在运行".into());
+        }
+        let address = format!("127.0.0.1:{}", config.controller_port);
+        let mut stream = TcpStream::connect(&address)
+            .map_err(|err| format!("连不上内核控制接口 {address}：{err}"))?;
+        // 状态页每秒都会问一次，问不通就得赶紧返回，不能把整页渲染拖住。
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        let request = format!(
+            "GET {path} HTTP/1.1\r\n\
+             Host: {address}\r\n\
+             Authorization: Bearer {secret}\r\n\
+             Accept: application/json\r\n\
+             Connection: close\r\n\r\n",
+            secret = config.controller_secret,
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|err| format!("发送内核请求失败：{err}"))?;
+        read_http_body(stream)
+    }
+
     /// 本次内核启动之后写进日志的新内容。
     fn log_since_start(&self) -> String {
         let path = core_log_path();
@@ -368,6 +484,16 @@ pub struct AppState {
     pub headless: bool,
     /// 上次套用到内核的配置快照，用来判断这次是不是真的变了。
     pub applied_snapshot: String,
+    /// 上回读到的内核累计流量与时刻，用来算瞬时速率。
+    pub traffic_mark: Option<(Instant, u64, u64)>,
+    pub traffic_download_rate: f64,
+    pub traffic_upload_rate: f64,
+    pub traffic_download_total: u64,
+    pub traffic_upload_total: u64,
+    pub traffic_connections: u32,
+    /// 最近 60 个采样点（字节/秒），界面直接当曲线数据用。
+    pub traffic_download_samples: Vec<f64>,
+    pub traffic_upload_samples: Vec<f64>,
     pub exit_ip: String,
     pub exit_ip_location: String,
     pub local_ip: String,
@@ -390,6 +516,14 @@ impl AppState {
             importing: false,
             headless: false,
             applied_snapshot: String::new(),
+            traffic_mark: None,
+            traffic_download_rate: 0.0,
+            traffic_upload_rate: 0.0,
+            traffic_download_total: 0,
+            traffic_upload_total: 0,
+            traffic_connections: 0,
+            traffic_download_samples: vec![0.0; TRAFFIC_WINDOW],
+            traffic_upload_samples: vec![0.0; TRAFFIC_WINDOW],
             exit_ip: "尚未检测".into(),
             exit_ip_location: String::new(),
             local_ip: "尚未检测".into(),
@@ -403,6 +537,45 @@ impl AppState {
         if self.toasts.len() > 40 {
             self.toasts.remove(0);
         }
+    }
+
+    /// 采一次内核流量，顺便推进那一格曲线。
+    ///
+    /// 计数只有内核知道，所以每次都是问它要累计值，再由我们两次差分出速率：
+    /// 这样即使某次状态没拉到，下一格也只是变长一点，不会凭空少一段流量。
+    pub fn sample_traffic(&mut self) {
+        if !self.core.is_running() {
+            self.traffic_mark = None;
+            self.traffic_download_rate = 0.0;
+            self.traffic_upload_rate = 0.0;
+            self.traffic_connections = 0;
+            return;
+        }
+        let Ok(snapshot) = self.core.traffic(&self.config) else {
+            return;
+        };
+        self.traffic_download_total = snapshot.download;
+        self.traffic_upload_total = snapshot.upload;
+        self.traffic_connections = snapshot.connections;
+
+        let now = Instant::now();
+        let Some((last_at, last_down, last_up)) = self.traffic_mark else {
+            self.traffic_mark = Some((now, snapshot.download, snapshot.upload));
+            return;
+        };
+        let elapsed = now.duration_since(last_at);
+        if elapsed < TRAFFIC_STEP {
+            return;
+        }
+        let seconds = elapsed.as_secs_f64().max(0.1);
+        // 内核重启会把计数清零，减上一次会得到负数，用饱和减法当 0 处理。
+        let download = snapshot.download.saturating_sub(last_down) as f64 / seconds;
+        let upload = snapshot.upload.saturating_sub(last_up) as f64 / seconds;
+        self.traffic_mark = Some((now, snapshot.download, snapshot.upload));
+        self.traffic_download_rate = download;
+        self.traffic_upload_rate = upload;
+        push_traffic_sample(&mut self.traffic_download_samples, download);
+        push_traffic_sample(&mut self.traffic_upload_samples, upload);
     }
 
     pub fn apply_config(&mut self) -> Result<(), String> {
