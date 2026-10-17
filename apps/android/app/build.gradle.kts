@@ -15,7 +15,7 @@ if (signingPropertiesFile.isFile) {
 // The release pipeline pins the version so the APK metadata, the Windows
 // installer, the Linux tarballs and the git tag all carry the same X.Y.Z.
 // Local builds fall back to the values below.
-val appVersionName = (project.findProperty("appVersionName") as String?) ?: "0.6.16"
+val appVersionName = (project.findProperty("appVersionName") as String?) ?: "0.6.17"
 val appVersionCode = ((project.findProperty("appVersionCode") as String?) ?: "9").toInt()
 
 android {
