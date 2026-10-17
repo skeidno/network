@@ -481,11 +481,16 @@ class AppRepository private constructor(private val context: Context) {
     @Volatile
     private var probePort: Int = 0
 
+    /** 内核控制接口当前监听的端口，0 表示没开（没有节点或没分配成功）。 */
+    @Volatile
+    private var clashApiPort: Int = 0
+
     fun writeRuntimeConfig(): File {
         val state = mutableState.value
         // 每次生成配置时重新挑一个空闲端口：sing-box 碰到端口占用会直接启动失败，
         // 而 App 挑完端口立刻就用它发请求，不存在「配置里写的」和「实际监听的」不一致的问题。
         probePort = if (state.nodes.isEmpty()) 0 else allocateLoopbackPort()
+        clashApiPort = if (state.nodes.isEmpty()) 0 else allocateLoopbackPort()
         val localProxyPort = if (state.localProxyEnabled) {
             resolveLocalProxyPort(state.localProxyPort, probePort)
         } else {
@@ -494,7 +499,7 @@ class AppRepository private constructor(private val context: Context) {
         val file = runtimeConfigFile()
         val temporary = File(file.parentFile, "runtime.tmp")
         temporary.writeText(
-            SingBoxConfigBuilder.build(state, probePort, localProxyPort),
+            SingBoxConfigBuilder.build(state, probePort, localProxyPort, clashApiPort),
             Charsets.UTF_8,
         )
         if (!temporary.renameTo(file)) {
@@ -733,7 +738,25 @@ class AppRepository private constructor(private val context: Context) {
         }
     }
 
+    /**
+     * 测一个节点到底能不能用。
+     *
+     * 内核在跑就一定要问内核：它的延迟测试是真的发一个 HTTP 请求走完整链路
+     * （建隧道 → 认证 → 取回响应）。本机自己连只能做到 TCP 握手，中间差着
+     * 「账号被拒」「对端 reset」「节点根本不转发」这一整段 —— 用户看到的
+     * 「批量测试全通还很快，一用就废」就是这么差出来的。
+     *
+     * 内核没接管时才退回握手：那时候没有链路可问，握手至少能看出端口开没开。
+     */
     private fun testEndpoint(node: ProxyNode): ProxyNode {
+        if (mutableState.value.running) {
+            val delay = runCatching { requestCoreDelay(node.id) }.getOrNull()
+            return if (delay == null) {
+                node.copy(latencyMs = null, latencyStatus = LatencyStatus.Error)
+            } else {
+                node.copy(latencyMs = delay, latencyStatus = LatencyStatus.Available)
+            }
+        }
         val started = System.nanoTime()
         return try {
             Socket().use { socket -> socket.connect(InetSocketAddress(node.server, node.port), 4_000) }
@@ -743,6 +766,35 @@ class AppRepository private constructor(private val context: Context) {
             )
         } catch (_: Exception) {
             node.copy(latencyMs = null, latencyStatus = LatencyStatus.Error)
+        }
+    }
+
+    /** 借内核的延迟测试：它走的是节点自己的完整链路（含 detour 中转链）。 */
+    private fun requestCoreDelay(outboundTag: String): Int? {
+        val port = clashApiPort
+        if (port <= 0) return null
+        val target = java.net.URLEncoder.encode(
+            "http://www.gstatic.com/generate_204",
+            Charsets.UTF_8.name(),
+        )
+        val tag = java.net.URLEncoder.encode(outboundTag, Charsets.UTF_8.name())
+        val connection = URL(
+            "http://127.0.0.1:$port/proxies/$tag/delay?url=$target&timeout=5000",
+        ).openConnection(Proxy.NO_PROXY) as HttpURLConnection
+        return try {
+            connection.requestMethod = "GET"
+            connection.setRequestProperty(
+                "Authorization",
+                "Bearer ${SingBoxConfigBuilder.CLASH_API_SECRET}",
+            )
+            connection.connectTimeout = 6_000
+            connection.readTimeout = 6_000
+            val code = connection.responseCode
+            if (code !in 200..299) return null
+            val body = connection.inputStream.bufferedReader().readText()
+            JSONObject(body).optInt("delay", -1).takeIf { it >= 0 }
+        } finally {
+            connection.disconnect()
         }
     }
 

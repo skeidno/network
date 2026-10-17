@@ -33,6 +33,14 @@ object SingBoxConfigBuilder {
      */
     internal const val localDnsServerTag = "local-dns"
 
+    /**
+     * 内核控制接口（experimental.clash_api）的口令。
+     *
+     * 这个接口只用来让 App 问内核要节点真实延迟，只听 127.0.0.1，外部访问不到。
+     * 但既然开了，就别裸奔 —— 请求带 Bearer，别的应用拿到端口也问不出东西。
+     */
+    const val CLASH_API_SECRET = "network-manager-local"
+
     // 工具箱的「规则命中预判」要按同一份局域网定义来判定，所以这里是 internal
     // 而不是 private —— 两处各写一份迟早会走偏。
     internal val lanDomainSuffixes = listOf("lan", "local", "home.arpa")
@@ -53,7 +61,12 @@ object SingBoxConfigBuilder {
         "ff00::/8",
     )
 
-    fun build(state: AppState, probePort: Int = 0, localProxyPort: Int = 0): String {
+    fun build(
+        state: AppState,
+        probePort: Int = 0,
+        localProxyPort: Int = 0,
+        clashApiPort: Int = 0,
+    ): String {
         val selected = state.nodes.firstOrNull { it.id == state.selectedNodeId }
             ?: state.nodes.firstOrNull()
         val orderedNodes = state.nodes.sortedByDescending { it.id == selected?.id }
@@ -263,7 +276,10 @@ object SingBoxConfigBuilder {
             )
         }
 
-        return JSONObject()
+        // 节点测速要问内核：本机只能握到 TCP 握手那一层，中间差着「认证被拒」
+        // 「对端 reset」「节点根本不转发」这一整段，测出来全通一用就废。
+        // 开了这个接口才能用 /proxies/{节点}/delay 让内核真的发一次请求。
+        val root = JSONObject()
             .put("log", JSONObject().put("level", "info").put("timestamp", true))
             .put(
                 "dns",
@@ -283,7 +299,19 @@ object SingBoxConfigBuilder {
                     .put("default_domain_resolver", "local")
                     .put("auto_detect_interface", true),
             )
-            .toString(2)
+        // 只听回环，外部访问不到；测速用完即走，不对外提供任何入口。
+        if (clashApiPort > 0) {
+            root.put(
+                "experimental",
+                JSONObject().put(
+                    "clash_api",
+                    JSONObject()
+                        .put("external_controller", "127.0.0.1:$clashApiPort")
+                        .put("secret", CLASH_API_SECRET),
+                ),
+            )
+        }
+        return root.toString(2)
     }
 
     private fun toRouteRule(rule: PortableRule, hasProxy: Boolean): JSONObject? {

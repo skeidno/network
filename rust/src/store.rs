@@ -87,7 +87,32 @@ fn migrate(config: &mut AppConfig, stored_version: i64) -> bool {
     if stored_version < 14 {
         changed = append_china_group(config) || changed;
     }
+    if stored_version < 15 {
+        changed = prune_builtin_groups(config) || changed;
+    }
     changed
+}
+
+/// 让内置组和用户看到的清单对齐：只留当前清单里还存在的域名。
+///
+/// 清单精简过一轮（只收常用站点，偏僻的不要）。但组里每条规则是写进配置文件的
+/// 真实条目，光把常量改小，老配置里那一批偏僻域名照样在 —— 界面上还是几百条。
+/// 这里按当前清单收一遍，只动两个内置组的成员，用户自己加的普通规则一概不碰。
+///
+/// 同理，用户往组里手加过的自定义域名也会被收掉：组本来就是内置清单的镜像，
+/// 真有需要加的规则请走普通规则（或者用弹窗里的「恢复默认」把清单整组拿回来）。
+fn prune_builtin_groups(config: &mut AppConfig) -> bool {
+    let before = config.rules.len();
+    config.rules.retain(|rule| match rule.group.as_str() {
+        COMMON_CHINA_GROUP => DEFAULT_DIRECT_DOMAINS
+            .iter()
+            .any(|(domain, _)| *domain == rule.value),
+        COMMON_OVERSEAS_GROUP => DEFAULT_PROXY_DOMAINS
+            .iter()
+            .any(|(domain, _)| *domain == rule.value),
+        _ => true,
+    });
+    config.rules.len() != before
 }
 
 /// 给老配置补一组「常用国内站点」直连规则。
@@ -343,6 +368,68 @@ mod tests {
         config.rules = default_routing_rules();
         assert!(!append_china_group(&mut config));
         assert_eq!(config.rules.len(), default_routing_rules().len());
+    }
+
+    #[test]
+    fn prunes_domains_dropped_from_the_builtin_lists() {
+        let mut config = AppConfig::default();
+        config.rules = vec![
+            RoutingRule {
+                rule_type: "DOMAIN-SUFFIX".into(),
+                value: "baidu.com".into(),
+                target: "DIRECT".into(),
+                enabled: true,
+                note: "百度".into(),
+                group: COMMON_CHINA_GROUP.into(),
+            },
+            RoutingRule {
+                rule_type: "DOMAIN-SUFFIX".into(),
+                value: "lianjia.com".into(),
+                target: "DIRECT".into(),
+                enabled: true,
+                note: "链家".into(),
+                group: COMMON_CHINA_GROUP.into(),
+            },
+            RoutingRule {
+                rule_type: "DOMAIN-SUFFIX".into(),
+                value: "discord.com".into(),
+                target: "CLASH".into(),
+                enabled: true,
+                note: "Discord".into(),
+                group: COMMON_OVERSEAS_GROUP.into(),
+            },
+            RoutingRule {
+                rule_type: "DOMAIN-SUFFIX".into(),
+                value: "iherb.com".into(),
+                target: "CLASH".into(),
+                enabled: true,
+                note: "iHerb".into(),
+                group: COMMON_OVERSEAS_GROUP.into(),
+            },
+        ];
+        assert!(prune_builtin_groups(&mut config));
+        let left: Vec<&str> = config.rules.iter().map(|rule| rule.value.as_str()).collect();
+        assert_eq!(left, vec!["baidu.com", "discord.com"]);
+    }
+
+    #[test]
+    fn pruning_never_touches_custom_rules() {
+        let mut config = AppConfig::default();
+        config.rules = vec![
+            RoutingRule {
+                value: "example.com".into(),
+                ..Default::default()
+            },
+            RoutingRule {
+                rule_type: "IP-CIDR".into(),
+                value: "43.130.30.0/24".into(),
+                target: "DIRECT".into(),
+                note: "微信长连接".into(),
+                ..Default::default()
+            },
+        ];
+        assert!(!prune_builtin_groups(&mut config));
+        assert_eq!(config.rules.len(), 2);
     }
 
     #[test]
