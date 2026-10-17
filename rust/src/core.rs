@@ -175,6 +175,63 @@ impl CoreProcess {
         Ok(())
     }
 
+    /// 通知运行中的内核重新读一遍配置文件。
+    ///
+    /// 内核只在启动时读配置，之后并不监听文件变化。切节点时配置文件改了、
+    /// 界面也显示选中了，实际生效的还是旧节点，表现就是「换到日本节点，
+    /// 出口 IP 还是美国的」。这里直接打它自己的 controller 接口触发重载：
+    /// 比重启内核轻，也不会断流。
+    pub fn reload(&self, config: &AppConfig) -> Result<(), String> {
+        use std::io::Write;
+        use std::net::TcpStream;
+
+        let address = format!("127.0.0.1:{}", config.controller_port);
+        let mut stream = TcpStream::connect(&address)
+            .map_err(|err| format!("连不上内核控制接口 {address}：{err}"))?;
+        // 重载要重建全部出站，节点多时可能要几秒；不能让调用方无限等。
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(8)));
+
+        let body = json!({ "path": generated_config_path().to_string_lossy() }).to_string();
+        let request = format!(
+            "PUT /configs?force=true HTTP/1.1\r\n\
+             Host: {address}\r\n\
+             Authorization: Bearer {secret}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {length}\r\n\
+             Connection: close\r\n\r\n{body}",
+            secret = config.controller_secret,
+            length = body.len(),
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|err| format!("发送重载请求失败：{err}"))?;
+
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+        let text = String::from_utf8_lossy(&response);
+        let status = text.lines().next().unwrap_or("").trim().to_string();
+        if status.contains(" 204") || status.contains(" 200") {
+            Ok(())
+        } else if status.is_empty() {
+            Err("内核没有回应重载请求".into())
+        } else {
+            Err(format!("内核拒绝了重载：{status}"))
+        }
+    }
+
+    /// 混合端口和控制端口是否还在监听。
+    ///
+    /// 光看进程活着看不出这个：mihomo 热重载配置时 `listeners` 段会整体丢掉，
+    /// 重载完 TUN 还在转发、日志也照常打，但 mixed-port 和 external-controller
+    /// 全没了——本地代理用不了，控制接口也调不动。必须真的连一下才知道。
+    pub fn listeners_alive(&self, config: &AppConfig) -> bool {
+        use std::net::TcpStream;
+        self.child.is_some()
+            && TcpStream::connect(format!("127.0.0.1:{}", config.mixed_port)).is_ok()
+            && TcpStream::connect(format!("127.0.0.1:{}", config.controller_port)).is_ok()
+    }
+
     /// 本次内核启动之后写进日志的新内容。
     fn log_since_start(&self) -> String {
         let path = core_log_path();
@@ -309,6 +366,8 @@ pub struct AppState {
     pub busy: bool,
     pub importing: bool,
     pub headless: bool,
+    /// 上次套用到内核的配置快照，用来判断这次是不是真的变了。
+    pub applied_snapshot: String,
     pub exit_ip: String,
     pub exit_ip_location: String,
     pub local_ip: String,
@@ -330,6 +389,7 @@ impl AppState {
             busy: false,
             importing: false,
             headless: false,
+            applied_snapshot: String::new(),
             exit_ip: "尚未检测".into(),
             exit_ip_location: String::new(),
             local_ip: "尚未检测".into(),
@@ -347,8 +407,28 @@ impl AppState {
 
     pub fn apply_config(&mut self) -> Result<(), String> {
         crate::store::save(&self.config);
-        if self.core.is_running() {
+        // 只有配置真的变了才去动内核。存盘/巡检这类周期性调用配置是一样的，
+        // 不设这道闸就会每隔一两分钟把内核重启一次 —— 每次重启 TUN 都要重建，
+        // 路由表跟着抖，表现就是「接管一会儿有一会儿没有」。
+        let snapshot = serde_json::to_string(&self.config).unwrap_or_default();
+        let unchanged = !snapshot.is_empty() && snapshot == self.applied_snapshot;
+        self.applied_snapshot = snapshot;
+        if self.core.is_running() && !unchanged {
             self.core.write_config(&self.config)?;
+            // 光把新配置写到磁盘，内核是不知道的：它只在启动时读一次，之后
+            // 并不监听文件变化。少了这一步，「切换节点」就变成只有界面和配置
+            // 文件变了，实际跑的还是旧节点——换到日本、出口还是美国。
+            let reloaded = self.core.reload(&self.config).is_ok();
+            // 重载完还要确认监听端口没丢：mihomo 的 listeners 不支持热重载，
+            // 重载后 TUN 照常转发、日志照常打，但两个端口都没了。这时候只剩
+            // 重启能把它们带回来。
+            if !reloaded || !self.core.listeners_alive(&self.config) {
+                eprintln!("内核热重载不可用，改为重启内核以套用新配置");
+                let _ = self.core.stop();
+                // 立刻重启会撞上还没释放干净的端口和网卡。
+                std::thread::sleep(Duration::from_millis(1200));
+                self.core.start(&self.config)?;
+            }
         }
         Ok(())
     }
