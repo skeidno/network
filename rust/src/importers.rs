@@ -285,6 +285,73 @@ pub fn parse_share_link(link: &str) -> Result<Value, String> {
     Err(format!("暂不支持的链接类型：{}", &trimmed[..trimmed.len().min(12)]))
 }
 
+/// 主机名或 IP 字面量的合法性检查：IP 直接放行，域名按 DNS 标签规则校验。
+fn valid_proxy_host(host: &str) -> bool {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    let trimmed = host.trim_end_matches('.');
+    !trimmed.is_empty()
+        && trimmed.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && label.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && label.ends_with(|c: char| c.is_ascii_alphanumeric())
+        })
+}
+
+/// 解析 `主机:端口:用户名:密码`，生成一条带认证的 HTTP 代理节点。
+///
+/// 机场/代理商家常按「一行一个」发这种纯文本条目。界面上的导入提示一直写着支持，
+/// 但 Python 版的 `parse_authenticated_proxy_line` 在迁到 Rust 时漏掉了，只剩提示文案。
+///
+/// 密码允许包含冒号（取第三个冒号之后的全部内容），但不允许空白字符。
+pub fn parse_authenticated_proxy_line(line: &str) -> Result<Value, String> {
+    let text = line.trim();
+    let invalid = || "代理 IP 格式应为 主机:端口:用户名:密码".to_string();
+    if text.is_empty() {
+        return Err(invalid());
+    }
+    // 主机可能是方括号包起来的 IPv6（`[fd00::1]:8080:user:pass`），方括号内允许冒号。
+    let (host, rest) = if let Some(inner) = text.strip_prefix('[') {
+        let end = inner.find(']').ok_or_else(invalid)?;
+        let rest = inner[end + 1..].strip_prefix(':').ok_or_else(invalid)?;
+        (&inner[..end], rest)
+    } else {
+        text.split_once(':').ok_or_else(invalid)?
+    };
+    let (port_text, rest) = rest.split_once(':').ok_or_else(invalid)?;
+    let (username, password) = rest.split_once(':').ok_or_else(invalid)?;
+
+    if host.is_empty() || host.chars().any(char::is_whitespace) || !valid_proxy_host(host) {
+        return Err("代理 IP 的主机名或 IP 地址无效".into());
+    }
+    let port: i32 = port_text
+        .parse()
+        .map_err(|_| "代理 IP 的端口必须是数字")?;
+    if !(1..=65535).contains(&port) {
+        return Err("代理 IP 的端口必须在 1 到 65535 之间".into());
+    }
+    if username.is_empty() || username.chars().any(char::is_whitespace) {
+        return Err("代理 IP 的用户名不能为空或包含空白字符".into());
+    }
+    if password.is_empty() || password.chars().any(char::is_whitespace) {
+        return Err("代理 IP 的密码不能为空或包含空白字符".into());
+    }
+    Ok(json!({
+        "name": format!("HTTP Proxy {host}:{port}"),
+        "type": "http",
+        "server": host,
+        "port": port,
+        "username": username,
+        "password": password,
+    }))
+}
+
 fn yaml_proxies(text: &str) -> Vec<Value> {
     let value: Value = match serde_yaml::from_str(text) {
         Ok(value) => value,
@@ -308,12 +375,24 @@ fn unstructured_nodes(text: &str) -> (Vec<Value>, Vec<String>) {
     let mut errors: Vec<String> = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
-        if line.is_empty() {
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        match parse_share_link(line) {
+        if line.contains("://") {
+            match parse_share_link(line) {
+                Ok(node) => nodes.push(node),
+                Err(error) => errors.push(format!("第 {} 个链接：{error}", index + 1)),
+            }
+            continue;
+        }
+        // 只有「像一条代理 IP」的行才当代理解析：至少三个冒号（主机/端口/用户名/密码）。
+        // 不设这道闸，整段 Base64 订阅会被逐行报格式错误，下面的 Base64 兜底就永远走不到。
+        if line.matches(':').count() < 3 {
+            continue;
+        }
+        match parse_authenticated_proxy_line(line) {
             Ok(node) => nodes.push(node),
-            Err(error) => errors.push(format!("第 {} 个链接：{error}", index + 1)),
+            Err(error) => errors.push(format!("第 {} 行代理 IP：{error}", index + 1)),
         }
     }
     (nodes, errors)
@@ -366,5 +445,75 @@ pub fn unique_node_name(base: &str, existing: &[String]) -> String {
             return candidate;
         }
         suffix += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_authenticated_proxy_lines() {
+        // 真实样例：代理商按「一行一个」发的纯文本，界面上一直写着支持这个格式。
+        let text = "163.128.72.103:5774:24A3LUWA16312872103A5774:VXeOGZwy106b\n\
+                    163.128.72.193:7690:24A3LUXA16312872193A7690:X25LE7kCcVDQ";
+        let (nodes, errors) = parse_import_content(text).expect("应该能导入");
+        assert!(errors.is_empty(), "不该有错误：{errors:?}");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0]["type"], "http");
+        assert_eq!(nodes[0]["server"], "163.128.72.103");
+        assert_eq!(nodes[0]["port"], 5774);
+        assert_eq!(nodes[0]["username"], "24A3LUWA16312872103A5774");
+        assert_eq!(nodes[0]["password"], "VXeOGZwy106b");
+        assert_eq!(nodes[0]["name"], "HTTP Proxy 163.128.72.103:5774");
+        assert_eq!(nodes[1]["port"], 7690);
+    }
+
+    #[test]
+    fn proxy_line_accepts_ipv6_and_colons_in_password() {
+        let node = parse_authenticated_proxy_line("[fd00::1]:8080:user:p:a:ss").unwrap();
+        assert_eq!(node["server"], "fd00::1");
+        assert_eq!(node["port"], 8080);
+        assert_eq!(node["password"], "p:a:ss");
+
+        let node = parse_authenticated_proxy_line("proxy.example.com:3128:user:pass").unwrap();
+        assert_eq!(node["server"], "proxy.example.com");
+    }
+
+    #[test]
+    fn proxy_line_rejects_bad_input() {
+        // 端口越界 / 非数字
+        assert!(parse_authenticated_proxy_line("1.2.3.4:0:u:p").is_err());
+        assert!(parse_authenticated_proxy_line("1.2.3.4:70000:u:p").is_err());
+        assert!(parse_authenticated_proxy_line("1.2.3.4:abc:u:p").is_err());
+        // 密码为空或含空白
+        assert!(parse_authenticated_proxy_line("1.2.3.4:80:u:").is_err());
+        assert!(parse_authenticated_proxy_line("1.2.3.4:80:u:p w").is_err());
+        // 少字段
+        assert!(parse_authenticated_proxy_line("1.2.3.4:80:u").is_err());
+        // 主机名不合法
+        assert!(parse_authenticated_proxy_line("bad_host!:80:u:p").is_err());
+    }
+
+    #[test]
+    fn base64_subscription_is_not_eaten_by_proxy_line_parser() {
+        // 整段 Base64 的订阅没有冒号，不能被当成「代理 IP 格式错误」而挡住 Base64 兜底。
+        let encoded = "c3M6Ly9ZV1Z6TFRJMU5pMW5ZMjA2YzJWamNtVjBAMS4yLjMuNDo4Mzg4I2pw";
+        let (nodes, errors) = parse_import_content(encoded).expect("Base64 订阅应该能解");
+        assert!(errors.is_empty(), "不该有错误：{errors:?}");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["type"], "ss");
+        assert_eq!(nodes[0]["server"], "1.2.3.4");
+    }
+
+    #[test]
+    fn mixed_content_keeps_both_links_and_proxy_lines() {
+        let text = "ss://YWVzLTI1Ni1nY206c2VjcmV0@1.2.3.4:8388#jp\n\
+                    163.128.72.103:5774:24A3LUWA16312872103A5774:VXeOGZwy106b";
+        let (nodes, errors) = parse_import_content(text).expect("应该能导入");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0]["type"], "ss");
+        assert_eq!(nodes[1]["type"], "http");
     }
 }
