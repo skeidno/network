@@ -93,21 +93,58 @@ function Ensure-Wintun {
   $archive = Join-Path $VendorDir ($asset + ".tmp")
   $extractDir = Join-Path $VendorDir "wintun-extract.tmp"
   $url = "https://www.wintun.net/builds/$asset"
-  Write-Host "Downloading $url"
   try {
+    # wintun.net 只有单节点，构机器上偶发握手失败。重试几次再放弃，避免一次
+    # 抖动就把整条发布流水线打挂。
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $url -OutFile $archive -UserAgent "NetworkManager-Build" -UseBasicParsing
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+      try {
+        Write-Host "Downloading $url (attempt $attempt/3)"
+        Invoke-WebRequest -Uri $url -OutFile $archive -UserAgent "NetworkManager-Build" -UseBasicParsing
+        $lastError = $null
+        break
+      }
+      catch {
+        $lastError = $_.Exception.Message
+        Write-Host "Download failed: $lastError"
+        if ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) }
+      }
+    }
+    if ($lastError) {
+      Write-Host "ERROR: giving up on $url -- $lastError"
+      throw "Wintun download failed after 3 attempts: $lastError"
+    }
     $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLower()
     if ($actual -ne $expected) {
+      Write-Host "ERROR: Wintun checksum mismatch: expected $expected, got $actual"
       throw "Wintun checksum mismatch: expected $expected, got $actual"
     }
     if (Test-Path -LiteralPath $extractDir) {
       Remove-Item -LiteralPath $extractDir -Recurse -Force
     }
     Expand-Archive -LiteralPath $archive -DestinationPath $extractDir -Force
+    # 元数据里记的是压缩包内的相对路径。上游一旦改打包布局（0.14.1 的实际路径带
+    # `wintun/` 前缀），写死的路径就会找不到文件并让整条流水线失败。这里按叶子名
+    # 兜一层：精确路径缺失时按 amd64 目录里的同名文件找，并把实际内容列进日志。
     $dll = Join-Path $extractDir ($dllEntry -replace '/', '\')
     if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) {
-      throw "Wintun package did not contain $dllEntry"
+      $leaf = Split-Path -Leaf ($dllEntry -replace '/', '\')
+      $found = Get-ChildItem -LiteralPath $extractDir -Recurse -Filter $leaf -File |
+        Where-Object { $_.FullName -match 'amd64' } |
+        Select-Object -First 1
+      if (-not $found) {
+        $found = Get-ChildItem -LiteralPath $extractDir -Recurse -Filter $leaf -File | Select-Object -First 1
+      }
+      if (-not $found) {
+        $listed = (Get-ChildItem -LiteralPath $extractDir -Recurse -File | ForEach-Object {
+            $_.FullName.Substring($extractDir.Length).TrimStart('\', '/')
+          }) -join ", "
+        Write-Host "ERROR: Wintun package did not contain $dllEntry. Entries: $listed"
+        throw "Wintun package did not contain $dllEntry (entries: $listed)"
+      }
+      Write-Host "Wintun dll path fell back to $($found.FullName)"
+      $dll = $found.FullName
     }
     Copy-Item -LiteralPath $dll -Destination $target -Force
     $license = Join-Path $extractDir ($licenseEntry -replace '/', '\')
