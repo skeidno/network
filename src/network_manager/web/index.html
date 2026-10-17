@@ -313,12 +313,12 @@
             <section class="panel settings-section">
               <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/link.svg')"></span></div><div><h2>统一中转</h2><p>所有出站先经过它，再连真正的节点</p></div></div>
               <div class="switch-list">
-                <label class="switch-row"><span><strong>启用统一中转</strong><small>开启后，程序里的每一条连接（<b>节点测速也算</b>）都先走中转，再由中转去连真正的节点。</small></span><input id="setting-relay-enabled" type="checkbox"><i></i></label>
+                <label class="switch-row"><span><strong>启用统一中转</strong><small>开启后，程序里的每一条连接（<b>节点测速也算</b>）都先走中转，再由中转去连真正的节点。<br>把别的代理软件当上游也可以：导入它留在本机的端口（<code>127.0.0.1:7897</code>），它会被自动识别成「本机端口」节点。</small></span><input id="setting-relay-enabled" type="checkbox"><i></i></label>
               </div>
               <div class="form-grid two">
                 <label class="relay-node-field"><span>中转节点</span><select id="setting-relay-node"><option value="">未选择</option></select><small id="setting-relay-hint">未启用，节点全部直接连接。</small></label>
               </div>
-              <p class="settings-note">本地直连某些节点会被掐、被限或干脆连不上，但中转那台机器能连上 —— 中转通常就是自己买的服务器或 ISP。它<b>只有这一个</b>，不用逐个节点去配：开启后所有节点自动挂上<b>代理链</b>（内核的 <code>dialer-proxy</code>），中转自己除外，否则会无限套娃。本程序、浏览器、以及挂本地代理端口跑的代码，走的都是同一条链路，不会出现「测速通但用不了」这种两套结果。<b>中转节点本身仍然可以当普通节点用</b>，只是不再经过任何前置。</p>
+              <p class="settings-note">本地直连某些节点会被掐、被限或干脆连不上，但中转那台机器能连上 —— 中转通常就是自己买的服务器或 ISP。它<b>只有这一个</b>，不用逐个节点去配：开启后所有节点自动挂上<b>代理链</b>（内核的 <code>dialer-proxy</code>），中转自己除外，否则会无限套娃。<b>指向本机回环的节点（另一个客户端的端口）也不走中转</b> —— 那台远端机器去连的会是它自己身上的 127.0.0.1，必然连失败。本程序、浏览器、以及挂本地代理端口跑的代码，走的都是同一条链路，不会出现「测速通但用不了」这种两套结果。<b>中转节点本身仍然可以当普通节点用</b>，只是不再经过任何前置。</p>
             </section>
             <section class="panel settings-section">
               <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/database.svg')"></span></div><div><h2>本地 DNS</h2><p>DNS 应答模式与自定义域名映射</p></div></div>

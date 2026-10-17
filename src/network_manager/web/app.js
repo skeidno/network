@@ -895,7 +895,7 @@ function renderRelay() {
       : !relay.node
         ? "已启用，但还没选中转节点，暂时不生效。"
         : relay.active
-          ? "已生效：所有出站（含节点测速）都先经过它再连节点。"
+          ? "已生效：所有出站（含节点测速）都先经过它；本机端口类节点除外。"
           : "已启用，但所选节点不在节点列表里，请重新选择。";
     hint.classList.toggle("is-warning", relay.enabled && !relay.active);
   }

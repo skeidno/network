@@ -152,6 +152,20 @@ fn is_lan_address(address: &str) -> bool {
         .any(|cidr| cidr_contains(cidr, parsed))
 }
 
+/// 出站地址是不是本机自己（`127.x`、`::1`、`localhost`）。
+///
+/// 这种节点指的是「这台机器上另一个代理软件留着的端口」——比如另一个客户端的
+/// 混合端口。**它绝不能挂远程中转**：中转在日本，去连的是它自己那台机器的
+/// `127.0.0.1:7897`，连不到我们本机这个端口，实测直接 503。
+pub(crate) fn is_loopback_server(server: &str) -> bool {
+    match server.trim().to_ascii_lowercase().as_str() {
+        "localhost" => true,
+        other => crate::models::parse_ip_literal(other)
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false),
+    }
+}
+
 /// 本地 DNS 映射里指向内网地址的那几条，生成显式直连规则。
 ///
 /// 局域网里的服务交给节点毫无意义，而兜底的 `IP-CIDR` 规则在这个场景下不一定命中：
@@ -360,7 +374,13 @@ pub fn build(config: &AppConfig) -> Value {
                 proxy.insert(key.clone(), value.clone());
             }
             // 中转自己不能挂自己，否则握手时会无限找拨号代理。
-            if !relay.is_empty() && relay != node.name() {
+            // 指向本机回环的节点也不能挂：中转在远端，它连的是自己那台机器的
+            // 127.0.0.1，永远到不了我们本机这个端口。
+            let server = proxy
+                .get("server")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if !relay.is_empty() && relay != node.name() && !is_loopback_server(server) {
                 proxy.insert("dialer-proxy".into(), Value::String(relay.clone()));
             }
             proxies.push(Value::Object(proxy));
@@ -707,14 +727,24 @@ mod tests {
     }
 
     fn relay_config(names: &[&str]) -> AppConfig {
+        relay_config_with_servers(names, &[])
+    }
+
+    /// 构造一份最少可用的、只带这几个节点的配置；`servers` 可以按名字覆盖 server。
+    fn relay_config_with_servers(names: &[&str], servers: &[(&str, &str)]) -> AppConfig {
         let mut config = AppConfig::default();
         config.imported_nodes = names
             .iter()
             .map(|name| {
+                let server = servers
+                    .iter()
+                    .find(|(target, _)| target == name)
+                    .map(|(_, server)| *server)
+                    .unwrap_or("1.2.3.4");
                 let mut map = serde_json::Map::new();
                 map.insert("name".into(), Value::String((*name).into()));
                 map.insert("type".into(), Value::String("http".into()));
-                map.insert("server".into(), Value::String("1.2.3.4".into()));
+                map.insert("server".into(), Value::String(server.into()));
                 map.insert("port".into(), json!(8080));
                 crate::models::ImportedNode {
                     config: Value::Object(map),
@@ -723,6 +753,45 @@ mod tests {
             })
             .collect();
         config
+    }
+
+    #[test]
+    fn local_port_node_never_goes_through_relay() {
+        // 本机回环上的节点是「这台机器上另一个代理软件的端口」。中转在远端，
+        // 让它去连自己的 127.0.0.1 必然失败（实测内核直接 503），必须跳过。
+        let mut config = relay_config_with_servers(
+            &["中转", "本机另一个客户端", "普通节点"],
+            &[
+                ("本机另一个客户端", "127.0.0.1"),
+                ("普通节点", "203.0.113.9"),
+            ],
+        );
+        config.relay_enabled = true;
+        config.relay_node = "中转".into();
+        let proxies = build(&config)["proxies"].as_array().expect("proxies").clone();
+        let dialer = |name: &str| {
+            proxies
+                .iter()
+                .find(|proxy| proxy["name"] == Value::String(name.into()))
+                .and_then(|proxy| proxy.get("dialer-proxy"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(dialer("普通节点").as_deref(), Some("中转"));
+        assert_eq!(dialer("本机另一个客户端"), None, "本机端口不能被串进中转链");
+        assert_eq!(dialer("中转"), None, "中转自己不能挂自己");
+    }
+
+    #[test]
+    fn localhost_and_ipv6_loopback_are_recognized() {
+        assert!(is_loopback_server("127.0.0.1"));
+        assert!(is_loopback_server("127.55.66.77"));
+        assert!(is_loopback_server("::1"));
+        assert!(is_loopback_server("LOCALHOST"));
+        // 局域网里另一台机器上的代理不是本机端口，仍可以走中转。
+        assert!(!is_loopback_server("192.168.1.100"));
+        assert!(!is_loopback_server("203.0.113.9"));
+        assert!(!is_loopback_server("example.com"));
     }
 
     #[test]

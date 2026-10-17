@@ -352,6 +352,41 @@ pub fn parse_authenticated_proxy_line(line: &str) -> Result<Value, String> {
     }))
 }
 
+/// 解析 `本机地址:端口`（无用户名密码），生成一条 HTTP 代理节点。
+///
+/// 用途很具体：**本机上另一个代理软件留着的混合端口**（比如另一个客户端的
+/// `127.0.0.1:7897`）。想让它给我们当上游是合法的搭配 —— 那边管路和订阅，
+/// 这边管接管和规则，两边不抢 TUN。
+///
+/// 只认本机回环（`127.x` / `::1` / `localhost`）。不认其它，
+/// 是为了避免把 mihomo 日志里「`203.119.245.36:443`」这种东西误判成节点。
+pub fn parse_local_proxy_line(line: &str) -> Result<Value, String> {
+    let text = line.trim();
+    let invalid = || "本机代理端口格式应为 127.0.0.1:端口".to_string();
+    let (host, port_text) = if let Some(inner) = text.strip_prefix('[') {
+        let end = inner.find(']').ok_or_else(invalid)?;
+        let rest = inner[end + 1..].strip_prefix(':').ok_or_else(invalid)?;
+        (&inner[..end], rest)
+    } else {
+        text.split_once(':').ok_or_else(invalid)?
+    };
+    if !crate::mihomo::is_loopback_server(host) {
+        return Err("本机代理端口的地址必须是 127.0.0.1 / localhost / ::1".into());
+    }
+    let port: i32 = port_text
+        .parse()
+        .map_err(|_| "本机代理端口的端口必须是数字")?;
+    if !(1..=65535).contains(&port) {
+        return Err("本机代理端口的端口必须在 1 到 65535 之间".into());
+    }
+    Ok(json!({
+        "name": format!("本机端口 {host}:{port}"),
+        "type": "http",
+        "server": host,
+        "port": port,
+    }))
+}
+
 fn yaml_proxies(text: &str) -> Vec<Value> {
     let value: Value = match serde_yaml::from_str(text) {
         Ok(value) => value,
@@ -383,6 +418,12 @@ fn unstructured_nodes(text: &str) -> (Vec<Value>, Vec<String>) {
                 Ok(node) => nodes.push(node),
                 Err(error) => errors.push(format!("第 {} 个链接：{error}", index + 1)),
             }
+            continue;
+        }
+        // 「本机地址:端口」只有两个字段，没有用户名密码，走的是另一套口径。
+        // 放在三个冒号那道闸之前：这类行永远不到 3 个冒号，会被直接 continue 掉。
+        if let Ok(node) = parse_local_proxy_line(line) {
+            nodes.push(node);
             continue;
         }
         // 只有「像一条代理 IP」的行才当代理解析：至少三个冒号（主机/端口/用户名/密码）。
@@ -451,6 +492,29 @@ pub fn unique_node_name(base: &str, existing: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_local_port_rows() {
+        // 本机上另一个客户端的混合端口，可以拿来当上游节点用。
+        let text = "127.0.0.1:7897\nlocalhost:1080";
+        let (nodes, errors) = parse_import_content(text).expect("应该能导入");
+        assert!(errors.is_empty(), "不该有错误：{errors:?}");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0]["type"], "http");
+        assert_eq!(nodes[0]["server"], "127.0.0.1");
+        assert_eq!(nodes[0]["port"], 7897);
+        assert_eq!(nodes[0]["name"], "本机端口 127.0.0.1:7897");
+        assert_eq!(nodes[1]["server"], "localhost");
+    }
+
+    #[test]
+    fn remote_host_port_is_not_a_local_row() {
+        // 名字里带端口的远程地址不能误判成本机端口，否则随便一段日志就会变成节点。
+        assert!(parse_local_proxy_line("203.119.245.36:443").is_err());
+        assert!(parse_local_proxy_line("example.com:8080").is_err());
+        assert!(parse_local_proxy_line("7897").is_err());
+        assert!(parse_local_proxy_line("127.0.0.1:abc").is_err());
+    }
 
     #[test]
     fn parses_authenticated_proxy_lines() {
