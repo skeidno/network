@@ -30,6 +30,32 @@ class PortableRuleTest {
     }
 
     @Test
+    fun topLevelDomainSuffixIsAcceptedInsteadOfRejected() {
+        // 想让整个 .cn 直连时会写 .cn。归一化把前导点剥掉成 cn —— 这是合法的单段
+        // 后缀，不是忘了填域名。以前拿「必须有点」卡它，这类规则一条都导不进来。
+        val rules = portableRulesFromValues(
+            type = "domain_suffix",
+            values = listOf(".cn"),
+            target = FallbackTarget.Direct,
+        )
+
+        assertEquals(listOf("cn"), rules.map(PortableRule::value))
+    }
+
+    @Test
+    fun exactDomainStillRequiresADot() {
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            portableRulesFromValues(
+                type = "domain",
+                values = listOf("localhost"),
+                target = FallbackTarget.Direct,
+            )
+        }
+
+        assertEquals("第 1 行：请输入有效域名，例如 example.com", error.message)
+    }
+
+    @Test
     fun commonRuleDomainsUseTheSameNormalizationAsPortableRules() {
         val domains = ruleGroupDomainsFromValues(
             listOf("*.Example.com", "custom.example", "EXAMPLE.COM"),

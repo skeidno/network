@@ -191,8 +191,14 @@ private fun normalizePortableRuleValue(type: String, rawValue: String): String {
 private fun validatePortableRuleValue(type: String, value: String): String? {
     if (value.isBlank()) return "匹配内容不能为空"
     if (value.any { it == ',' || it == '\n' || it == '\r' }) return "匹配内容不能包含逗号或换行"
-    if (type in setOf("domain", "domain_suffix")) {
+    if (type == "domain") {
         if (value.any(Char::isWhitespace) || '.' !in value) return "请输入有效域名，例如 example.com"
+    }
+    if (type == "domain_suffix") {
+        // 顶级域后缀是合法且常用的写法 —— 用户就是想让整个 .cn 直连。传到这里的
+        // 值已经剥掉过 *. 和前导点，所以单段（cn、com）是正常结果，不是漏填域名。
+        // 拿「必须有点」去卡它，等于把这类规则全挡在门外。
+        if (value.any(Char::isWhitespace)) return "请输入有效域名后缀，例如 example.com"
     }
     if (type == "package_name" && !value.matches(Regex("[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+"))) {
         return "请输入有效应用包名，例如 com.example.app"

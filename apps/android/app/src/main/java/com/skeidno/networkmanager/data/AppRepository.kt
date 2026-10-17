@@ -587,7 +587,14 @@ class AppRepository private constructor(private val context: Context) {
             .toString(2)
     }
 
-    fun importPortableConfig(content: String): Int {
+    // 跳过条数必须带出来：静默吞掉的话，用户以为全导进来了，
+    // 实际少了几条分流规则，等流量走错出口才发现。
+    data class PortableImportResult(
+        val nodeCount: Int,
+        val skippedRules: Int,
+    )
+
+    fun importPortableConfig(content: String): PortableImportResult {
         val root = JSONObject(content)
         require(root.optString("format") == "network-manager-config") {
             "不是 Network Manager 跨设备配置"
@@ -639,17 +646,26 @@ class AppRepository private constructor(private val context: Context) {
         }.filter { it.url.isNotBlank() }
         val rulesArray = root.optJSONArray("rules") ?: JSONArray()
         require(rulesArray.length() <= 5_000) { "规则数量超过限制" }
-        val rules = List(rulesArray.length()) { index ->
-            val item = rulesArray.getJSONObject(index)
-            val type = item.optString("type").lowercase()
-            val value = item.optString("value").trim()
-            portableRulesFromValues(
-                type = type,
-                values = listOf(value),
-                target = item.optString("target").toFallbackTarget(),
-                enabled = item.optBoolean("enabled", true),
-                note = item.optString("note"),
-            ).singleOrNull() ?: error("第 ${index + 1} 条规则无效")
+        var skippedRules = 0
+        val rules = buildList {
+            repeat(rulesArray.length()) { index ->
+                val item = rulesArray.getJSONObject(index)
+                val type = item.optString("type").lowercase()
+                val value = item.optString("value").trim()
+                // 一条规则写坏了就让整份配置导不进来太亏 —— 节点和订阅一起陪葬，
+                // 界面上还只弹一句看不懂的校验错误。跳过它、把条数报给用户，
+                // 剩下的照常生效。
+                val parsed = runCatching {
+                    portableRulesFromValues(
+                        type = type,
+                        values = listOf(value),
+                        target = item.optString("target").toFallbackTarget(),
+                        enabled = item.optBoolean("enabled", true),
+                        note = item.optString("note"),
+                    ).singleOrNull()
+                }.getOrNull()
+                if (parsed == null) skippedRules += 1 else add(parsed)
+            }
         }
         val routing = root.optJSONObject("routing") ?: JSONObject()
         // 桌面端会把「常用国内站点」整组折叠进 commonChina。端上不认识这一段的话，
@@ -661,16 +677,17 @@ class AppRepository private constructor(private val context: Context) {
             val enabled = china.optBoolean("enabled", true)
             buildList {
                 // 一次最多 500 条，超了就分批展开，别把整份配置拒掉。
+                // 内置组理论上写不坏，但一批里夹一条脏数据就把整批丢掉同样不划算。
                 values.chunked(500).forEach { chunk ->
-                    addAll(
+                    runCatching {
                         portableRulesFromValues(
                             type = "domain_suffix",
                             values = chunk,
                             target = FallbackTarget.Direct,
                             enabled = enabled,
                             note = "常用国内站点",
-                        ),
-                    )
+                        )
+                    }.getOrNull()?.let { addAll(it) }
                 }
             }
         }.orEmpty()
@@ -707,7 +724,7 @@ class AppRepository private constructor(private val context: Context) {
                 portableRules = chinaRules + rules,
             ),
         )
-        return nodes.size
+        return PortableImportResult(nodes.size, skippedRules)
     }
 
     fun updateRuntime(running: Boolean, busy: Boolean, message: String, error: String = "") {

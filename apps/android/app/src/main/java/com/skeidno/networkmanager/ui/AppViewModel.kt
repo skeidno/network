@@ -498,8 +498,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     require(bytes.size <= 10 * 1024 * 1024) { "配置文件不能超过 10 MB" }
                     repository.importPortableConfig(bytes.toString(Charsets.UTF_8))
                 }
-            }.onSuccess { count ->
-                mutableMessages.emit("跨设备配置已导入，共 $count 个节点")
+            }.onSuccess { result ->
+                val skipped = result.skippedRules.takeIf { it > 0 }
+                    ?.let { "，其中 $it 条规则无法识别已跳过" }
+                    .orEmpty()
+                mutableMessages.emit("跨设备配置已导入，共 ${result.nodeCount} 个节点$skipped")
                 applyConfigurationIfRunning()
             }.onFailure {
                 mutableMessages.emit(it.message ?: "配置导入失败")
