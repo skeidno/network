@@ -365,6 +365,11 @@ data class AppState(
     val selectedNodeId: String = "",
     val nodes: List<ProxyNode> = emptyList(),
     val nodeGroups: List<String> = emptyList(),
+    // 统一中转：开了之后除中转自己以外的节点都先经过它再出去。
+    // [relayEnabled] 是开关，[relayNodeId] 指向中转节点（空 = 没选）。
+    // 两个分开存，才能做到「先选好节点、之后再开开关」以及关掉开关时保留选择。
+    val relayEnabled: Boolean = false,
+    val relayNodeId: String = "",
     val subscriptions: List<Subscription> = emptyList(),
     val ruleGroup: RuleGroup = defaultOverseasRuleGroup(),
     val commonRuleTarget: FallbackTarget = FallbackTarget.Proxy,

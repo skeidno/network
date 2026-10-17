@@ -181,6 +181,20 @@ class AppRepository private constructor(private val context: Context) {
         update(mutableState.value.copy(selectedNodeId = id))
     }
 
+    /**
+     * 统一中转：开关 + 用哪个节点当中转。
+     *
+     * 和桌面端同一个语义 —— 开关开着就必须真有一个中转节点在列表里，
+     * 否则「界面显示已开启」但一条流量都没走中转，比不开还难排查。
+     * 节点不存在时按没选处理，而不是留着一个指不到人的开关。
+     */
+    fun setRelay(enabled: Boolean, nodeId: String) {
+        val current = mutableState.value
+        val resolved = nodeId.takeIf { id -> current.nodes.any { it.id == id } }.orEmpty()
+        require(!enabled || resolved.isNotBlank()) { "启用中转前先选一个中转节点" }
+        update(current.copy(relayEnabled = enabled, relayNodeId = resolved))
+    }
+
     fun deleteNode(id: String) {
         val current = mutableState.value
         val nodes = current.nodes.filterNot { it.id == id }
@@ -809,8 +823,17 @@ class AppRepository private constructor(private val context: Context) {
     }
 
     private fun update(value: AppState, persist: Boolean = true) {
-        mutableState.value = value
-        if (persist) save(value)
+        // 中转节点会随删节点、订阅更新一起消失。放在这里兜底，任何一条改动路径
+        // 都留不下「开关开着却指向一个不存在节点」的状态 —— 那种状态比不开更糟。
+        val safe = if (
+            value.relayNodeId.isNotBlank() && value.nodes.none { it.id == value.relayNodeId }
+        ) {
+            value.copy(relayNodeId = "", relayEnabled = false)
+        } else {
+            value
+        }
+        mutableState.value = safe
+        if (persist) save(safe)
     }
 
     private fun save(state: AppState) {
@@ -844,6 +867,8 @@ class AppRepository private constructor(private val context: Context) {
             .putString("nodes", nodes.toString())
             .putString("subscriptions", subscriptions.toString())
             .putString("selectedNodeId", state.selectedNodeId)
+            .putBoolean("relayEnabled", state.relayEnabled)
+            .putString("relayNodeId", state.relayNodeId)
             .putString("nodeGroups", JSONArray(state.nodeGroups).toString())
             .putString("mode", state.mode.name)
             .putString("fallback", state.fallbackTarget.name)
@@ -916,6 +941,11 @@ class AppRepository private constructor(private val context: Context) {
         }.getOrDefault(emptyList())
         val selected = preferences.getString("selectedNodeId", "").orEmpty()
             .takeIf { id -> nodes.any { it.id == id } } ?: nodes.firstOrNull()?.id.orEmpty()
+        // 中转节点可能已经随订阅更新被删掉了，读回来时同样要核对一遍，
+        // 否则开关还开着、指向的却是个不存在的节点。
+        val relayNodeId = preferences.getString("relayNodeId", "").orEmpty()
+            .takeIf { id -> nodes.any { it.id == id } }.orEmpty()
+        val relayEnabled = preferences.getBoolean("relayEnabled", false) && relayNodeId.isNotBlank()
         val nodeGroups = runCatching {
             val array = JSONArray(preferences.getString("nodeGroups", "[]"))
             List(array.length()) { index -> normalizeNodeGroup(array.optString(index)) }
@@ -954,6 +984,8 @@ class AppRepository private constructor(private val context: Context) {
             mode = enumPreference("mode", RoutingMode.Rule),
             fallbackTarget = enumPreference("fallback", FallbackTarget.Direct),
             selectedNodeId = selected,
+            relayEnabled = relayEnabled,
+            relayNodeId = relayNodeId,
             nodes = nodes,
             nodeGroups = (
                 nodeGroups +

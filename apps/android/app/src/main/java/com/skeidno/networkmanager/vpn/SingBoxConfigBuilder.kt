@@ -71,8 +71,14 @@ object SingBoxConfigBuilder {
             ?: state.nodes.firstOrNull()
         val orderedNodes = state.nodes.sortedByDescending { it.id == selected?.id }
         val nodeIdsByName = state.nodes.associate { it.name to it.id }
+        // 统一中转真正生效要同时满足：开关开着、选了节点、且那个节点还在列表里。
+        // 少任何一条都当没开 —— 把 detour 指向一个不存在的出站，整个配置起不来。
+        val relayId = state.relayNodeId
+            .takeIf { state.relayEnabled && it.isNotBlank() }
+            ?.takeIf { id -> state.nodes.any { it.id == id } }
+            .orEmpty()
         val outbounds = JSONArray()
-        orderedNodes.forEach { outbounds.put(toOutbound(it, nodeIdsByName)) }
+        orderedNodes.forEach { outbounds.put(toOutbound(it, nodeIdsByName, relayId)) }
         if (orderedNodes.isNotEmpty()) {
             outbounds.put(
                 JSONObject()
@@ -118,7 +124,7 @@ object SingBoxConfigBuilder {
                     .put("ip_cidr", JSONArray(lanCidrs))
                     .put("outbound", "direct"),
             )
-        orderedNodes.mapNotNull { proxyEndpointRelayRule(it, nodeIdsByName) }
+        orderedNodes.mapNotNull { proxyEndpointRelayRule(it, nodeIdsByName, relayId) }
             .forEach(rules::put)
         val enabledPortableRules = state.portableRules.filter { it.enabled }
         enabledPortableRules.filter { it.type == "package_name" }
@@ -365,6 +371,7 @@ object SingBoxConfigBuilder {
     internal fun toOutbound(
         node: ProxyNode,
         nodeIdsByName: Map<String, String> = emptyMap(),
+        relayId: String = "",
     ): JSONObject {
         val raw = node.raw
         val type = raw.optString("type").lowercase()
@@ -403,17 +410,37 @@ object SingBoxConfigBuilder {
                 )
             }
         }
-        raw.optString(nodeDialerProxyKey)
-            .takeIf { it.isNotBlank() && it != node.name }
-            ?.let(nodeIdsByName::get)
-            ?.let { outbound.put("detour", it) }
+        // 统一中转开着就一律挂在它下面，节点自带的前置这时不算数：两套混着用会出现
+        // 「同一个列表里有的走统一中转、有的走自己的前置」，是最难排查的一类故障。
+        // 中转自己不能挂自己（会无限找拨号器），落在本机回环的节点也不能挂 ——
+        // 中转在远端，它连的是自己那台机器的 127.0.0.1，永远到不了我们本机这个端口。
+        if (relayId.isNotBlank()) {
+            if (node.id != relayId && !isLoopbackServer(raw.optString("server"))) {
+                outbound.put("detour", relayId)
+            }
+        } else {
+            raw.optString(nodeDialerProxyKey)
+                .takeIf { it.isNotBlank() && it != node.name }
+                ?.let(nodeIdsByName::get)
+                ?.let { outbound.put("detour", it) }
+        }
         return outbound
+    }
+
+    /** 中转在远端，指向本机回环的节点挂上它必然连不通。 */
+    private fun isLoopbackServer(server: String): Boolean {
+        val host = server.trim().removePrefix("[").removeSuffix("]").lowercase()
+        return host == "localhost" || host == "::1" || host.startsWith("127.") ||
+            host.startsWith("0:0:0:0")
     }
 
     private fun proxyEndpointRelayRule(
         node: ProxyNode,
         nodeIdsByName: Map<String, String>,
+        relayId: String,
     ): JSONObject? {
+        // 统一中转开着时，节点自带的前置已被覆盖掉，这条配套规则也就没了意义。
+        if (relayId.isNotBlank()) return null
         val raw = node.raw
         val relayId = raw.optString(nodeDialerProxyKey)
             .takeIf { it.isNotBlank() && it != node.name }
