@@ -40,6 +40,10 @@ apps/android/.kotlin/
 apps/android/local.properties
 apps/android/**/build/
 apps/android/app/libs/*.aar
+# libbox 例外：43 MB，但 CI 的 android job 必须要有它才编得出来。
+# 原来靠 scripts/fetch_libbox.ps1 从 sing-box 的 Actions artifact 现拉，
+# 那条路依赖 90 天保留期和 token，过期就必挂；本地不跑那个脚本也编不了。
+!apps/android/app/libs/libbox.aar
 apps/android/captures/
 apps/android/signing.properties
 apps/android/*.keystore
