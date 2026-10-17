@@ -312,6 +312,23 @@ class SingBoxConfigBuilderTest {
     }
 
     @Test
+    fun nativeSingBoxTlsObjectSurvivesInsteadOfBeingSilentlyDropped() {
+        val nativeNode = ProxyNode(
+            id = "native-node",
+            name = "Native",
+            sourceId = "test",
+            sourceName = "Test",
+            rawJson = """{"type":"vless","server":"example.com","port":443,"uuid":"id","tls":{"enabled":true,"server_name":"sni.example.com","reality":{"enabled":true,"public_key":"key","short_id":"short"},"utls":{"enabled":true,"fingerprint":"firefox"}}}""",
+        )
+
+        val tls = SingBoxConfigBuilder.toOutbound(nativeNode).getJSONObject("tls")
+
+        assertEquals("sni.example.com", tls.getString("server_name"))
+        assertEquals("key", tls.getJSONObject("reality").getString("public_key"))
+        assertEquals("firefox", tls.getJSONObject("utls").getString("fingerprint"))
+    }
+
+    @Test
     fun localDnsMappingBecomesHostsServerThatBeatsTheLanSuffixRule() {
         val config = JSONObject(
             SingBoxConfigBuilder.build(

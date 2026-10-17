@@ -433,6 +433,13 @@ object SingBoxConfigBuilder {
     }
 
     private fun addTls(outbound: JSONObject, raw: JSONObject, type: String) {
+        // 节点本身已经是 sing-box 原生格式（tls 是个对象而不是开关）就直接透传。
+        // 不这么接住的话，下面按 Clash 键名重建时会因为找不到 `tls: true` 而整段跳过，
+        // 节点变成明文连接 —— 不报错、起得来，只是永远连不上，最难查的那类故障。
+        raw.optJSONObject("tls")?.let { nested ->
+            outbound.put("tls", nested)
+            return
+        }
         val enabled = type in setOf("trojan", "hysteria2") || raw.optBoolean("tls") || raw.has("reality-opts")
         if (!enabled) return
         val tls = JSONObject()
