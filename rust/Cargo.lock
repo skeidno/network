@@ -1716,7 +1716,7 @@ dependencies = [
 
 [[package]]
 name = "network-manager-rs"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "aes",
  "axum",
