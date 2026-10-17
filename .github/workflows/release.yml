@@ -107,11 +107,24 @@ jobs:
       - name: 构建 Windows 安装包
         shell: pwsh
         run: |
-          ./scripts/build_windows_installer.ps1 `
-            -Version "${{ needs.verify-version.outputs.version }}" `
-            -IsccPath "${{ steps.iscc.outputs.path }}" `
-            -OutputDir "release-assets" -SkipBuild *>&1 | Tee-Object -FilePath windows-package.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # 脚本里未捕获的终止性错误由 host 直接打到控制台，不会流进 Tee-Object
+          # 的日志文件；而 CI 日志只有管理员能下载。这里显式 catch 一份写进日志，
+          # 否则发布说明里的「构建诊断」只能看到最后一行 Write-Host。
+          $failed = $false
+          try {
+            ./scripts/build_windows_installer.ps1 `
+              -Version "${{ needs.verify-version.outputs.version }}" `
+              -IsccPath "${{ steps.iscc.outputs.path }}" `
+              -OutputDir "release-assets" -SkipBuild *>&1 | Tee-Object -FilePath windows-package.log
+          }
+          catch {
+            "ERROR: $($_.Exception.Message)" | Out-File -FilePath windows-package.log -Append
+            if ($_.ScriptStackTrace) {
+              $_.ScriptStackTrace | Out-File -FilePath windows-package.log -Append
+            }
+            $failed = $true
+          }
+          if ($failed) { exit 1 }
       # CI 日志要管理员权限才下载得到，失败时把脚本输出单独存一份方便排查。
       - name: 上传打包日志
         if: failure()
