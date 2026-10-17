@@ -211,8 +211,22 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+      # 不用 android-actions/setup-android：ubuntu-latest（24.04）镜像本来就带
+      # Android SDK，而这个 action 会去 chown 那个预装目录，权限不够直接失败
+      # —— job 挂在「准备环境」这一步，看起来像签名又出问题了。
+      - name: 确认 Android SDK 就绪
         if: steps.keycheck.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [[ -z "$SDK" || ! -d "$SDK" ]]; then
+            echo "::error::runner 上没有 Android SDK"
+            exit 1
+          fi
+          echo "ANDROID_HOME=$SDK"
+          echo "--- platforms ---"; ls "$SDK/platforms" 2>/dev/null | tail -5 || true
+          echo "--- build-tools ---"; ls "$SDK/build-tools" 2>/dev/null | tail -5 || true
+          echo "sdk.dir=$SDK" > apps/android/local.properties
       - name: 从 secrets 还原签名配置
         if: steps.keycheck.outputs.available == 'true'
         env:
@@ -232,11 +246,21 @@ jobs:
       - name: 构建正式签名 APK
         if: steps.keycheck.outputs.available == 'true'
         run: |
+          set -o pipefail
           cd apps/android
           chmod +x gradlew
           ./gradlew assembleRelease \
             -PappVersionName="${{ needs.verify-version.outputs.version }}" \
-            -PappVersionCode="${{ github.run_number }}"
+            -PappVersionCode="${{ github.run_number }}" 2>&1 | tee ../../android-gradle.log
+      # CI 日志只有仓库管理员能下载，android job 失败时否则只能盲猜。
+      # 和 windows 一样只在失败时上传，凑进 publish 的诊断段。
+      - name: 上传构建日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-log
+          path: android-gradle.log
+          if-no-files-found: ignore
       - name: 重命名为发布用文件名
         if: steps.keycheck.outputs.available == 'true'
         run: |
