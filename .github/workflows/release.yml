@@ -186,9 +186,22 @@ jobs:
       - uses: actions/checkout@v5
       - name: 判断是否有签名密钥
         id: keycheck
+        env:
+          # 别名/口令这两个允许带不带 ANDROID_ 前缀，历史上两种写法都配过。
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || secrets.KEY_PASSWORD }}
         run: |
-          if [[ -z "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]]; then
-            echo "::warning::未配置 ANDROID_KEYSTORE_BASE64，跳过 Android 正式签名 APK"
+          # 四个缺任何一个都签不出来。只查 base64 会让流水线跑到签名那步
+          # 才失败，且失败信息是一句 keystore 为空，看不出到底缺哪个。
+          missing=()
+          [[ -n "$KEYSTORE_BASE64" ]] || missing+=("ANDROID_KEYSTORE_BASE64")
+          [[ -n "$STORE_PASSWORD" ]] || missing+=("ANDROID_KEYSTORE_PASSWORD")
+          [[ -n "$KEY_ALIAS" ]] || missing+=("ANDROID_KEY_ALIAS/KEY_ALIAS")
+          [[ -n "$KEY_PASSWORD" ]] || missing+=("ANDROID_KEY_PASSWORD/KEY_PASSWORD")
+          if (( ${#missing[@]} > 0 )); then
+            echo "::warning::未配置签名 secrets（${missing[*]:-}），跳过 Android 正式签名 APK"
             echo "available=false" >> "$GITHUB_OUTPUT"
           else
             echo "available=true" >> "$GITHUB_OUTPUT"
@@ -205,8 +218,8 @@ jobs:
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
           echo "$KEYSTORE_BASE64" | base64 --decode > apps/android/network-manager-release.keystore
