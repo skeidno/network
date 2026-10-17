@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::mihomo::render_yaml;
@@ -364,6 +364,38 @@ pub fn memory_mb() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// 从内核日志尾部捞最后一条 fatal / error，用来说明「为什么起不来」。
+///
+/// mihomo 配置有错时是 `level=fatal msg="Parse config error: ..."` 然后立刻退出，
+/// 只提示「核心异常退出」等于什么都没说，用户只能猜。
+fn last_core_error() -> String {
+    let text = read_log_tail(&core_log_path(), 16 * 1024, 80);
+    text.lines()
+        .rev()
+        .find(|line| line.contains("level=fatal") || line.contains("level=error"))
+        .and_then(|line| {
+            let rest = line.split("msg=").nth(1)?.trim();
+            Some(rest.trim_matches('"').to_string())
+        })
+        .filter(|message| !message.is_empty())
+        .unwrap_or_default()
+}
+
+/// 可被 shutdown 打断的休眠；返回 true 表示收到退出信号。
+async fn sleep_watch(shutdown: &Arc<AtomicBool>, total: Duration) -> bool {
+    let deadline = Instant::now() + total;
+    while Instant::now() < deadline {
+        if shutdown.load(Ordering::SeqCst) {
+            return true;
+        }
+        let step = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(250));
+        sleep(step).await;
+    }
+    shutdown.load(Ordering::SeqCst)
+}
+
 /// 接管核心自愈守护。
 ///
 /// 内核（mihomo）是个独立子进程，目前除了手动开关没有任何守护：它一旦因为崩溃、
@@ -374,45 +406,115 @@ pub fn memory_mb() -> f64 {
 /// 这个任务跑在 tokio 运行时上，和 GUI 事件循环完全解耦，所以窗口藏起来也照常巡检。
 /// 只要 `core_desired_running` 为 true（说明用户是要它跑着的）而内核实际没在跑，
 /// 就重新拉起。`shutdown` 置位后立刻退出，避免主程序收尾停内核时被它又拉起来。
+///
+/// 两个容易踩的坑（都真实发生过）：
+/// 1. `start()` 成功只代表**进程创建成功**。配置有错时 mihomo 读配置就 fatal 退出，
+///    于是「拉起成功」每 15 秒重演一次，界面不停弹同一句「核心曾异常退出，已自动恢复」。
+///    所以拉起后要等一小会儿确认真活着，死掉就把日志里的 fatal 原因带出来。
+/// 2. 同一条提示不要反复弹：失败只在第一次提示，之后安静退避；恢复成功也要隔开
+///    一段时间才再提示，避免「崩—恢复」循环刷屏。
 pub async fn supervise_core(shared: crate::server::Shared, shutdown: Arc<AtomicBool>) {
-    // 基础巡检间隔；连续恢复失败就指数退避，避免日志被刷屏。
-    let mut backoff = Duration::from_secs(15);
+    const RESTART_INTERVAL: Duration = Duration::from_secs(15);
+    const MAX_BACKOFF: Duration = Duration::from_secs(120);
+    /// 拉起后等这么久再确认它不是「刚起来就死」。
+    const VERIFY_DELAY: Duration = Duration::from_millis(800);
+    /// 两次「已自动恢复」提示之间至少隔这么久，避免循环刷屏。
+    const NOTIFY_GAP: Duration = Duration::from_secs(120);
+
+    let mut backoff = RESTART_INTERVAL;
+    let mut failures: u32 = 0;
+    let mut last_notice: Option<Instant> = None;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
-        // 分两段：先短暂拿锁做判断与动作，再在锁外 sleep，避免长期占着状态锁，
-        // 也不会挡住界面里的开关操作。
-        {
+
+        // 先短促持锁判断，再在锁外等待，避免长期占着状态锁挡住界面操作。
+        let needs_restart = {
             let mut state = shared.lock().await;
-            if state.core_desired_running
+            state.core_desired_running
                 && !state.core.is_running()
-                // 拿锁的瞬间可能主程序正在收尾停内核：再确认一次，避免把刚停掉的
-                // 内核又拉起来（否则收尾后还得靠作业对象兜底杀一次）。
                 && !shutdown.load(Ordering::SeqCst)
-            {
-                let config = state.config.clone();
-                match state.core.start(&config) {
-                    Ok(()) => {
-                        state.notify("warning", "接管核心曾异常退出，已自动恢复");
-                        backoff = Duration::from_secs(15);
-                    }
-                    Err(err) => {
-                        eprintln!("自动恢复接管核心失败：{err}");
-                        backoff = (backoff * 2).min(Duration::from_secs(120));
-                    }
-                }
-            } else {
-                backoff = Duration::from_secs(15);
-            }
-        }
-        // 把 sleep 拆成一秒一跳，期间随时能响应 shutdown，不用傻等整个间隔。
-        let seconds = backoff.as_secs().max(1);
-        for _ in 0..seconds {
-            if shutdown.load(Ordering::SeqCst) {
+        };
+        if !needs_restart {
+            // 用户本来就是关着的，或者内核正跑着：恢复正常节奏。
+            failures = 0;
+            if sleep_watch(&shutdown, RESTART_INTERVAL).await {
                 return;
             }
-            sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let started = {
+            let mut state = shared.lock().await;
+            if !state.core_desired_running || shutdown.load(Ordering::SeqCst) {
+                None
+            } else {
+                let config = state.config.clone();
+                Some(state.core.start(&config))
+            }
+        };
+        let started = match started {
+            Some(result) => result,
+            None => continue,
+        };
+
+        if let Err(err) = started {
+            failures += 1;
+            eprintln!("自动恢复接管核心失败：{err}");
+            if failures == 1 {
+                let mut state = shared.lock().await;
+                state.notify("error", format!("接管核心启动失败：{err}"));
+            }
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+            if sleep_watch(&shutdown, backoff).await {
+                return;
+            }
+            continue;
+        }
+
+        // 确认它不是「刚起来就死」：配置有错时这里会立刻发现。
+        if sleep_watch(&shutdown, VERIFY_DELAY).await {
+            return;
+        }
+        let alive = {
+            let mut state = shared.lock().await;
+            state.core.is_running()
+        };
+        if alive {
+            let should_notify = last_notice
+                .map(|when| when.elapsed() >= NOTIFY_GAP)
+                .unwrap_or(true);
+            if should_notify {
+                let mut state = shared.lock().await;
+                state.notify("warning", "接管核心曾异常退出，已自动恢复");
+                last_notice = Some(Instant::now());
+            }
+            failures = 0;
+            backoff = RESTART_INTERVAL;
+            if sleep_watch(&shutdown, RESTART_INTERVAL).await {
+                return;
+            }
+            continue;
+        }
+
+        // 起来了又立刻死：多半是配置被内核拒绝，重试也只会重复同样结局。
+        failures += 1;
+        let reason = last_core_error();
+        eprintln!("接管核心启动后立即退出（第 {failures} 次）：{reason}");
+        if failures == 1 {
+            let mut state = shared.lock().await;
+            if reason.is_empty() {
+                state.notify("error", "接管核心启动后立即退出，请查看内核日志");
+            } else {
+                state.notify("error", format!("接管核心启动失败：{reason}"));
+            }
+            last_notice = Some(Instant::now());
+        }
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+        if sleep_watch(&shutdown, backoff).await {
+            return;
         }
     }
 }

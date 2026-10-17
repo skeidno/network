@@ -561,37 +561,65 @@ fn mark_nodes_testing(state: &mut AppState, indices: &[usize]) {
     }
 }
 
-/// 后台逐个测速并回写结果。
+/// 后台测速并回写结果。
 ///
-/// 每次等待网络前都重新取锁、测完立刻放锁：期间界面照常轮询，能看到「测试中」
-/// 一步步变成具体延迟。
+/// 一个节点只是一次 TCP 握手，但串行跑时 N 个连不上的节点会把总耗时拖到 N×3 秒
+/// （几十个节点接近两分钟，界面看着像卡死，用户感受就是「批量测速特别慢」）。
+/// 改成有界并发：同时最多 `MAX_PARALLEL` 个握手在飞，既快又不会把本机连接数打爆。
+/// 每测完一个立刻回写并放锁，界面照常轮询，能看到结果一条条刷出来。
 pub async fn run_node_tests(shared: Shared, indices: Vec<usize>) {
-    for index in indices {
-        let target = {
-            let state = shared.lock().await;
-            state.config.imported_nodes.get(index).map(|node| {
-                let (host, port) = node_endpoint(node);
-                (node.name(), host, port)
+    const MAX_PARALLEL: usize = 16;
+
+    // 先把目标快照出来，避免整个测速期间反复持有状态锁。
+    let targets: Vec<(String, String, u16)> = {
+        let state = shared.lock().await;
+        indices
+            .iter()
+            .filter_map(|index| {
+                state.config.imported_nodes.get(*index).map(|node| {
+                    let (host, port) = node_endpoint(node);
+                    (node.name(), host, port)
+                })
             })
-        };
-        let Some((name, host, port)) = target else {
-            continue;
-        };
-        let delay = match measure_delay(&host, port).await {
-            Ok(delay) => NodeDelay {
-                status: "ok".into(),
-                delay: Some(delay),
-                message: String::new(),
-            },
-            Err(error) => NodeDelay {
-                status: "error".into(),
-                delay: None,
-                message: error,
-            },
-        };
-        let mut state = shared.lock().await;
-        state.node_delays.insert(name, delay);
+            .collect()
+    };
+
+    let mut queue = targets.into_iter();
+    let mut tasks: tokio::task::JoinSet<(String, NodeDelay)> = tokio::task::JoinSet::new();
+    for _ in 0..MAX_PARALLEL {
+        match queue.next() {
+            Some(target) => {
+                tasks.spawn(measure_node(target));
+            }
+            None => break,
+        }
     }
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok((name, delay)) = joined {
+            let mut state = shared.lock().await;
+            state.node_delays.insert(name, delay);
+        }
+        if let Some(target) = queue.next() {
+            tasks.spawn(measure_node(target));
+        }
+    }
+}
+
+/// 单个节点的测速任务，独立成函数是为了能丢进 `JoinSet` 并发跑。
+async fn measure_node((name, host, port): (String, String, u16)) -> (String, NodeDelay) {
+    let delay = match measure_delay(&host, port).await {
+        Ok(delay) => NodeDelay {
+            status: "ok".into(),
+            delay: Some(delay),
+            message: String::new(),
+        },
+        Err(error) => NodeDelay {
+            status: "error".into(),
+            delay: None,
+            message: error,
+        },
+    };
+    (name, delay)
 }
 
 /// 常用海外站点规则组在 `rules` 中的下标。
@@ -604,6 +632,74 @@ fn common_rule_indexes(state: &AppState) -> Vec<usize> {
         .filter(|(_, rule)| crate::portable::is_common_overseas_rule(rule))
         .map(|(index, _)| index)
         .collect()
+}
+
+/// 把界面的规则表单转成若干条 `RoutingRule`。
+///
+/// 前端提交的是 `{index, ruleType, values: [...], target, note, enabled}`，而后端结构体
+/// 是单值字段 `value` 且带 `#[serde(default)]`。键名对不上时 serde **不报错**，直接补
+/// 默认值 —— 于是「添加规则」得到的是一条 `rule_type=DOMAIN-SUFFIX, value=""` 的空规则，
+/// 渲染进内核配置就是 `DOMAIN-SUFFIX,,X`，mihomo 立刻 fatal 退出：接管反复失败，界面每
+/// 15 秒弹一次「核心异常退出，已自动恢复」。
+///
+/// 所以这里按表单结构显式解析，一行一条展开成多条规则，而不是靠 serde 猜。
+fn rules_from_patch(patch: &Value) -> Result<Vec<RoutingRule>, String> {
+    let text_field = |keys: &[&str], fallback: &str| -> String {
+        keys.iter()
+            .find_map(|key| patch.get(*key).and_then(|value| value.as_str()))
+            .map(str::trim)
+            .unwrap_or(fallback)
+            .to_string()
+    };
+    let rule_type = text_field(&["ruleType", "rule_type"], "DOMAIN-SUFFIX");
+    if rule_type.is_empty() {
+        return Err("规则的匹配类型不能为空".into());
+    }
+    let target = text_field(&["target"], "DIRECT").to_uppercase();
+    if !crate::mihomo::TARGET_NAMES
+        .iter()
+        .any(|(key, _)| *key == target.as_str())
+    {
+        return Err(format!("不支持的流量去向：{target}"));
+    }
+    let note = text_field(&["note"], "");
+    let group = text_field(&["group"], "");
+    let enabled = patch
+        .get("enabled")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+
+    let mut values: Vec<String> = Vec::new();
+    if let Some(array) = patch.get("values").and_then(|value| value.as_array()) {
+        for item in array {
+            if let Some(text) = item.as_str() {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() && !values.iter().any(|item| item == trimmed) {
+                    values.push(trimmed.to_string());
+                }
+            }
+        }
+    } else if let Some(text) = patch.get("value").and_then(|value| value.as_str()) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            values.push(trimmed.to_string());
+        }
+    }
+    if values.is_empty() {
+        return Err("请至少填写一条匹配内容".into());
+    }
+
+    Ok(values
+        .into_iter()
+        .map(|value| RoutingRule {
+            rule_type: rule_type.clone(),
+            value,
+            target: target.clone(),
+            enabled,
+            note: note.clone(),
+            group: group.clone(),
+        })
+        .collect())
 }
 
 /// 清掉指向已删除节点的中转引用。
@@ -1054,19 +1150,46 @@ pub async fn dispatch(
         }
         "saveRule" => {
             let patch = payload(&args, 0)?;
-            let rule: RoutingRule =
-                serde_json::from_value(patch).map_err(|_| "规则内容无效".to_string())?;
-            let index = number(&args, 1) as usize;
-            if index < state.config.rules.len() {
-                state.config.rules[index] = rule;
-            } else {
-                state.config.rules.push(rule);
+            let rules = rules_from_patch(&patch)?;
+            // 前端把 index 放在表单里（添加时是 -1），两处都认：负数或缺失表示新增。
+            // 以前只读 args[1]，而前端根本只传了一个参数，于是「编辑」永远写到第 0 条，
+            // 「添加」也覆盖第 0 条 —— 用户第一条规则就是这么没的。
+            let index = patch
+                .get("index")
+                .and_then(|value| value.as_i64())
+                .or_else(|| args.get(1).and_then(|value| value.as_i64()))
+                .filter(|value| *value >= 0)
+                .map(|value| value as usize);
+            match index {
+                // 「一行一条匹配内容」会展开成多条，插回原来的位置。
+                Some(index) if index < state.config.rules.len() => {
+                    let _replaced: Vec<RoutingRule> = state
+                        .config
+                        .rules
+                        .splice(index..index + 1, rules)
+                        .collect();
+                }
+                _ => state.config.rules.extend(rules),
             }
             apply(state)
         }
         "ruleAction" => {
-            let action = text(&args, 0);
-            let index = number(&args, 1) as usize;
+            // 前端调用顺序是 (index, action)，而后端此前按 (action, index) 读，
+            // 结果是 action 读成空串、index 读成 0：切换/删除规则一律报「不支持的规则操作」。
+            // 这里按类型判断，两种顺序都认。
+            let (index, action) = match (args.first(), args.get(1)) {
+                // 现在的顺序：(index, action)
+                (Some(index), Some(Value::String(action))) => (
+                    index.as_i64().unwrap_or(-1).max(0) as usize,
+                    action.clone(),
+                ),
+                // 兼容旧的 (action, index)
+                (Some(Value::String(action)), Some(index)) => (
+                    index.as_i64().unwrap_or(-1).max(0) as usize,
+                    action.clone(),
+                ),
+                _ => (number(&args, 1) as usize, text(&args, 0)),
+            };
             let rule = state
                 .config
                 .rules
@@ -1608,5 +1731,72 @@ pub async fn dispatch(
             apply(state)
         }
         other => Err(format!("不支持的操作：{other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rule_patch_uses_the_values_array_from_the_form() {
+        // 界面提交的是 ruleType + values[]，不是后端的 rule_type/value。以前直接交给
+        // serde 反序列化，键名对不上就静默补默认值，于是存下一条 value 为空的规则，
+        // 渲染进内核配置就是 `DOMAIN-SUFFIX,,X`，mihomo 直接 fatal 退出。
+        let patch = json!({
+            "index": -1,
+            "ruleType": "DOMAIN-SUFFIX",
+            "values": ["a.com", "b.com", "a.com", "  "],
+            "target": "builtin",
+            "note": "备注",
+            "enabled": true
+        });
+        let rules = rules_from_patch(&patch).expect("应当解析成功");
+        assert_eq!(rules.len(), 2, "空值与重复项要去掉");
+        assert_eq!(rules[0].value, "a.com");
+        assert_eq!(rules[1].value, "b.com");
+        assert_eq!(rules[0].rule_type, "DOMAIN-SUFFIX");
+        assert_eq!(rules[0].target, "BUILTIN", "去向要归一化成大写");
+        assert_eq!(rules[0].note, "备注");
+        assert!(rules.iter().all(RoutingRule::is_complete));
+    }
+
+    #[test]
+    fn rule_patch_rejects_empty_values_and_bad_target() {
+        assert!(rules_from_patch(&json!({
+            "ruleType": "DOMAIN", "values": [], "target": "DIRECT"
+        }))
+        .is_err());
+        assert!(rules_from_patch(&json!({
+            "ruleType": "DOMAIN", "values": ["a.com"], "target": "NOWHERE"
+        }))
+        .is_err());
+        assert!(rules_from_patch(&json!({
+            "ruleType": "DOMAIN", "values": ["a.com"], "target": "DIRECT"
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn rule_patch_accepts_the_single_value_shape() {
+        let rules = rules_from_patch(&json!({
+            "rule_type": "IP-CIDR", "value": "1.2.3.0/24", "target": "CLASH"
+        }))
+        .unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].rule_type, "IP-CIDR");
+        assert_eq!(rules[0].value, "1.2.3.0/24");
+    }
+
+    #[test]
+    fn incomplete_rules_are_dropped_by_is_complete() {
+        assert!(!RoutingRule::default().is_complete(), "默认规则没有匹配内容");
+        assert!(RoutingRule {
+            rule_type: "DOMAIN".into(),
+            value: "a.com".into(),
+            ..Default::default()
+        }
+        .is_complete());
     }
 }

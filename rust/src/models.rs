@@ -92,6 +92,17 @@ pub struct RoutingRule {
     pub group: String,
 }
 
+impl RoutingRule {
+    /// 这条规则有没有完整到可以写进内核配置。
+    ///
+    /// 缺 `rule_type` 或 `value` 的规则一旦渲染成 `DOMAIN-SUFFIX,,X`，mihomo 会直接
+    /// `level=fatal msg="Parse config error: ... missing subsequent parameters"`
+    /// 退出——不是跳过这一条，是整个接管起不来。所以渲染、保存、加载三处都要挡。
+    pub fn is_complete(&self) -> bool {
+        !self.rule_type.trim().is_empty() && !self.value.trim().is_empty()
+    }
+}
+
 impl Default for RoutingRule {
     fn default() -> Self {
         Self {

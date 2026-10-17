@@ -30,9 +30,20 @@ pub fn load() -> AppConfig {
                     let entries = crate::models::sanitize_local_dns_entries(raw_entries.clone());
                     let entries_changed = entries != raw_entries;
                     config.local_dns = entries;
+                    // 半成品规则（缺匹配内容）渲染出来是 `DOMAIN-SUFFIX,,X`，mihomo 会
+                    // 直接 fatal 退出，整个接管起不来。这里一次性清掉；历史上「添加规则」
+                    // 写坏的空规则也靠这一步自愈，不用用户自己去列表里翻。
+                    let raw_rules = std::mem::take(&mut config.rules);
+                    let rules_before = raw_rules.len();
+                    let rules: Vec<RoutingRule> = raw_rules
+                        .into_iter()
+                        .filter(RoutingRule::is_complete)
+                        .collect();
+                    let rules_changed = rules.len() != rules_before;
+                    config.rules = rules;
                     // 迁移只在内存里改的话，每次启动都要重算一遍，配置文件里的
                     // 旧值也永远在那里；改了就落盘，让用户看到真实生效的值。
-                    if migrate(&mut config, stored_version) || entries_changed {
+                    if migrate(&mut config, stored_version) || entries_changed || rules_changed {
                         save(&config);
                     }
                     config

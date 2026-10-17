@@ -5,7 +5,7 @@ use crate::models::{
     AppConfig, LocalDnsEntry, RoutingRule, NODE_DIALER_POLICY_KEY, NODE_DIALER_PROXY_KEY,
 };
 
-const TARGET_NAMES: &[(&str, &str)] = &[
+pub const TARGET_NAMES: &[(&str, &str)] = &[
     ("CLASH", "UPSTREAM-CLASH"),
     ("V2RAY", "UPSTREAM-V2RAY"),
     ("SSH", "UPSTREAM-SSH"),
@@ -424,7 +424,9 @@ pub fn build(config: &AppConfig) -> Value {
                 config
                     .rules
                     .iter()
-                    .filter(|rule| rule.enabled)
+                    // 空值规则必须排除：`DOMAIN-SUFFIX,,X` 会让 mihomo 直接 fatal 退出，
+                    // 整个接管都起不来（见 RoutingRule::is_complete 的说明）。
+                    .filter(|rule| rule.enabled && rule.is_complete())
                     .map(rule_line),
             );
             target_name(&config.default_target)
@@ -722,6 +724,41 @@ mod tests {
             .position(|rule| rule == "DOMAIN-SUFFIX,nas.lan,UPSTREAM-CLASH")
             .expect("应当有用户规则");
         assert!(mapping < user_rule, "映射规则要排在用户规则之前：{rules:?}");
+    }
+
+    #[test]
+    fn incomplete_rules_never_reach_the_kernel() {
+        // 空值规则渲染成 `DOMAIN-SUFFIX,,IMPORTED-NODES` 会让 mihomo 直接 fatal
+        // 退出（missing subsequent parameters），整个接管起不来 —— 所以必须过滤掉。
+        let mut config = config_with(&[]);
+        config.rules = vec![
+            crate::models::RoutingRule {
+                rule_type: "DOMAIN-SUFFIX".into(),
+                value: "example.com".into(),
+                target: "CLASH".into(),
+                ..Default::default()
+            },
+            // 就是这条：value 为空。
+            crate::models::RoutingRule {
+                rule_type: "DOMAIN-SUFFIX".into(),
+                value: String::new(),
+                target: "BUILTIN".into(),
+                ..Default::default()
+            },
+            crate::models::RoutingRule {
+                rule_type: String::new(),
+                value: "whatever.com".into(),
+                target: "BUILTIN".into(),
+                ..Default::default()
+            },
+        ];
+        let rules = rules_of(&build(&config));
+        assert!(rules.contains(&"DOMAIN-SUFFIX,example.com,UPSTREAM-CLASH".to_string()));
+        assert!(
+            !rules.iter().any(|rule| rule.contains(",,")),
+            "不该出现空值规则：{rules:?}"
+        );
+        assert_eq!(rules.iter().filter(|rule| rule.contains("example.com")).count(), 1);
     }
 
     #[test]
