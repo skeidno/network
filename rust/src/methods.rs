@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
@@ -720,6 +721,19 @@ fn mark_nodes_testing(state: &mut AppState, indices: &[usize]) {
 pub async fn run_node_tests(shared: Shared, indices: Vec<usize>) {
     const MAX_PARALLEL: usize = 16;
 
+    // 内核在跑的话，测速交给内核：它的延迟测试走完整链路，本机只能握到握手。
+    let core: Option<Arc<CoreProbe>> = {
+        let mut state = shared.lock().await;
+        if state.core.is_running() {
+            Some(Arc::new(CoreProbe {
+                port: state.config.controller_port as u16,
+                secret: state.config.controller_secret.clone(),
+            }))
+        } else {
+            None
+        }
+    };
+
     // 先把目标快照出来，避免整个测速期间反复持有状态锁。
     let targets: Vec<TestTarget> = {
         let state = shared.lock().await;
@@ -740,7 +754,7 @@ pub async fn run_node_tests(shared: Shared, indices: Vec<usize>) {
     for _ in 0..MAX_PARALLEL {
         match queue.next() {
             Some(target) => {
-                tasks.spawn(measure_node(target));
+                tasks.spawn(measure_node(target, core.clone()));
             }
             None => break,
         }
@@ -751,21 +765,103 @@ pub async fn run_node_tests(shared: Shared, indices: Vec<usize>) {
             state.node_delays.insert(name, delay);
         }
         if let Some(target) = queue.next() {
-            tasks.spawn(measure_node(target));
+            tasks.spawn(measure_node(target, core.clone()));
         }
     }
 }
 
-/// 单个节点的测速任务，独立成函数是为了能丢进 `JoinSet` 并发跑。
-async fn measure_node(target: TestTarget) -> (String, NodeDelay) {
-    let outcome = match target.protocol.to_lowercase().as_str() {
-        // 「端口开着」不等于「能代理」：这两类必须走完真实握手才算通过。
+/// 内核在跑时改问内核要延迟数字。
+///
+/// 内核自带的延迟测试是真的发一个 HTTP 请求走完整链路：建隧道 → 认证 →
+/// 取回响应。本机无论怎么测都只能做到握手那一层，中间差着「认证被拒」「对端
+/// reset」「节点根本不转发」这一整段——用户看到的「测速全通还很快，一用就废」
+/// 就是这段差出来的。内核在跑就交给它，这才是最权威的判据。
+struct CoreProbe {
+    port: u16,
+    secret: String,
+}
+
+impl CoreProbe {
+    async fn delay(&self, name: &str) -> Result<Option<i64>, String> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(12))
+            .no_proxy()
+            .build()
+            .map_err(|err| format!("创建 HTTP 客户端失败：{err}"))?;
+        let url = format!(
+            "http://127.0.0.1:{}/proxies/{}/delay?url={}&timeout=5000",
+            self.port,
+            percent_encode(name),
+            percent_encode("http://www.gstatic.com/generate_204"),
+        );
+        let response = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.secret))
+            .send()
+            .await
+            .map_err(|err| format!("连不上内核控制接口：{err}"))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .unwrap_or_default();
+        let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if let Some(delay) = parsed.get("delay").and_then(|value| value.as_i64()) {
+            return Ok(Some(delay));
+        }
+        // 拿不到 delay 但拿到了结构化结果 = 内核确实测了，就是这个节点不行。
+        if parsed.get("message").is_some() {
+            return Err(if status.is_success() {
+                "内核实测不可用".into()
+            } else {
+                format!("内核实测不可用（HTTP {status}）")
+            });
+        }
+        // 连结构化结果都没有：多半是接口本身没通，交给调用方回退本机探测。
+        Err(format!("内核延迟接口无响应（HTTP {status}）"))
+    }
+}
+
+/// 最小 percent-encoding：节点名里有中文和 emoji，不编码拼进 URL 会 400。
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 2);
+    for byte in input.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// 本机侧的分层探测：能在本机握手验到「能代理」的协议就验到那一层。
+async fn probe_locally(target: &TestTarget) -> Result<i64, String> {
+    match target.protocol.to_lowercase().as_str() {
         "http" | "https" => {
             probe_http_connect(&target.host, target.port, &target.username, &target.password).await
         }
         "socks5" | "socks" => probe_socks5(&target.host, target.port).await,
-        // 加密协议本机没有密钥，握不了手，只能确认端口可达。
         _ => measure_delay(&target.host, target.port).await,
+    }
+}
+
+/// 单个节点的测速任务，独立成函数是为了能丢进 `JoinSet` 并发跑。
+async fn measure_node(target: TestTarget, core: Option<Arc<CoreProbe>>) -> (String, NodeDelay) {
+    let outcome = match core.as_ref() {
+        Some(probe) => match probe.delay(&target.name).await {
+            // 内核测过了，以它为准。
+            Ok(Some(delay)) => Ok(delay),
+            Ok(None) => probe_locally(&target).await,
+            // 接口本身没连通才回退；「内核实测不可用」是真实结论，不能拿本机
+            // 的握手成功去覆盖它，否则又变回「测速全通、一用就废」。
+            Err(err) if err.contains("无响应") || err.contains("连不上") => {
+                probe_locally(&target).await
+            }
+            Err(err) => Err(err),
+        },
+        None => probe_locally(&target).await,
     };
     let delay = match outcome {
         Ok(delay) => NodeDelay {
