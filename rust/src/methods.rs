@@ -117,7 +117,7 @@ async fn exit_ip_direct() -> Result<ExitIdentity, String> {
         .no_proxy()
         .build()
         .map_err(|err| format!("创建 HTTP 客户端失败：{err}"))?;
-    fetch_exit_identity(&client).await
+    fetch_exit_identity(&client, false).await
 }
 
 /// 通过本地混合代理端口检测出口 IP —— 测的是「经过代理后的出口」。
@@ -127,7 +127,7 @@ async fn exit_ip_through_proxy(proxy_url: &str) -> Result<ExitIdentity, String> 
         .proxy(reqwest::Proxy::all(proxy_url).map_err(|err| format!("代理地址无效：{err}"))?)
         .build()
         .map_err(|err| format!("创建 HTTP 客户端失败：{err}"))?;
-    fetch_exit_identity(&client).await
+    fetch_exit_identity(&client, true).await
 }
 
 /// 代理出口检测该连哪个端口，以及是否连上了「检测专用入站」。
@@ -154,7 +154,14 @@ async fn proxy_probe_endpoint(config: &AppConfig) -> (String, bool) {
 
 /// 所有端点同时发起。先拿到「带归属地」的结果就直接返回；
 /// 只拿到裸 IP 时，再宽限 3 秒等一个带归属地的响应，实在没有就用裸 IP。
-async fn fetch_exit_identity(client: &reqwest::Client) -> Result<ExitIdentity, String> {
+///
+/// `via_proxy` 决定失败时怎么措辞：走代理时 502/503 是**内核连不上上游节点**，
+/// 跟检测站点无关。以前一律报「所有出口检测端点均失败：ip-api 502」，把人引去
+/// 折腾检测站点，而真正坏的是节点。
+async fn fetch_exit_identity(
+    client: &reqwest::Client,
+    via_proxy: bool,
+) -> Result<ExitIdentity, String> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(IP_CHECKS.len());
     for (endpoint, kind) in IP_CHECKS {
         let tx = tx.clone();
@@ -191,7 +198,26 @@ async fn fetch_exit_identity(client: &reqwest::Client) -> Result<ExitIdentity, S
         }
     }
     fallback.ok_or_else(|| {
-        let detail = failures.last().cloned().unwrap_or_else(|| "检测端点没有返回 IP".into());
+        if via_proxy {
+            if failures.iter().any(|item| {
+                item.contains("502") || item.contains("503") || item.contains("504")
+            }) {
+                return "内核连不上当前节点（返回 502），换一个节点再试".to_string();
+            }
+            if !failures.is_empty()
+                && failures.iter().all(|item| {
+                    item.contains("10061")
+                        || item.to_lowercase().contains("connection refused")
+                        || item.contains("拒绝")
+                })
+            {
+                return "本地代理端口没有监听，接管可能已经停止".to_string();
+            }
+        }
+        let detail = failures
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "检测端点没有返回 IP".into());
         format!("所有出口检测端点均失败：{detail}")
     })
 }
@@ -201,23 +227,27 @@ async fn probe_exit_endpoint(
     endpoint: &str,
     kind: &str,
 ) -> Result<ExitIdentity, String> {
-    let response = client
-        .get(endpoint)
-        .send()
-        .await
-        .map_err(|err| {
-            // reqwest 的错误外壳不带细节，展开整个 source 链才能看到
-            // 是 DNS、连接超时还是 TLS 问题。
-            let mut chain = vec![err.to_string()];
-            let mut source = std::error::Error::source(&err);
-            while let Some(cause) = source {
-                chain.push(cause.to_string());
-                source = cause.source();
-            }
-            chain.join(" ← ")
-        })?
-        .error_for_status()
-        .map_err(|err| err.to_string())?;
+    let response = client.get(endpoint).send().await.map_err(|err| {
+        // reqwest 的错误外壳不带细节，展开整个 source 链才能看到
+        // 是 DNS、连接超时还是 TLS 问题。
+        let mut chain = vec![err.to_string()];
+        let mut source = std::error::Error::source(&err);
+        while let Some(cause) = source {
+            chain.push(cause.to_string());
+            source = cause.source();
+        }
+        chain.join(" ← ")
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        // 走本地代理时，502/503/504 是内核「拨不通上游节点」的统一回包，不是检测站
+        // 点的错；把 reqwest 那一长串「for url (...)」压成一句，别误导排查方向。
+        let hint = match status.as_u16() {
+            502 | 503 | 504 => "（内核没连上节点）",
+            _ => "",
+        };
+        return Err(format!("HTTP {}{hint}", status.as_u16()));
+    }
     let text = response.text().await.map_err(|err| err.to_string())?;
     parse_exit_identity(&text, kind).ok_or_else(|| "响应中没有 IP".to_string())
 }
@@ -1664,11 +1694,39 @@ pub async fn dispatch(
             } else {
                 (format!("http://127.0.0.1:{}", state.config.mixed_port), false)
             };
+            // 先花最多 3 秒确认「当前选中的节点」能不能握手。节点整条不通时，8 个检测
+            // 端点会各自等到 12 秒超时，最后只回一句「所有出口检测端点均失败」——
+            // 看着像检测站点的问题，其实跟它们一点关系都没有。先试一次，不通就直说。
+            let node_error: Option<String> = if core_running {
+                let target = state
+                    .config
+                    .imported_nodes
+                    .iter()
+                    .find(|node| node.name() == state.config.selected_node)
+                    .map(|node| {
+                        let (server, port) = node_endpoint(node);
+                        (node.name(), server, port)
+                    });
+                match target {
+                    Some((name, server, port)) => match measure_delay(&server, port).await {
+                        Ok(_) => None,
+                        Err(err) => Some(format!(
+                            "所选节点「{name}」连不上（{err}），换一个节点再试"
+                        )),
+                    },
+                    None => None,
+                }
+            } else {
+                None
+            };
             let (local, proxy_result) = tokio::join!(
                 exit_ip_direct(),
                 async {
                     if !core_running {
                         return Err("内核未运行".to_string());
+                    }
+                    if let Some(err) = node_error.clone() {
+                        return Err(err);
                     }
                     exit_ip_through_proxy(&proxy).await
                 }
