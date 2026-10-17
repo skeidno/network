@@ -885,15 +885,18 @@ function renderRelay() {
     ...nodes.map((node) => `<option value="${escapeHtml(node.name)}"${node.name === relay.node ? " selected" : ""}>${escapeHtml(node.name)} · ${escapeHtml(node.protocol)}</option>`),
   ].join("");
   select.innerHTML = options;
-  select.disabled = !relay.enabled;
+  // 下拉始终可选：开关和选择是两回事，锁住任何一个都会把另一个卡死
+  // （先开开关要求已选节点、不选节点又开不了开关）。
   enabled.checked = relay.enabled;
   const hint = byId("setting-relay-hint");
   if (hint) {
     hint.textContent = !relay.enabled
       ? "未启用，节点全部直接连接。"
-      : relay.active
-        ? "已生效：所有出站（含节点测速）都先经过它再连节点。"
-        : "已勾选但没生效：所选节点不在节点列表里，请重新选择。";
+      : !relay.node
+        ? "已启用，但还没选中转节点，暂时不生效。"
+        : relay.active
+          ? "已生效：所有出站（含节点测速）都先经过它再连节点。"
+          : "已启用，但所选节点不在节点列表里，请重新选择。";
     hint.classList.toggle("is-warning", relay.enabled && !relay.active);
   }
 }
