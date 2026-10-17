@@ -35,6 +35,9 @@ pub struct DeployTask {
 
 pub struct CoreProcess {
     child: Option<Child>,
+    /// 本次内核启动时日志文件的字节长度。之后的日志才算「这次启动产生的」——
+    /// 日志是追加写的，不记这个位置就分不清一条报错是这次的还是上次的。
+    log_mark: Option<u64>,
     /// Windows 作业对象句柄：把内核进程挂进来，父进程无论正常退出、崩溃还是被
     /// 强杀，系统都会连同作业里的内核一起终止（JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE）。
     // 存原始句柄值而不是 HANDLE：HANDLE 内含裸指针，不满足 Send，
@@ -47,6 +50,7 @@ impl Default for CoreProcess {
     fn default() -> Self {
         Self {
             child: None,
+            log_mark: None,
             #[cfg(windows)]
             job: None,
         }
@@ -118,6 +122,10 @@ impl CoreProcess {
         kill_orphan_cores(None);
         // 启动前先裁剪一次：此时还没有句柄持有日志文件，重写最安全。
         trim_core_log();
+        // 记下此刻的日志长度，之后新增的内容才算这次启动产生的。
+        let log_mark = std::fs::metadata(core_log_path())
+            .map(|meta| meta.len())
+            .unwrap_or(0);
         let binary = core_binary();
         if !binary.exists() {
             return Err(format!(
@@ -163,7 +171,46 @@ impl CoreProcess {
             }
         }
         self.child = Some(child);
+        self.log_mark = Some(log_mark);
         Ok(())
+    }
+
+    /// 本次内核启动之后写进日志的新内容。
+    fn log_since_start(&self) -> String {
+        let path = core_log_path();
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return String::new();
+        };
+        let mark = self.log_mark.unwrap_or(0).min(meta.len());
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            return String::new();
+        };
+        if file.seek(SeekFrom::Start(mark)).is_err() {
+            return String::new();
+        }
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).is_err() {
+            return String::new();
+        }
+        // 崩溃栈里可能夹着非法 UTF-8 字节，丢掉它们也要拿到能看的部分。
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    /// 内核起来了但 TUN 没起来时的原因。
+    ///
+    /// 这是最容易骗过所有健康检查的一种故障：mihomo 起 TUN 失败只打一条
+    /// `level=error msg="Start TUN listening error: ..."`，**进程不退出**、端口照常监听，
+    /// 于是「进程活着」这个判据一路绿灯，界面显示接管中，实际一条流量都没被接管——
+    /// 用户看到的就是「代理明明开着，出口 IP 还是本地的」。
+    /// 除了翻日志没有别的判据，所以这里必须查。
+    pub fn tun_start_error(&self) -> Option<String> {
+        self.log_since_start()
+            .lines()
+            .rev()
+            .find(|line| line.contains("Start TUN listening error"))
+            .and_then(|line| line.split("msg=").nth(1))
+            .map(|message| message.trim().trim_matches('"').to_string())
+            .filter(|message| !message.is_empty())
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
@@ -171,6 +218,7 @@ impl CoreProcess {
             let _ = child.kill();
             let _ = child.wait();
         }
+        self.log_mark = None;
         #[cfg(windows)]
         if let Some(job) = self.job.take() {
             unsafe {
@@ -181,6 +229,30 @@ impl CoreProcess {
         }
         Ok(())
     }
+}
+
+/// 删掉上次异常退出残留的 wintun 网卡。
+///
+/// 内核崩溃或被强杀时 wintun 适配器常常没释放干净，下次启动就报
+/// `configure tun interface: set ipv4 address: The object already exists`，
+/// 然后安静地不带 TUN 继续跑。重启内核之前必须先把残留设备清掉，否则
+/// 重启只会原样再失败一次。
+#[cfg(windows)]
+pub fn clear_stale_tun_adapter() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = concat!(
+        "$ErrorActionPreference='SilentlyContinue';",
+        "Get-PnpDevice -Class Net | Where-Object {",
+        "  $_.FriendlyName -like 'NetWorkManger*' -or $_.FriendlyName -like 'Wintun*'",
+        "} | ForEach-Object {",
+        "  & pnputil.exe /remove-device \"$($_.InstanceId)\" | Out-Null",
+        "}"
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
 }
 
 /// 创建一个「句柄全部关闭即终止组内进程」的作业对象。
@@ -420,10 +492,13 @@ pub async fn supervise_core(shared: crate::server::Shared, shutdown: Arc<AtomicB
     const VERIFY_DELAY: Duration = Duration::from_millis(800);
     /// 两次「已自动恢复」提示之间至少隔这么久，避免循环刷屏。
     const NOTIFY_GAP: Duration = Duration::from_secs(120);
+    /// TUN 起不来时，先等这么久再重启内核，给系统时间释放上一张网卡。
+    const TUN_RETRY_DELAY: Duration = Duration::from_millis(1500);
 
     let mut backoff = RESTART_INTERVAL;
     let mut failures: u32 = 0;
     let mut last_notice: Option<Instant> = None;
+    let mut last_tun_notice: Option<Instant> = None;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -440,6 +515,59 @@ pub async fn supervise_core(shared: crate::server::Shared, shutdown: Arc<AtomicB
         if !needs_restart {
             // 用户本来就是关着的，或者内核正跑着：恢复正常节奏。
             failures = 0;
+
+            // 「进程活着」不等于「接管生效」。TUN 起不来时内核只打一条 error 就
+            // 继续跑：端口在听、界面显示接管中，实际一条流量都没被接管，用户看到
+            // 的就是「节点都挂着，出口 IP 还是本地的」。这是唯一能发现它的地方。
+            let tun_error = {
+                let state = shared.lock().await;
+                if state.core_desired_running {
+                    state.core.tun_start_error()
+                } else {
+                    None
+                }
+            };
+            if let Some(reason) = tun_error {
+                eprintln!("接管未真正生效：{reason}");
+                // 残留的 wintun 网卡不先清掉，重启内核只会原样再失败一次。
+                #[cfg(windows)]
+                clear_stale_tun_adapter();
+                let pending = {
+                    let mut state = shared.lock().await;
+                    if state.core_desired_running && !shutdown.load(Ordering::SeqCst) {
+                        let _ = state.core.stop();
+                        Some(state.config.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(config) = pending {
+                    // 立刻重启会撞上还没释放干净的网卡，等一下再拉起来。
+                    if sleep_watch(&shutdown, TUN_RETRY_DELAY).await {
+                        return;
+                    }
+                    let mut state = shared.lock().await;
+                    if let Err(err) = state.core.start(&config) {
+                        eprintln!("重启内核失败：{err}");
+                    }
+                }
+                let should_notify = last_tun_notice
+                    .map(|when| when.elapsed() >= NOTIFY_GAP)
+                    .unwrap_or(true);
+                if should_notify {
+                    let mut state = shared.lock().await;
+                    state.notify(
+                        "error",
+                        format!("接管没有真正生效（{reason}），已重启内核重试"),
+                    );
+                    last_tun_notice = Some(Instant::now());
+                }
+                if sleep_watch(&shutdown, RESTART_INTERVAL).await {
+                    return;
+                }
+                continue;
+            }
+
             if sleep_watch(&shutdown, RESTART_INTERVAL).await {
                 return;
             }
