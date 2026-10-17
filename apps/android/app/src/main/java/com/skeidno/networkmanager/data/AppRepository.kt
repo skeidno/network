@@ -632,6 +632,28 @@ class AppRepository private constructor(private val context: Context) {
             ).singleOrNull() ?: error("第 ${index + 1} 条规则无效")
         }
         val routing = root.optJSONObject("routing") ?: JSONObject()
+        // 桌面端会把「常用国内站点」整组折叠进 commonChina。端上不认识这一段的话，
+        // 这一组会整个丢掉 —— 国内域名跟着保底出口走，等于白配。这里展开成普通的
+        // 直连规则，至少规则还在，用户也能自己增删。
+        val china = routing.optJSONObject("commonChina")
+        val chinaRules: List<PortableRule> = china?.optJSONArray("domains")?.let { array ->
+            val values = List(array.length()) { index -> array.optString(index) }
+            val enabled = china.optBoolean("enabled", true)
+            buildList {
+                // 一次最多 500 条，超了就分批展开，别把整份配置拒掉。
+                values.chunked(500).forEach { chunk ->
+                    addAll(
+                        portableRulesFromValues(
+                            type = "domain_suffix",
+                            values = chunk,
+                            target = FallbackTarget.Direct,
+                            enabled = enabled,
+                            note = "常用国内站点",
+                        ),
+                    )
+                }
+            }
+        }.orEmpty()
         val common = routing.optJSONObject("commonOverseas") ?: JSONObject()
         val commonDomainsArray = common.optJSONArray("domains")
         val commonDomains = if (commonDomainsArray == null) {
@@ -661,7 +683,8 @@ class AppRepository private constructor(private val context: Context) {
                     enabled = common.optBoolean("enabled", true),
                 ),
                 commonRuleTarget = common.optString("target", "proxy").toFallbackTarget(),
-                portableRules = rules,
+                // 国内直连排在最前：它是「国内的就别绕出去」，要先于其它自定义规则命中。
+                portableRules = chinaRules + rules,
             ),
         )
         return nodes.size

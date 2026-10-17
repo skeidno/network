@@ -2,7 +2,8 @@ use serde_json::Value;
 use std::path::Path;
 
 use crate::models::{
-    AppConfig, RoutingRule, COMMON_OVERSEAS_GROUP, DEFAULT_PROXY_DOMAINS, PROXY_DOMAINS_V11,
+    AppConfig, RoutingRule, COMMON_CHINA_GROUP, COMMON_OVERSEAS_GROUP, DEFAULT_DIRECT_DOMAINS,
+    DEFAULT_PROXY_DOMAINS, PROXY_DOMAINS_V11,
 };
 use crate::paths::settings_path;
 
@@ -83,7 +84,54 @@ fn migrate(config: &mut AppConfig, stored_version: i64) -> bool {
     if stored_version < 12 {
         changed = append_new_domains(config) || changed;
     }
+    if stored_version < 14 {
+        changed = append_china_group(config) || changed;
+    }
     changed
+}
+
+/// 给老配置补一组「常用国内站点」直连规则。
+///
+/// 只在版本升级时跑一次，所以用户之后把整组删掉不会被塞回来。
+/// 已经存在的同名后缀一律跳过：用户自己配过的规则优先，不制造互相打架的重复项。
+fn append_china_group(config: &mut AppConfig) -> bool {
+    if config
+        .rules
+        .iter()
+        .any(|rule| rule.group == COMMON_CHINA_GROUP)
+    {
+        return false;
+    }
+    let present: Vec<String> = config
+        .rules
+        .iter()
+        .map(|rule| crate::mihomo::normalize_rule_value(&rule.rule_type, &rule.value))
+        .collect();
+    let added: Vec<RoutingRule> = DEFAULT_DIRECT_DOMAINS
+        .iter()
+        .filter(|(domain, _)| !present.iter().any(|value| value == *domain))
+        .map(|(domain, label)| RoutingRule {
+            rule_type: "DOMAIN-SUFFIX".into(),
+            value: (*domain).into(),
+            target: "DIRECT".into(),
+            enabled: true,
+            note: (*label).into(),
+            group: COMMON_CHINA_GROUP.into(),
+        })
+        .collect();
+    if added.is_empty() {
+        return false;
+    }
+    // 插到海外组之前，让规则列表里「国内直连 → 海外代理」的次序一眼看得出来。
+    let position = config
+        .rules
+        .iter()
+        .position(|rule| crate::portable::is_common_overseas_rule(rule))
+        .unwrap_or(config.rules.len());
+    let tail = config.rules.split_off(position);
+    config.rules.extend(added);
+    config.rules.extend(tail);
+    true
 }
 
 /// 把新版本追加进去的内置域名补到已有配置里。
@@ -149,7 +197,7 @@ fn quarantine(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::default_routing_rules;
+    use crate::models::{default_routing_rules, DEFAULT_PROXY_DOMAINS};
 
     fn config_from(domains: &[&str]) -> AppConfig {
         let mut config = AppConfig::default();
@@ -222,6 +270,79 @@ mod tests {
         }];
         assert!(!append_new_domains(&mut config));
         assert_eq!(config.rules.len(), 1);
+    }
+
+    #[test]
+    fn china_group_defaults_go_direct() {
+        let rules = default_routing_rules();
+        let china: Vec<&RoutingRule> = rules
+            .iter()
+            .filter(|rule| rule.group == COMMON_CHINA_GROUP)
+            .collect();
+        assert_eq!(china.len(), DEFAULT_DIRECT_DOMAINS.len());
+        assert!(
+            china.iter().all(|rule| rule.target == "DIRECT"),
+            "国内站点那一组必须整组直连"
+        );
+        for domain in ["weixin.qq.com", "taobao.com", "alipay.com", "feishu.cn"] {
+            assert!(
+                china.iter().any(|rule| domain.ends_with(&rule.value)),
+                "清单里应能匹配 {domain}"
+            );
+        }
+    }
+
+    #[test]
+    fn china_group_is_seeded_ahead_of_the_overseas_group() {
+        let mut config = config_from(&DEFAULT_PROXY_DOMAINS[..3].iter().map(|(d, _)| *d).collect::<Vec<_>>());
+        assert!(append_china_group(&mut config));
+        let first_china = config
+            .rules
+            .iter()
+            .position(|rule| rule.group == COMMON_CHINA_GROUP)
+            .expect("应补出国内组");
+        let first_overseas = config
+            .rules
+            .iter()
+            .position(|rule| rule.group == COMMON_OVERSEAS_GROUP)
+            .expect("海外组还在");
+        assert!(
+            first_china < first_overseas,
+            "国内直连要先匹配，不能排在海外组后面"
+        );
+    }
+
+    #[test]
+    fn china_group_skips_domains_the_user_already_set() {
+        let mut config = AppConfig::default();
+        config.rules = vec![RoutingRule {
+            rule_type: "DOMAIN-SUFFIX".into(),
+            value: "baidu.com".into(),
+            target: "CLASH".into(),
+            enabled: true,
+            note: "我自己配的".into(),
+            group: String::new(),
+        }];
+        assert!(append_china_group(&mut config));
+        let matched: Vec<&RoutingRule> = config
+            .rules
+            .iter()
+            .filter(|rule| rule.value == "baidu.com")
+            .collect();
+        assert_eq!(
+            matched.len(),
+            1,
+            "用户自己配过的域名不能被补一条互相打架的重复规则"
+        );
+        assert_eq!(matched[0].target, "CLASH");
+    }
+
+    #[test]
+    fn china_group_is_not_seeded_twice() {
+        let mut config = AppConfig::default();
+        config.rules = default_routing_rules();
+        assert!(!append_china_group(&mut config));
+        assert_eq!(config.rules.len(), default_routing_rules().len());
     }
 
     #[test]

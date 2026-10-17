@@ -560,7 +560,7 @@ function renderRules() {
         <td><span class="group-label">${escapeHtml(rule.ruleTypeLabel)}</span></td>
         <td title="${escapeHtml(rule.detail)}"><strong>${escapeHtml(rule.note)}</strong><small>${rule.count} 条匹配</small></td>
         <td><span class="chip">${escapeHtml(rule.targetLabel)}</span></td>
-        <td>第 1 阶段：站点域名选择代理出口</td>
+        <td>整组共用当前出口 · ${escapeHtml(rule.note)}</td>
         <td class="actions">
           <button class="mini-button" data-rule-action="view" data-rule-group="${rule.groupId}" title="查看全部域名">${icon("file-text")}</button>
           <button class="mini-button" data-rule-action="toggle" data-rule-group="${rule.groupId}" title="${rule.enabled ? "停用整组" : "启用整组"}">${icon(rule.enabled ? "square" : "check")}</button>
@@ -1277,7 +1277,7 @@ function openRuleGroupDialog(group, focusValues = false) {
     </button>`).join("");
   const entries = Array.isArray(group.entries) ? group.entries : [];
   const values = entries.map((entry) => entry.domain).join("\n");
-  openModal("常用海外站点", `
+  openModal(escapeHtml(group.note || "规则组"), `
     <div class="form-grid rule-group-editor">
       <div class="wide-field">
         <div class="rule-group-editor-head"><span class="field-label">匹配内容（一行一个域名）</span><label class="rule-value-search"><span class="sr-only">查找域名</span><input id="rule-group-search" type="search" placeholder="查找域名"><button id="rule-group-find" type="button" class="mini-button" title="查找下一个">${icon("search")}</button></label></div>
@@ -1377,7 +1377,7 @@ function openRuleGroupDomains(group) {
       <strong title="${escapeHtml(entry.domain)}">${escapeHtml(entry.domain)}</strong>
       <span title="${escapeHtml(entry.label)}">${escapeHtml(entry.label || "其他")}</span>
     </div>`).join("");
-  openModal("常用海外站点域名", `
+  openModal(`${escapeHtml(group.note || "规则组")}域名`, `
     <div class="rule-domain-browser">
       <div class="group-dialog-summary"><strong>${group.count} 条匹配 · ${escapeHtml(group.targetLabel)}</strong><span>整组共用当前出口</span></div>
       <label class="rule-domain-search"><span>搜索域名或分类</span><input id="rule-domain-filter" type="search" placeholder="例如 arcteryx、Google、ChatGPT" autocomplete="off"></label>
@@ -1714,7 +1714,7 @@ function bindEvents() {
       const group = appState.rules.find((rule) => rule.groupId === groupId);
       if (action === "view") openRuleGroupDialog(group, true);
       else if (action === "edit") openRuleGroupDialog(group);
-      else if (action === "delete") confirmAction("删除规则组", "确定删除常用海外站点规则组？", () => invoke("ruleGroupAction", groupId, "delete"));
+      else if (action === "delete") confirmAction("删除规则组", `确定删除${group.note || "该规则组"}？`, () => invoke("ruleGroupAction", groupId, "delete"));
       else invoke("ruleGroupAction", groupId, action);
       return;
     }

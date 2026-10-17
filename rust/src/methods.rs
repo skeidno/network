@@ -878,14 +878,26 @@ async fn measure_node(target: TestTarget, core: Option<Arc<CoreProbe>>) -> (Stri
     (target.name, delay)
 }
 
-/// 常用海外站点规则组在 `rules` 中的下标。
-fn common_rule_indexes(state: &AppState) -> Vec<usize> {
+/// 内置规则组的 id 白名单：目前是国内直连组和海外代理组。
+fn is_builtin_group(group_id: &str) -> bool {
+    matches!(
+        group_id,
+        crate::models::COMMON_CHINA_GROUP | crate::models::COMMON_OVERSEAS_GROUP
+    )
+}
+
+/// 某个内置规则组在 `rules` 中的下标。
+fn common_rule_indexes(state: &AppState, group_id: &str) -> Vec<usize> {
+    let members: fn(&crate::models::RoutingRule) -> bool = match group_id {
+        crate::models::COMMON_CHINA_GROUP => crate::portable::is_common_china_rule,
+        _ => crate::portable::is_common_overseas_rule,
+    };
     state
         .config
         .rules
         .iter()
         .enumerate()
-        .filter(|(_, rule)| crate::portable::is_common_overseas_rule(rule))
+        .filter(|(_, rule)| members(rule))
         .map(|(index, _)| index)
         .collect()
 }
@@ -1453,10 +1465,11 @@ pub async fn dispatch(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if group_id != crate::models::COMMON_OVERSEAS_GROUP {
+            if !is_builtin_group(&group_id) {
                 state.notify("error", "规则组无效");
                 return Ok(json!(null));
             }
+            let group_name = crate::portable::builtin_group_name(&group_id);
             let target = payload_value
                 .get("target")
                 .and_then(|v| v.as_str())
@@ -1466,7 +1479,7 @@ pub async fn dispatch(
                 state.notify("error", "规则组去向无效");
                 return Ok(json!(null));
             }
-            let members: Vec<usize> = common_rule_indexes(state);
+            let members: Vec<usize> = common_rule_indexes(state, &group_id);
             if members.is_empty() {
                 state.notify("error", "规则组已经不存在");
                 return Ok(json!(null));
@@ -1477,17 +1490,18 @@ pub async fn dispatch(
                     for index in members {
                         state.config.rules[index].target = target.clone();
                     }
-                    state.notify("success", "常用海外站点去向已更新");
+                    state.notify("success", format!("{group_name}去向已更新"));
                 }
                 Some(Value::Null) => {
                     for index in members {
                         state.config.rules[index].target = target.clone();
                     }
-                    state.notify("success", "常用海外站点去向已更新");
+                    state.notify("success", format!("{group_name}去向已更新"));
                 }
                 Some(values) => {
                     let list = values.as_array().cloned().unwrap_or_default();
-                    let rebuilt = match crate::portable::common_overseas_rules(
+                    let rebuilt = match crate::portable::builtin_group_rules(
+                        &group_id,
                         &json!(list),
                         &target,
                         true,
@@ -1498,16 +1512,23 @@ pub async fn dispatch(
                             return Ok(json!(null));
                         }
                     };
-                    let keep: Vec<RoutingRule> = state
+                    let kept: Vec<(usize, RoutingRule)> = state
                         .config
                         .rules
                         .iter()
                         .enumerate()
                         .filter(|(index, _)| !members.contains(index))
-                        .map(|(_, rule)| rule.clone())
+                        .map(|(index, rule)| (index, rule.clone()))
                         .collect();
-                    state.config.rules = [keep, rebuilt].concat();
-                    state.notify("success", "常用海外站点已更新");
+                    // 重建后放回原来的位置，别把整组甩到列表末尾 ——
+                    // 组内顺序是「国内直连 → 海外代理」，挪到后面会跟着变。
+                    let anchor = members.first().copied().unwrap_or(usize::MAX);
+                    let insert_at = kept.iter().take_while(|(index, _)| *index < anchor).count();
+                    let mut rules: Vec<RoutingRule> =
+                        kept.into_iter().map(|(_, rule)| rule).collect();
+                    let tail = rules.split_off(insert_at);
+                    state.config.rules = [rules, rebuilt, tail].concat();
+                    state.notify("success", format!("{group_name}已更新"));
                 }
             }
             apply(state)
@@ -1515,10 +1536,11 @@ pub async fn dispatch(
         "ruleGroupAction" => {
             let group_id = text(&args, 0);
             let action = text(&args, 1);
-            if group_id != crate::models::COMMON_OVERSEAS_GROUP {
+            if !is_builtin_group(&group_id) {
                 return Ok(json!(null));
             }
-            let members = common_rule_indexes(state);
+            let group_name = crate::portable::builtin_group_name(&group_id);
+            let members = common_rule_indexes(state, &group_id);
             if members.is_empty() {
                 return Ok(json!(null));
             }
@@ -1530,7 +1552,7 @@ pub async fn dispatch(
                     for index in members {
                         state.config.rules[index].enabled = enabled;
                     }
-                    state.notify("success", "常用海外站点规则组状态已更新");
+                    state.notify("success", format!("{group_name}规则组状态已更新"));
                 }
                 "delete" => {
                     state.config.rules = state
@@ -1541,7 +1563,7 @@ pub async fn dispatch(
                         .filter(|(index, _)| !members.contains(index))
                         .map(|(_, rule)| rule.clone())
                         .collect();
-                    state.notify("success", "常用海外站点规则组已删除");
+                    state.notify("success", format!("{group_name}规则组已删除"));
                 }
                 _ => return Ok(json!(null)),
             }

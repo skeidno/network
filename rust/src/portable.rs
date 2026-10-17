@@ -7,8 +7,9 @@
 use serde_json::{json, Value};
 
 use crate::models::{
-    default_routing_rules, normalize_group, AppConfig, ImportedNode, RoutingRule,
-    SubscriptionSource, COMMON_OVERSEAS_GROUP, DEFAULT_PROXY_DOMAINS,
+    normalize_group, AppConfig, ImportedNode, RoutingRule,
+    SubscriptionSource, COMMON_CHINA_GROUP, COMMON_OVERSEAS_GROUP, DEFAULT_DIRECT_DOMAINS,
+    DEFAULT_PROXY_DOMAINS,
 };
 
 pub const PORTABLE_FORMAT: &str = "network-manager-config";
@@ -45,6 +46,60 @@ pub fn is_common_overseas_rule(rule: &RoutingRule) -> bool {
     DEFAULT_PROXY_DOMAINS
         .iter()
         .any(|(domain, _)| *domain == value)
+}
+
+/// 「常用国内站点」组内成员。
+///
+/// 比组 id 多认一种情况：老配置里用户自己加的、域名正好在国内清单里的直连规则，
+/// 也归到这一组里一起显示，不然界面上会出现「组里有、组外也有」的两份同域名规则。
+/// 要求 target 是直连 —— 用户明确让某个国内域名走代理时，那是另一回事，不能被吞进来。
+pub fn is_common_china_rule(rule: &RoutingRule) -> bool {
+    if rule.group == COMMON_CHINA_GROUP {
+        return true;
+    }
+    if rule.rule_type != "DOMAIN-SUFFIX" || !is_direct_target(&rule.target) {
+        return false;
+    }
+    let value = crate::mihomo::normalize_rule_value(&rule.rule_type, &rule.value);
+    DEFAULT_DIRECT_DOMAINS
+        .iter()
+        .any(|(domain, _)| *domain == value)
+}
+
+fn is_direct_target(target: &str) -> bool {
+    target.eq_ignore_ascii_case("DIRECT")
+}
+
+/// 两个内置规则组的判定入口：导出时要整组折叠，普通规则区不能再出现它们。
+pub fn is_builtin_group_rule(rule: &RoutingRule) -> bool {
+    is_common_overseas_rule(rule) || is_common_china_rule(rule)
+}
+
+/// 内置规则组的展示名，提示语里用它，免得写死「常用海外站点」。
+pub fn builtin_group_name(group_id: &str) -> &'static str {
+    match group_id {
+        COMMON_CHINA_GROUP => "常用国内站点",
+        _ => "常用海外站点",
+    }
+}
+
+/// 内置规则组的默认域名清单（"恢复默认"按钮用）。
+pub fn builtin_group_defaults(group_id: &str) -> Vec<&'static str> {
+    match group_id {
+        COMMON_CHINA_GROUP => DEFAULT_DIRECT_DOMAINS
+            .iter()
+            .map(|(domain, _)| *domain)
+            .collect(),
+        _ => DEFAULT_PROXY_DOMAINS.iter().map(|(domain, _)| *domain).collect(),
+    }
+}
+
+/// 内置规则组的标签表，用来给自定义域名补一个说明。
+fn builtin_group_labels(group_id: &str) -> &'static [(&'static str, &'static str)] {
+    match group_id {
+        COMMON_CHINA_GROUP => DEFAULT_DIRECT_DOMAINS,
+        _ => DEFAULT_PROXY_DOMAINS,
+    }
 }
 
 fn portable_target(target: &str) -> &'static str {
@@ -230,8 +285,20 @@ pub fn common_overseas_rules(
     target: &str,
     enabled: bool,
 ) -> Result<Vec<RoutingRule>, String> {
+    builtin_group_rules(COMMON_OVERSEAS_GROUP, values, target, enabled)
+}
+
+/// 按内置组生成规则：域名清单 → 一组 `DOMAIN-SUFFIX` 规则。
+///
+/// 两个组（国内直连 / 海外代理）走的是同一套生成逻辑，只是默认域名表不同。
+pub fn builtin_group_rules(
+    group_id: &str,
+    values: &Value,
+    target: &str,
+    enabled: bool,
+) -> Result<Vec<RoutingRule>, String> {
     let Some(list) = values.as_array() else {
-        return Err("commonOverseas.domains 必须是数组".into());
+        return Err(format!("{} 的 domains 必须是数组", builtin_group_name(group_id)));
     };
     if list.is_empty() || list.len() > 500 {
         return Err("每次必须填写 1 到 500 条匹配内容".into());
@@ -249,12 +316,12 @@ pub fn common_overseas_rules(
             value: value.clone(),
             target: target.to_string(),
             enabled,
-            note: DEFAULT_PROXY_DOMAINS
+            note: builtin_group_labels(group_id)
                 .iter()
                 .find(|(domain, _)| *domain == value)
                 .map(|(_, label)| (*label).to_string())
                 .unwrap_or_else(|| "自定义".into()),
-            group: COMMON_OVERSEAS_GROUP.into(),
+            group: group_id.to_string(),
         };
         let errors = validate_rule(&rule);
         if !errors.is_empty() {
@@ -275,9 +342,14 @@ pub fn export_portable_config(config: &AppConfig) -> Value {
         .iter()
         .filter(|rule| is_common_overseas_rule(rule))
         .collect();
+    let china_rules: Vec<&RoutingRule> = config
+        .rules
+        .iter()
+        .filter(|rule| is_common_china_rule(rule))
+        .collect();
     let mut custom_rules: Vec<Value> = Vec::new();
     for rule in &config.rules {
-        if rule.rule_type == "PROCESS-NAME" || is_common_overseas_rule(rule) {
+        if rule.rule_type == "PROCESS-NAME" || is_builtin_group_rule(rule) {
             continue;
         }
         let Some(portable_type) = portable_rule_types()
@@ -318,6 +390,16 @@ pub fn export_portable_config(config: &AppConfig) -> Value {
                 "enabled": !common_rules.is_empty() && common_rules.iter().all(|rule| rule.enabled),
                 "target": portable_target(common_rules.first().map(|rule| rule.target.as_str()).unwrap_or("BUILTIN")),
                 "domains": common_rules
+                    .iter()
+                    .map(|rule| crate::mihomo::normalize_rule_value(&rule.rule_type, &rule.value))
+                    .collect::<Vec<String>>(),
+            },
+            // 国内组同样折叠：它是内置组，不能混进普通规则里散着导出，
+            // 否则导入回来就退化成几百条没法整组管理的单条规则。
+            "commonChina": {
+                "enabled": !china_rules.is_empty() && china_rules.iter().all(|rule| rule.enabled),
+                "target": portable_target(china_rules.first().map(|rule| rule.target.as_str()).unwrap_or("DIRECT")),
+                "domains": china_rules
                     .iter()
                     .map(|rule| crate::mihomo::normalize_rule_value(&rule.rule_type, &rule.value))
                     .collect::<Vec<String>>(),
@@ -509,13 +591,27 @@ pub fn import_portable_config(current: &AppConfig, payload: &Value) -> Result<Ap
     let common_target = windows_target(common_settings.get("target"), has_nodes);
     let common_domains = match common_settings.get("domains") {
         Some(value) => value.clone(),
-        None => json!(default_routing_rules()
-            .iter()
-            .filter(|rule| rule.rule_type == "DOMAIN-SUFFIX")
-            .map(|rule| rule.value.clone())
-            .collect::<Vec<String>>()),
+        None => json!(builtin_group_defaults(COMMON_OVERSEAS_GROUP)),
     };
     let common_rules = common_overseas_rules(&common_domains, &common_target, common_enabled)?;
+
+    // 国内组：老配置文件里没有这段（PORTABLE_VERSION 仍是 1，保持互相能读），
+    // 缺失就按内置清单重建，不会把国内域名误塞进海外组。
+    let china_settings = routing.get("commonChina").cloned().unwrap_or_else(|| json!({}));
+    if !china_settings.is_object() {
+        return Err("commonChina 必须是对象".into());
+    }
+    let china_enabled = bool_field(&china_settings, "enabled", true);
+    let china_target = match china_settings.get("target") {
+        Some(value) => windows_target(Some(value), has_nodes),
+        None => "DIRECT".to_string(),
+    };
+    let china_domains = match china_settings.get("domains") {
+        Some(value) => value.clone(),
+        None => json!(builtin_group_defaults(COMMON_CHINA_GROUP)),
+    };
+    let china_rules =
+        builtin_group_rules(COMMON_CHINA_GROUP, &china_domains, &china_target, china_enabled)?;
 
     let mut portable_rules: Vec<RoutingRule> = Vec::new();
     for item in &rules_data {
@@ -541,7 +637,8 @@ pub fn import_portable_config(current: &AppConfig, payload: &Value) -> Result<Ap
         }
         portable_rules.push(rule);
     }
-    imported.rules = [process_rules, common_rules, portable_rules].concat();
+    // 国内组排在海外组之前：两边万一有归属不清的后缀，先按直连处理。
+    imported.rules = [process_rules, china_rules, common_rules, portable_rules].concat();
 
 
     let errors = validate_config(&imported);
@@ -556,5 +653,72 @@ fn nonempty(value: String, fallback: String) -> String {
         fallback
     } else {
         value.trim().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::default_routing_rules;
+
+    #[test]
+    fn china_group_round_trips_as_a_group() {
+        let mut config = AppConfig::default();
+        config.rules = default_routing_rules();
+        let exported = export_portable_config(&config);
+
+        let china_domains = exported["routing"]["commonChina"]["domains"]
+            .as_array()
+            .expect("导出应带 commonChina.domains");
+        assert_eq!(china_domains.len(), DEFAULT_DIRECT_DOMAINS.len());
+
+        // 普通规则区不能再出现内置组的东西：否则导入回来就散成一堆单条规则，
+        // 界面上没法再整组开关、整组换出口。
+        let custom = exported["rules"].as_array().expect("rules 是数组");
+        assert!(
+            !custom
+                .iter()
+                .any(|item| item["value"].as_str() == Some("baidu.com")),
+            "内置组的域名不该混进普通规则"
+        );
+
+        let imported = import_portable_config(&AppConfig::default(), &exported)
+            .expect("导出的配置应该能导回来");
+        let first_china = imported
+            .rules
+            .iter()
+            .position(is_common_china_rule)
+            .expect("导入后国内组还在");
+        let first_overseas = imported
+            .rules
+            .iter()
+            .position(is_common_overseas_rule)
+            .expect("导入后海外组还在");
+        assert!(first_china < first_overseas, "国内组仍应在海外组之前");
+        assert_eq!(
+            imported.rules.iter().filter(|rule| is_common_china_rule(rule)).count(),
+            DEFAULT_DIRECT_DOMAINS.len(),
+            "一组 231 条应该整组回来，不是散成单条"
+        );
+    }
+
+    #[test]
+    fn legacy_portable_config_without_china_group_still_imports() {
+        let mut config = AppConfig::default();
+        config.rules = default_routing_rules();
+        let mut exported = export_portable_config(&config);
+        // 老版本导出的文件里没有这一段（PORTABLE_VERSION 仍是 1）。
+        exported["routing"]
+            .as_object_mut()
+            .expect("routing 是对象")
+            .remove("commonChina");
+
+        let imported = import_portable_config(&AppConfig::default(), &exported)
+            .expect("缺 commonChina 也应该能导入");
+        assert_eq!(
+            imported.rules.iter().filter(|rule| is_common_china_rule(rule)).count(),
+            DEFAULT_DIRECT_DOMAINS.len(),
+            "缺失时按内置清单重建，不能把国内域名漏掉"
+        );
     }
 }

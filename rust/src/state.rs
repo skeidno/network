@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use crate::core::{memory_mb, AppState, NodeDelay};
 use crate::models::{
-    server_proxy_port_error, AppConfig, RoutingRule, COMMON_OVERSEAS_GROUP,
-    DEFAULT_PROXY_DOMAINS,
+    server_proxy_port_error, AppConfig, RoutingRule, COMMON_CHINA_GROUP,
+    COMMON_OVERSEAS_GROUP,
 };
 
 pub const MODE_LABELS: &[(&str, &str)] = &[
@@ -60,24 +60,12 @@ fn format_rate(bytes_per_second: f64) -> String {
     format!("{}/s", format_bytes(bytes_per_second))
 }
 
-fn label(table: &[(&str, &str)], key: &str) -> String {    table
+fn label(table: &[(&str, &str)], key: &str) -> String {
+    table
         .iter()
         .find(|(name, _)| *name == key)
         .map(|(_, text)| (*text).to_string())
         .unwrap_or_else(|| key.to_string())
-}
-
-fn is_common_overseas_rule(rule: &RoutingRule) -> bool {
-    if rule.group == COMMON_OVERSEAS_GROUP {
-        return true;
-    }
-    if rule.rule_type != "DOMAIN-SUFFIX" {
-        return false;
-    }
-    let value = crate::mihomo::normalize_rule_value(&rule.rule_type, &rule.value);
-    DEFAULT_PROXY_DOMAINS
-        .iter()
-        .any(|(domain, _)| *domain == value)
 }
 
 fn port_is_open(host: &str, port: i32) -> bool {
@@ -103,70 +91,110 @@ fn source_state(name: &str, protocol: &str, host: &str, port: i32, enabled: bool
     })
 }
 
-fn rule_states(config: &AppConfig) -> Vec<Value> {
-    let common: Vec<(usize, &RoutingRule)> = config
-        .rules
+/// 内置规则组的定义：判定函数 + 展示名 + 默认域名清单。
+struct BuiltinGroup {
+    id: &'static str,
+    name: &'static str,
+    members: fn(&RoutingRule) -> bool,
+}
+
+const BUILTIN_GROUPS: [BuiltinGroup; 2] = [
+    BuiltinGroup {
+        id: COMMON_CHINA_GROUP,
+        name: "常用国内站点",
+        members: crate::portable::is_common_china_rule,
+    },
+    BuiltinGroup {
+        id: COMMON_OVERSEAS_GROUP,
+        name: "常用海外站点",
+        members: crate::portable::is_common_overseas_rule,
+    },
+];
+
+/// 把属于内置组的若干条规则合成界面上的一行「整组」。
+///
+/// 组是写进配置文件的真实规则，不是每次启动算出来的派生数据，所以这里只是
+/// 把它们聚在一起展示：整组开关、整组换出口、整组编辑域名都作用在这些成员上。
+fn group_state(group: &BuiltinGroup, members: &[(usize, &RoutingRule)]) -> Value {
+    let targets: std::collections::HashSet<&str> =
+        members.iter().map(|(_, item)| item.target.as_str()).collect();
+    let target = if targets.len() == 1 {
+        members
+            .first()
+            .map(|(_, item)| item.target.clone())
+            .unwrap_or_default()
+    } else {
+        "MIXED".to_string()
+    };
+    let enabled_count = members.iter().filter(|(_, item)| item.enabled).count();
+    let entries: Vec<Value> = members
         .iter()
-        .enumerate()
-        .filter(|(_, rule)| is_common_overseas_rule(rule))
+        .map(|(_, item)| {
+            json!({
+                "domain": item.value,
+                "label": item.note,
+                "enabled": item.enabled,
+            })
+        })
         .collect();
-    let common_indexes: std::collections::HashSet<usize> =
-        common.iter().map(|(index, _)| *index).collect();
+    let detail = members
+        .iter()
+        .map(|(_, item)| item.value.clone())
+        .collect::<Vec<_>>()
+        .join("、");
+    let default_entries: Vec<Value> = crate::portable::builtin_group_defaults(group.id)
+        .into_iter()
+        .map(|domain| json!(domain))
+        .collect();
+    json!({
+        "kind": "group",
+        "groupId": group.id,
+        "enabled": enabled_count == members.len(),
+        "partiallyEnabled": 0 < enabled_count && enabled_count < members.len(),
+        "ruleType": "GROUP",
+        "ruleTypeLabel": label(RULE_LABELS, "GROUP"),
+        "value": format!("{} 条匹配", members.len()),
+        "detail": detail,
+        "entries": entries,
+        "defaultEntries": default_entries,
+        "target": target,
+        "targetLabel": if targets.len() == 1 { label(TARGET_LABELS, &target) } else { "多个去向".to_string() },
+        "note": group.name,
+        "count": members.len(),
+    })
+}
+
+fn rule_states(config: &AppConfig) -> Vec<Value> {
+    // 每个内置组各自的成员下标；一行组内规则在界面上只占一行。
+    let grouped: Vec<(&BuiltinGroup, Vec<(usize, &RoutingRule)>)> = BUILTIN_GROUPS
+        .iter()
+        .map(|group| {
+            let members = config
+                .rules
+                .iter()
+                .enumerate()
+                .filter(|(_, rule)| (group.members)(rule))
+                .collect();
+            (group, members)
+        })
+        .collect();
+    let mut group_added: Vec<&str> = Vec::new();
 
     let mut states: Vec<Value> = Vec::new();
-    let mut group_added = false;
     for (index, rule) in config.rules.iter().enumerate() {
-        if common_indexes.contains(&index) {
-            if group_added {
+        let mut handled = false;
+        for (group, members) in &grouped {
+            if !members.iter().any(|(member_index, _)| *member_index == index) {
                 continue;
             }
-            group_added = true;
-            let targets: std::collections::HashSet<&str> =
-                common.iter().map(|(_, item)| item.target.as_str()).collect();
-            let target = if targets.len() == 1 {
-                common
-                    .first()
-                    .map(|(_, item)| item.target.clone())
-                    .unwrap_or_default()
-            } else {
-                "MIXED".to_string()
-            };
-            let enabled_count = common.iter().filter(|(_, item)| item.enabled).count();
-            let entries: Vec<Value> = common
-                .iter()
-                .map(|(_, item)| {
-                    json!({
-                        "domain": item.value,
-                        "label": item.note,
-                        "enabled": item.enabled,
-                    })
-                })
-                .collect();
-            let detail = common
-                .iter()
-                .map(|(_, item)| item.value.clone())
-                .collect::<Vec<_>>()
-                .join("、");
-            let default_entries: Vec<Value> = DEFAULT_PROXY_DOMAINS
-                .iter()
-                .map(|(domain, _)| json!(domain))
-                .collect();
-            states.push(json!({
-                "kind": "group",
-                "groupId": COMMON_OVERSEAS_GROUP,
-                "enabled": enabled_count == common.len(),
-                "partiallyEnabled": 0 < enabled_count && enabled_count < common.len(),
-                "ruleType": "GROUP",
-                "ruleTypeLabel": label(RULE_LABELS, "GROUP"),
-                "value": format!("{} 条匹配", common.len()),
-                "detail": detail,
-                "entries": entries,
-                "defaultEntries": default_entries,
-                "target": target,
-                "targetLabel": if targets.len() == 1 { label(TARGET_LABELS, &target) } else { "多个去向".to_string() },
-                "note": "常用海外站点",
-                "count": common.len(),
-            }));
+            handled = true;
+            if members.is_empty() || group_added.contains(&group.id) {
+                continue;
+            }
+            group_added.push(group.id);
+            states.push(group_state(group, members));
+        }
+        if handled {
             continue;
         }
         states.push(json!({
