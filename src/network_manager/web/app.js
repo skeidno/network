@@ -1045,47 +1045,76 @@ function renderEnv(data) {
     return;
   }
 
+  const outdated = items.filter((item) => item.outdated);
   const missing = items.filter((item) => !item.ready);
-  summary.innerHTML = missing.length
-    ? `<strong>${data.ready}/${data.total}</strong> 已就绪 · 缺 ${missing.length} 项：${escapeHtml(missing.map((item) => item.name).join("、"))}`
-    : `<strong>${data.total}/${data.total}</strong> 全部就绪`;
+  // 摘要把三种情况分开讲。混成一句「N/M 就绪」的话，
+  // 用户看到 5/7 会不知道剩下两项是没装还是版本旧，而这两者要做的事完全不同。
+  const parts = [`<strong>${data.ready}/${data.total}</strong> 已就绪`];
+  if (outdated.length) parts.push(`${outdated.length} 项版本过旧（${escapeHtml(outdated.map((i) => i.name).join("、"))}）`);
+  if (missing.length) parts.push(`${missing.length} 项缺失（${escapeHtml(missing.map((i) => i.name).join("、"))}）`);
+  summary.innerHTML = parts.join(" · ");
 
   grid.innerHTML = items.map((item) => {
     // winget 不可用时不给「一键部署」，只留「去官网」，并在卡片上说明原因
-    const canInstall = Boolean(item.canInstall) && !item.ready;
-    const versionText = item.ready
-      ? (item.version || "已安装")
-      : "未检测到";
+    const canInstall = Boolean(item.canInstall);
+    const canReinstall = Boolean(item.canReinstall) && item.outdated;
+    // 三态决定徽章与卡片配色：就绪 / 缺失 / 版本过旧
+    const state = item.outdated ? "outdated" : (item.ready ? "ready" : "missing");
+    const badgeText = item.outdated ? "版本过旧" : (item.ready ? "已就绪" : "缺失");
+    const versionText = item.ready ? (item.version || "已安装") : "未检测到";
     const pathHint = item.path
       ? escapeHtml(item.path)
       : (item.ready ? "位置未记录" : "");
+
+    // 版本过旧时把「需要哪个版本」摆出来。后端的 outdatedNote 里也带当前版本，
+    // 但那是给 toast 用的单行摘要；这里已经有版本号单独一行了，再拼一遍会变成
+    // 「需要 20.0.0 或更高；当前 18.19.0，建议 20.0.0 以上」—— 同一句话说三遍。
+    // outdatedNote 不丢，挪到 title 上做悬浮提示，信息还在但不占版面。
+    const hint = item.outdated
+      ? `<div class="env-card-hint"${item.outdatedNote ? ` title="${escapeHtml(item.outdatedNote)}"` : ""}>需要 <code>${escapeHtml(item.minVersion)}</code> 或更高版本，重装可升级到最新版</div>`
+      : "";
+
+    let actions;
+    if (item.outdated) {
+      // 过期项给「重装」，不给「一键部署」—— 重装走 upgrade，破坏性小得多
+      actions = `${canReinstall
+          ? `<button type="button" class="button primary" data-env-reinstall="${escapeHtml(item.id)}">${icon("refresh-cw")}<span>重装升级</span></button>`
+          : ""}
+        <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">查看官网版本</button>`;
+    } else if (item.ready) {
+      actions = `<button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">打开官网</button>`;
+    } else {
+      actions = `${canInstall
+          ? `<button type="button" class="button primary" data-env-install="${escapeHtml(item.id)}">${icon("download")}<span>一键部署</span></button>`
+          : ""}
+        <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">去官网下载</button>`;
+    }
+
     return `
-      <div class="env-card ${item.ready ? "is-ready" : "is-missing"}" data-env-card="${escapeHtml(item.id)}">
+      <div class="env-card is-${state}" data-env-card="${escapeHtml(item.id)}">
         <div class="env-card-head">
           <span class="env-card-name">${escapeHtml(item.name)}</span>
-          <span class="env-badge ${item.ready ? "is-ready" : "is-missing"}">${item.ready ? "已就绪" : "缺失"}</span>
+          <span class="env-badge is-${state}">${badgeText}</span>
         </div>
         <div class="env-card-version ${item.ready && !item.version ? "is-unknown" : ""}">${escapeHtml(versionText)}</div>
+        ${hint}
         ${pathHint ? `<div class="env-card-path">${pathHint}</div>` : ""}
         ${item.note ? `<div class="env-card-note">${escapeHtml(item.note)}</div>` : ""}
-        <div class="env-card-actions">
-          ${item.ready
-            ? `<button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">打开官网</button>`
-            : `${canInstall
-                ? `<button type="button" class="button primary" data-env-install="${escapeHtml(item.id)}">${icon("download")}<span>一键部署</span></button>`
-                : ""}
-              <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">去官网下载</button>`}
-        </div>
+        <div class="env-card-actions">${actions}</div>
       </div>`;
   }).join("");
 
-  // 一键部署只在「确有缺失且本机能自动装」时才可点
+  // 一键部署只在「确有缺失且本机能自动装」时才可点。
+  // 过期项不算在内 —— 它需要的是重装，混进批量安装会让 winget 去做破坏性更大的事。
   const installAll = byId("env-install-all");
   const installable = missing.filter((item) => item.canInstall);
   installAll.disabled = !installable.length || envBusy;
-  installAll.title = data.winget
-    ? (installable.length ? `将依次安装：${installable.map((item) => item.name).join("、")}` : "没有缺失项")
-    : "本机没有 winget，无法自动安装";
+  const hints = [];
+  if (!data.winget) hints.push("本机没有 winget，无法自动安装");
+  else if (installable.length) hints.push(`将依次安装：${installable.map((item) => item.name).join("、")}`);
+  else hints.push("没有缺失项");
+  if (outdated.length) hints.push(`过期项请单独点「重装升级」`);
+  installAll.title = hints.join("；");
 }
 
 async function refreshEnv() {
@@ -1114,31 +1143,42 @@ function showEnvDetail(title, body) {
 function setEnvBusy(busy) {
   envBusy = busy;
   // 安装期间把所有按钮禁掉：winget 独占安装锁，连点两次只会得到一段乱序输出
-  document.querySelectorAll("[data-env-install], #env-install-all, #env-refresh")
+  document.querySelectorAll("[data-env-install], [data-env-reinstall], #env-install-all, #env-refresh")
     .forEach((button) => { button.disabled = busy; });
   const summary = byId("env-summary");
   if (busy) summary.textContent = "正在执行安装，这一步可能要几分钟…";
 }
 
-async function installEnv(id) {
+async function runEnvAction(id, method, verb) {
   if (envBusy) return;
   setEnvBusy(true);
   try {
-    const result = await invoke("installEnv", id);
+    const result = await invoke(method, id);
     if (result && result.env) renderEnv(result.env);
-    showEnvDetail("安装输出", result?.detail || "安装完成");
+    showEnvDetail(`${verb}输出`, result?.detail || `${verb}完成`);
   } catch (error) {
     // 失败时把后端带来的详细输出也摊开，别只留一句「安装失败」
-    showEnvDetail("安装失败", error.message || String(error));
+    showEnvDetail(`${verb}失败`, error.message || String(error));
   } finally {
     setEnvBusy(false);
     if (byId("env-detail").hidden) refreshEnv();
   }
 }
 
+async function installEnv(id) {
+  return runEnvAction(id, "installEnv", "安装");
+}
+
+async function reinstallEnv(id) {
+  return runEnvAction(id, "reinstallEnv", "重装");
+}
+
 async function installAllEnv() {
   if (envBusy) return;
-  // 先自己算一遍要装哪些，避免为了「拿 id 列表」多调一次 scanEnv
+  // 先自己算一遍要装哪些，避免为了「拿 id 列表」多调一次 scanEnv。
+  // 只取 is-missing —— 过期项是 is-outdated，天然被排除在批量安装之外。
+  // 这是故意的：批量走的是 install，而重装会先卸载，两者破坏性不同，
+  // 不该由一个「一键」按钮替用户决定。
   const cards = [...document.querySelectorAll(".env-card.is-missing")]
     .map((card) => card.dataset.envCard)
     .filter((id) => {
@@ -2100,6 +2140,11 @@ function bindEvents() {
   byId("env-detail-close").addEventListener("click", () => { byId("env-detail").hidden = true; });
   // 卡片里的按钮是渲染出来的，用事件委托绑一次就够，不用每张卡重绑
   byId("env-grid").addEventListener("click", (event) => {
+    const reinstall = event.target.closest("[data-env-reinstall]");
+    if (reinstall) {
+      reinstallEnv(reinstall.dataset.envReinstall);
+      return;
+    }
     const install = event.target.closest("[data-env-install]");
     if (install) {
       installEnv(install.dataset.envInstall);

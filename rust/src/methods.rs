@@ -1371,22 +1371,17 @@ pub async fn dispatch(
             if id.is_empty() {
                 return Err("缺少环境条目 id".into());
             }
-            // 安装期间置 busy：挡住其它会改配置的调用，也提示前端转圈
-            state.busy = true;
-            let result = crate::envmgr::install(&id);
-            state.busy = false;
-            match result {
-                Ok(detail) => {
-                    // 装完立刻重扫，界面上的「已就绪」当场变绿，不用用户手动刷新
-                    let fresh = crate::envmgr::scan();
-                    state.notify("success", detail.lines().next().unwrap_or("安装完成").to_string());
-                    Ok(json!({ "detail": detail, "env": fresh }))
-                }
-                Err(error) => {
-                    state.notify("error", error.lines().next().unwrap_or("安装失败").to_string());
-                    Err(error)
-                }
+            run_env_action(state, &id, crate::envmgr::install)
+        }
+        // 「装了但版本太老」走重装：先试 winget upgrade，不行再退回强制安装。
+        // 与 install 分开是因为语义不同 —— 强制安装会先卸载，失败的话用户环境就没了，
+        // 不能让前端在「一键部署缺失项」里顺手触发。
+        "reinstallEnv" => {
+            let id = text(&args, 0).to_string();
+            if id.is_empty() {
+                return Err("缺少环境条目 id".into());
             }
+            run_env_action(state, &id, crate::envmgr::reinstall)
         }
         "openEnvDownload" => {
             let id = text(&args, 0).to_string();
@@ -2053,6 +2048,37 @@ pub async fn dispatch(
             apply(state)
         }
         other => Err(format!("不支持的操作：{other}")),
+    }
+}
+
+/// 安装 / 重装环境条目的公共处理：置 busy、跑命令、立刻重扫、把首行结果弹成 toast。
+///
+/// 参数是函数指针而不是再传一个 bool —— 安装与重装的区别留在 envmgr 内部，
+/// 这里不该知道 winget 到底会 upgrade 还是会 force install。
+fn run_env_action(
+    state: &mut AppState,
+    id: &str,
+    action: fn(&str) -> Result<String, String>,
+) -> Result<Value, String> {
+    // 执行期间置 busy：挡住其它会改配置的调用，也提示前端转圈
+    state.busy = true;
+    let result = action(id);
+    state.busy = false;
+    match result {
+        Ok(detail) => {
+            // 装完立刻重扫，界面上的状态当场变绿，不用用户手动刷新。
+            // 过期项还会顺带从 outdated 退回就绪。
+            let fresh = crate::envmgr::scan();
+            state.notify(
+                "success",
+                detail.lines().next().unwrap_or("安装完成").to_string(),
+            );
+            Ok(json!({ "detail": detail, "env": fresh }))
+        }
+        Err(error) => {
+            state.notify("error", error.lines().next().unwrap_or("安装失败").to_string());
+            Err(error)
+        }
     }
 }
 

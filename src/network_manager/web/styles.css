@@ -1095,6 +1095,9 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
 }
 .env-card.is-ready { border-left: 3px solid var(--green); }
 .env-card.is-missing { border-left: 3px solid var(--amber); }
+/* 版本过老：跟「缺失」区分开 —— 它装着呢，只是该升。用红边是因为它比缺失更危险：
+   缺失会立刻报错，过期是悄悄地用着一个有问题的老版本。 */
+.env-card.is-outdated { border-left: 3px solid var(--orange); }
 
 .env-card-head {
   display: flex;
@@ -1114,6 +1117,20 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
 }
 .env-badge.is-ready { color: var(--green-text); background: var(--green-soft); }
 .env-badge.is-missing { color: var(--amber-text); background: var(--amber-soft); }
+.env-badge.is-outdated { color: var(--orange-text); background: var(--orange-soft); }
+
+/* 过期项把「当前版本 → 需要的版本」明确写出来，别让用户自己心算差多少 */
+.env-card-hint {
+  font-size: 12px;
+  color: var(--orange-text);
+  line-height: 1.5;
+}
+.env-card-hint code {
+  font: 12px/1.5 Consolas, monospace;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--orange-soft);
+}
 
 .env-card-version {
   font-size: 13px;

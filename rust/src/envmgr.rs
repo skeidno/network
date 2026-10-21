@@ -6,20 +6,25 @@
 //! 我们只负责把命令拼对、把输出如实转述给用户。
 //!
 //! 探测优先级：能直接问官方 exe 的（`--version`）就问 exe，问不到再查注册表
-//! （很多运行库只往注册表写，不进 PATH），最后才退到「目录在不在」。三级都不中才算未就绪。
+//! （很多运行库只往往注册表写，不进 PATH），最后才退到「目录在不在」。三级都不中才算未就绪。
+//!
+//! 三态而不是「就绪 / 没就绪」两个值：**装了但版本太老**和**根本没装**是两回事 ——
+//! 前者重装能解决，后者必须先装，界面上给的按钮不一样（重装 vs 一键部署），
+//! 混成一个布尔值就会出现「明明装了却不给重装按钮」的荒唐情况。
 
 use serde_json::{json, Value};
+use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// 单个环境的探测结果。前端只认这五个字段，别的一律塞进 `note`。
+/// 单个环境的探测结果。前端只认这些字段，别的一律塞进 `note`。
 #[derive(Debug, Clone)]
 pub struct EnvItem {
     /// 稳定 id，前端拿它做 testTag 和图标映射。
     pub id: &'static str,
     /// 界面上的名字，比如 "Node.js"。
     pub name: &'static str,
-    /// 是否就绪。
+    /// 装了没装。装了不等于可用 —— 还要看 `outdated`。
     pub ready: bool,
     /// 版本号原文，探测不到就是空串。
     pub version: String,
@@ -29,6 +34,12 @@ pub struct EnvItem {
     pub note: String,
     /// 安装方式，见 [`InstallKind`]。
     pub install: InstallKind,
+    /// 建议的最低版本，空串表示这一项不挑版本。
+    pub min_version: &'static str,
+    /// 装了但低于 `min_version`。只有 ready && outdated 才有意义。
+    pub outdated: bool,
+    /// 实际版本与最低版本的差距说明，outdated 时才有内容。
+    pub outdated_note: String,
 }
 
 /// 安装方式。决定「一键部署」按钮点下去到底干什么。
@@ -42,7 +53,7 @@ pub enum InstallKind {
 }
 
 impl EnvItem {
-    fn new(id: &'static str, name: &'static str, install: InstallKind) -> Self {
+    fn new(id: &'static str, name: &'static str, min_version: &'static str) -> Self {
         Self {
             id,
             name,
@@ -50,7 +61,39 @@ impl EnvItem {
             version: String::new(),
             path: String::new(),
             note: String::new(),
-            install,
+            install: InstallKind::Winget,
+            min_version,
+            outdated: false,
+            outdated_note: String::new(),
+        }
+    }
+
+    /// 探测收尾：知道实际版本之后，比一下最低要求，把三态补齐。
+    ///
+    /// 拿不到版本号时一律**不**判过期 —— 读不出本就不知道是多是少，
+    /// 猜一个「可能太老」只会让用户去重装一个本来好好的东西。
+    fn finalize(&mut self) {
+        self.outdated = false;
+        self.outdated_note.clear();
+        if !self.ready || self.version.is_empty() || self.min_version.is_empty() {
+            return;
+        }
+        match compare_versions(&self.version, self.min_version) {
+            Some(Ordering::Less) => {
+                self.outdated = true;
+                self.outdated_note =
+                    format!("当前 {}，建议 {} 以上；重装会升级到最新版", self.version, self.min_version);
+            }
+            // 版本号格式怪到没法比较（比如注册表里读到非预期内容）时，
+            // 照旧按就绪处理，只是提示一句，省得用户以为程序坏了。
+            Some(Ordering::Equal) | Some(Ordering::Greater) => {}
+            None => {
+                self.note = if self.note.is_empty() {
+                    format!("版本号「{}」无法与最低要求比较，按就绪处理", self.version)
+                } else {
+                    self.note.clone()
+                };
+            }
         }
     }
 
@@ -63,12 +106,18 @@ impl EnvItem {
             "version": self.version,
             "path": self.path,
             "note": self.note,
-"install": match self.install {
-InstallKind::Winget => "winget",
+            "install": match self.install {
+                InstallKind::Winget => "winget",
             },
+            "minVersion": self.min_version,
+            "outdated": self.outdated,
+            "outdatedNote": self.outdated_note,
             // 一键部署能不能点：取决于这台机器有没有 winget。前端拿它决定按钮灰不灰，
             // 比自己再判断一遍可靠。
             "canInstall": can_auto_install(self.id),
+            // 过期项也需要重装按钮，所以单独给前端一个「可重装」标记。
+            // 前端不能只看 outdated，因为 winget 缺失时重装也做不了。
+            "canReinstall": can_auto_install(self.id),
         })
     }
 }
@@ -334,7 +383,7 @@ fn probe_webview2(item: &mut EnvItem) {
                 }
                 let better = match &best {
                     None => true,
-                    Some(current) => compare_version(&name, current),
+                    Some(current) => compare_versions(&name, current) == Some(Ordering::Greater),
                 };
                 if better {
                     best = Some(name);
@@ -356,24 +405,65 @@ fn probe_webview2(item: &mut EnvItem) {
     }
 }
 
-/// 比较两个点分版本号，`true` 表示 `left` 更新。
-/// 逐段按数值比，段数不同时多的那段补 0，所以 `1.2` 与 `1.2.0` 判等。
-fn compare_version(left: &str, right: &str) -> bool {
-    let parse = |text: &str| -> Vec<u64> {
-        text.split('.')
-            .map(|part| part.parse::<u64>().unwrap_or(0))
-            .collect()
-    };
-    let l = parse(left);
-    let r = parse(right);
-    for index in 0..l.len().max(r.len()) {
-        let lv = l.get(index).copied().unwrap_or(0);
-        let rv = r.get(index).copied().unwrap_or(0);
-        if lv != rv {
-            return lv > rv;
+/// 版本段。既能装数字，也能装字母（Git 的 `windows` 就是字母段）。
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum VersionSegment {
+    Num(u64),
+    /// 字母段。排序时排在同位置的数字之后 —— `1.0.windows.2` 与 `1.0.1` 不好比，
+    /// 但只要最低要求里没有字母段，就不会走到这个分支。
+    Word(String),
+}
+
+/// 把一段版本号切成可比较的段。切不出来就返回 None。
+///
+/// 为什么不用 `split('.')` 直接 parse：实际探测到的版本号里混着这些东西 ——
+/// `2.50.1.windows.1`、`14.44.35211.00`、`35.0.2-12147458`、`v3.13.14`。
+/// 硬 parse 会在遇到字母时整条失败，然后所有项都判不出过期 —— 那是更糟的静默。
+/// 所以宽松切：能转数字就转，转不了就当字母段留着。
+fn parse_version(text: &str) -> Option<Vec<VersionSegment>> {
+    // 前缀的 v / V（node --version 输出 v22.19.0）不是版本的一部分
+    let body = text.trim().trim_start_matches(['v', 'V']);
+    // 尾巴上的 -构建号、+元数据（adb 的 35.0.2-12147458）不比
+    let body = body.split(['-', '+']).next().unwrap_or(body);
+    if body.is_empty() {
+        return None;
+    }
+    let mut segments = Vec::new();
+    for part in body.split('.') {
+        if part.is_empty() {
+            // "1.2..3" 这种畸形输入，保守当无法比较
+            return None;
+        }
+        match part.parse::<u64>() {
+            Ok(value) => segments.push(VersionSegment::Num(value)),
+            Err(_) => {
+                // 纯字母段才认；夹着别的字符说明这压根不是版本号
+                if part.chars().all(|c| c.is_ascii_alphabetic()) {
+                    segments.push(VersionSegment::Word(part.to_ascii_lowercase()));
+                } else {
+                    return None;
+                }
+            }
         }
     }
-    false
+    Some(segments)
+}
+
+/// 比较两个版本号。返回 `None` 表示有一边格式没法解析，调用方应保守处理
+/// （按就绪算，不提示重装）—— 宁可漏报也不要让用户去重装一个好端端的东西。
+fn compare_versions(left: &str, right: &str) -> Option<Ordering> {
+    let l = parse_version(left)?;
+    let r = parse_version(right)?;
+    for index in 0..l.len().max(r.len()) {
+        // 缺的段当 0，这样 21 与 21.0.0 判等
+        let lv = l.get(index).unwrap_or(&VersionSegment::Num(0));
+        let rv = r.get(index).unwrap_or(&VersionSegment::Num(0));
+        match lv.cmp(rv) {
+            Ordering::Equal => continue,
+            other => return Some(other),
+        }
+    }
+    Some(Ordering::Equal)
 }
 
 /// 从 `reg query` 的输出里取「值名 → 值」中某个值名的值。
@@ -451,51 +541,80 @@ fn probe_vcredist(item: &mut EnvItem) {
 
 /// 体检全部条目。
 ///
-/// 结果按「就绪的排前面，且按名字排」——不对，顺序保持目录序，
-/// 因为用户扫一眼卡片列表时，稳定的位置比排序更有用。
+/// 顺序保持目录序：用户扫一眼卡片列表时，位置稳定比排序更有用。
 pub fn scan() -> Value {
     let items = scan_items();
-    let ready = items.iter().filter(|item| item.ready).count();
+    let installed = items.iter().filter(|item| item.ready).count();
+    let outdated = items.iter().filter(|item| item.outdated).count();
     json!({
         "items": items.iter().map(|item| item.to_json()).collect::<Vec<Value>>(),
         "total": items.len(),
-        "ready": ready,
-        "missing": items.len() - ready,
-        // winget 有没有是「一键部署」能不能用的前提，没它整列按钮都得灰掉
+        // 装了且版本够新 = 真就绪。过期项单列，因为它需要的是重装而不是安装。
+        "ready": installed - outdated,
+        "installed": installed,
+        "outdated": outdated,
+        "missing": items.len() - installed,
+        // winget 有没有是「一键部署 / 重装」能不能用的前提，没它整列按钮都得灰掉
         "winget": winget_available(),
     })
 }
 
+/// 最低版本要求。
+///
+/// 取值不是随手写的：每一条都对应一个具体的、会在某个环节真的出问题的地方，
+/// 而不是「最新版」。定得太高会让一半正常环境被判过期，催着用户去重装没必要的东西。
+const MIN_PYTHON: &str = "3.9.0";
+/// Node 20 是当前 LTS，18 已进入维护末期；CI 用 `node --check` 校验前端语法。
+const MIN_NODE: &str = "20.0.0";
+/// 2.30 才有 `git switch` 与新版凭据助手，老版本在跨平台协作上问题较多。
+const MIN_GIT: &str = "2.30.0";
+/// Android Gradle Plugin 8.x 要求 JDK 17 起；本项目 `jbr` 也带 21。
+const MIN_JDK: &str = "17.0.0";
+/// WebView2 90 才有稳定的多进程与 DevTools 协议，桌面端 wry 依赖它。
+const MIN_WEBVIEW2: &str = "90.0.0";
+/// VC++ 2015-2022 的注册表版本是 14.x；低于 14 说明只有更老的 2015 运行库，
+/// 原生依赖的新 API 会缺符号。
+const MIN_VCREDIST: &str = "14.0.0";
+/// ADB 30 才有 split-APK 与增量安装支持，Android 调试链路必需。
+const MIN_ADB: &str = "30.0.0";
+
 fn scan_items() -> Vec<EnvItem> {
     let mut items = Vec::new();
 
-    let mut python = EnvItem::new("python", "Python", InstallKind::Winget);
+    let mut python = EnvItem::new("python", "Python", MIN_PYTHON);
     probe_python(&mut python);
+    python.finalize();
     items.push(python);
 
-    let mut node = EnvItem::new("node", "Node.js", InstallKind::Winget);
+    let mut node = EnvItem::new("node", "Node.js", MIN_NODE);
     probe_node(&mut node);
+    node.finalize();
     items.push(node);
 
-    let mut git = EnvItem::new("git", "Git", InstallKind::Winget);
+    let mut git = EnvItem::new("git", "Git", MIN_GIT);
     probe_git(&mut git);
+    git.finalize();
     items.push(git);
 
-    let mut jdk = EnvItem::new("jdk", "JDK", InstallKind::Winget);
+    let mut jdk = EnvItem::new("jdk", "JDK", MIN_JDK);
     probe_jdk(&mut jdk);
+    jdk.finalize();
     items.push(jdk);
 
     // 桌面端自己的渲染依赖：装不上程序起不来，所以列在常用工具前面
-    let mut webview2 = EnvItem::new("webview2", "WebView2 运行时", InstallKind::Winget);
+    let mut webview2 = EnvItem::new("webview2", "WebView2 运行时", MIN_WEBVIEW2);
     probe_webview2(&mut webview2);
+    webview2.finalize();
     items.push(webview2);
 
-    let mut vcredist = EnvItem::new("vcredist", "VC++ 运行库", InstallKind::Winget);
+    let mut vcredist = EnvItem::new("vcredist", "VC++ 运行库", MIN_VCREDIST);
     probe_vcredist(&mut vcredist);
+    vcredist.finalize();
     items.push(vcredist);
 
-    let mut adb = EnvItem::new("adb", "ADB", InstallKind::Winget);
+    let mut adb = EnvItem::new("adb", "ADB", MIN_ADB);
     probe_adb(&mut adb);
+    adb.finalize();
     items.push(adb);
 
     items
@@ -532,6 +651,21 @@ fn winget_id(id: &str) -> Option<&'static str> {
 /// 刻意同步执行而不是后台异步：安装过程要花几十秒到几分钟，
 /// 界面上一个转圈的按钮比一个不知道在干嘛的 toast 诚实得多。
 pub fn install(id: &str) -> Result<String, String> {
+    run_winget(id, false)
+}
+
+/// 强制重装到最新版。用于「装了但版本太老」的场景。
+///
+/// 走的是 `winget upgrade`。不用 `install --force` 的原因：
+/// 强制安装会先卸载再装，一旦下载失败就把用户的环境弄没了 —— 先试升级，
+/// 升级不可用（版本太老不在源里、包不支持升级）再退回强制安装，
+/// 并且把降级这件事在返回文案里说清楚。
+pub fn reinstall(id: &str) -> Result<String, String> {
+    run_winget(id, true)
+}
+
+/// 组装并执行 winget 命令。
+fn run_winget(id: &str, force: bool) -> Result<String, String> {
     let Some(package) = winget_id(id) else {
         return Err(format!("未知的环境条目：{id}"));
     };
@@ -539,40 +673,73 @@ pub fn install(id: &str) -> Result<String, String> {
         return Err("本机没有 winget，无法自动安装。\n请到「设置 → 应用 → 应用执行别名」里启用 winget，或手动到官网下载安装。".to_string());
     }
 
-    let args = [
-        "install",
-        "--id",
-        package,
+    // 公共参数这几个动作都一样
+    const COMMON: [&str; 4] = [
         "--exact",
         "--source",
         "winget",
         "--accept-package-agreements",
-        "--accept-source-agreements",
-        "--disable-interactivity",
     ];
+
+    if force {
+        // 先试升级：非破坏性，失败也不动用户现有环境
+        match run_winget_command("upgrade", package, &COMMON, None) {
+            Ok(detail) => return Ok(format!("{package} 已升级。\n{detail}")),
+            Err(upgrade_error) => {
+                // 升级走不通（源里没新版 / 包不支持升级）才强制重装
+                // 强制安装会先卸载，所以文案必须说明这一步发生了什么
+                let detail = run_winget_command("install", package, &COMMON, Some("--force"))
+                    .map_err(|force_error| {
+                        format!(
+                            "重装失败。\n升级方式：{upgrade_error}\n强制安装方式：{force_error}"
+                        )
+                    })?;
+                return Ok(format!(
+                    "{package} 升级不可用，已改为强制重装（会先卸载旧版本）。\n{detail}"
+                ));
+            }
+        }
+    }
+
+    let detail = run_winget_command("install", package, &COMMON, None)?;
+    // winget 命中已安装时返回 0 但会说「No applicable upgrade found」，文案上区分一下
+    if detail.contains("already installed") || detail.contains("已安装") {
+        return Ok(format!("{package} 已经是最新状态，无需重复安装。\n{detail}"));
+    }
+    Ok(format!("{package} 安装完成。\n{detail}"))
+}
+
+/// 执行一次 winget，返回合并后的输出文本。失败时把 winget 的话原样带回来。
+fn run_winget_command(
+    action: &str,
+    package: &str,
+    common: &[&str],
+    extra: Option<&str>,
+) -> Result<String, String> {
+    let mut args: Vec<&str> = vec![action];
+    args.push("--id");
+    args.push(package);
+    args.extend_from_slice(common);
+    args.push("--accept-source-agreements");
+    args.push("--disable-interactivity");
+    if let Some(flag) = extra {
+        args.push(flag);
+    }
+
     let output = Command::new("winget")
-        .args(args)
+        .args(&args)
         .output()
         .map_err(|error| format!("调用 winget 失败：{error}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let combined = format!("{stdout}\n{stderr}");
+    let combined = format!("{stdout}\n{stderr}").trim().to_string();
 
     if output.status.success() {
-        // winget 命中已安装时返回 0 但会说「No applicable upgrade found」，文案上区分一下
-        let already = combined.contains("already installed")
-            || combined.contains("已安装")
-            || combined.contains("No applicable upgrade");
-        Ok(if already {
-            format!("{package} 已经是最新状态，无需重复安装。\n{stdout}")
-        } else {
-            format!("{package} 安装完成。\n{stdout}")
-        })
+        Ok(combined)
     } else {
-        // 失败时把 winget 自己的话原样带回来，它比我们的转述有用
         Err(format!(
-            "{package} 安装失败（winget 退出码 {:?}）。\n{combined}",
+            "winget {action} 退出码 {:?}：\n{combined}",
             output.status.code()
         ))
     }
@@ -653,12 +820,77 @@ mod tests {
 
     #[test]
     fn 版本比较逐段比数值() {
-        assert!(compare_version("155.0.4283.62", "155.0.4283.45"));
-        assert!(!compare_version("155.0.4283.45", "155.0.4283.62"));
+        assert_eq!(compare_versions("155.0.4283.62", "155.0.4283.45"), Some(Ordering::Greater));
+        assert_eq!(compare_versions("155.0.4283.45", "155.0.4283.62"), Some(Ordering::Less));
         // 段数不同按 0 补齐，判等
-        assert!(!compare_version("1.2", "1.2.0"));
-        assert!(compare_version("1.3", "1.2.9"));
-        assert!(!compare_version("1.2.1", "1.2.1"));
+        assert_eq!(compare_versions("1.2", "1.2.0"), Some(Ordering::Equal));
+        assert_eq!(compare_versions("21", "21.0.0"), Some(Ordering::Equal));
+        assert_eq!(compare_versions("1.3", "1.2.9"), Some(Ordering::Greater));
+        assert_eq!(compare_versions("2.19.0", "2.9.0"), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn 版本比较容忍实际输出里的怪格式() {
+        // node 的 v 前缀
+        assert_eq!(compare_versions("v22.19.0", "20.0.0"), Some(Ordering::Greater));
+        assert_eq!(compare_versions("V3.13.14", "3.9.0"), Some(Ordering::Greater));
+        // adb 的 -构建号后缀不比
+        assert_eq!(compare_versions("35.0.2-12147458", "33.0.1"), Some(Ordering::Greater));
+        // git 的字母段：.windows.1 不能让整条解析失败
+        assert_eq!(compare_versions("2.50.1.windows.1", "2.30.0"), Some(Ordering::Greater));
+        // 字母段按派生 Ord 排在数字段之后（枚举声明顺序 Num 在前），
+        // 所以 "1.0.windows" > "1.0.1"。实际用不出这个结果 ——
+        // 最低要求里不会出现字母段，写在这里是为了把这条边界钉住。
+        assert_eq!(compare_versions("1.0.windows.1", "1.0.1"), Some(Ordering::Greater));
+        // 注册表里的 VC++ 版本带 v 前缀且四段
+        assert_eq!(compare_versions("14.44.35211.00", "14.30.0"), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn 版本号完全没法比较时返回None() {
+        assert_eq!(compare_versions("未知", "3.0.0"), None);
+        assert_eq!(compare_versions("", "3.0.0"), None);
+        assert_eq!(compare_versions("1.2..3", "1.2.3"), None);
+        // 夹着非字母非数字的段（3_1、1.2-beta）判为不可比较
+        assert_eq!(compare_versions("3_0.0", "3.0.0"), None);
+        // 纯字母段是合法的（Git 的 windows 就是），不该被拒；
+        // 排在数字段之后是派生 Ord 的既定行为
+        assert_eq!(compare_versions("abc", "3.0.0"), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn 装了但版本过老会被标出来() {
+        let mut item = EnvItem::new("node", "Node.js", "20.0.0");
+        // 先按就绪装上，但给一个太老的版本
+        item.ready = true;
+        item.version = "18.19.0".to_string();
+        item.finalize();
+        assert!(item.ready, "装了就是 ready，重装与否是另一回事");
+        assert!(item.outdated, "18.19.0 低于 20.0.0，应该提示重装");
+        assert!(item.outdated_note.contains("18.19.0"));
+        assert!(item.outdated_note.contains("20.0.0"));
+    }
+
+    #[test]
+    fn 版本够新或者读不出就不提示重装() {
+        let mut ok = EnvItem::new("node", "Node.js", "20.0.0");
+        ok.ready = true;
+        ok.version = "22.19.0".to_string();
+        ok.finalize();
+        assert!(!ok.outdated);
+
+        // 读不出版本号时不能瞎猜 —— 宁可漏报也不要让用户重装好端端的东西
+        let mut unknown = EnvItem::new("weird", "怪东西", "20.0.0");
+        unknown.ready = true;
+        unknown.version = String::new();
+        unknown.finalize();
+        assert!(!unknown.outdated);
+
+        // 没装更不该提重装
+        let mut missing = EnvItem::new("node", "Node.js", "20.0.0");
+        missing.finalize();
+        assert!(!missing.outdated);
+        assert!(!missing.ready);
     }
 
     #[test]

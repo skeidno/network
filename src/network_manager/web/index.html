@@ -397,7 +397,7 @@
             </div>
             <pre id="env-detail-body" class="env-detail-body"></pre>
           </div>
-          <p class="settings-note">体检只做只读检查：直接问各工具自己的 <code>--version</code>，问不到再查注册表和默认安装目录。<strong>不下载安装包、不改注册表、不动 PATH</strong>。缺什么就交给官方包管理器 winget 去装，命令与输出原样显示在这里 —— 出了问题你能自己判断是哪一步的事。</p>
+          <p class="settings-note">体检只做只读检查：直接问各工具自己的 <code>--version</code>，问不到再查注册表和默认安装目录。<strong>不下载安装包、不改注册表、不动 PATH</strong>。缺什么就交给官方包管理器 winget 去装，命令与输出原样显示在这里 —— 出了问题你能自己判断是哪一步的事。<br><strong>「版本过旧」和「缺失」是两回事</strong>：过旧的项已经装上了，只是低于本项目实际需要的版本（比如 Node.js 要 20、JDK 要 17、WebView2 要 90），<strong>重装会先尝试 winget 升级，升级不可用才退回强制重装</strong>，所以它只出现在单张卡片的「重装升级」按钮里，不进「一键部署」的批量流程 —— 那个按钮只管真正缺的东西。</p>
         </section>
       </div>
     </main>
