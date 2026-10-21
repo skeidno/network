@@ -1157,6 +1157,84 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
 }
 .env-card-actions .button { padding: 6px 12px; font-size: 12px; }
 
+/* 版本管理区：只在支持指定版本的项（Node）上出现。
+   故意用不同的底色，跟上面的体检结果区分开 —— 一个是「现状」，
+   一个是「可以装成什么样」，混在一张卡片里看的人会分不清。 */
+.env-versions {
+  margin-top: 4px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-hairline);
+}
+.env-versions-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.env-versions-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.env-versions-row + .env-versions-row { margin-top: 8px; }
+
+.env-versions-select {
+  flex: 1 1 160px;
+  min-width: 0;
+  font: 12px/1.5 inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+.env-versions-select:focus {
+  outline: 2px solid var(--focus-border);
+  outline-offset: 1px;
+}
+
+.env-versions-tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--blue-soft);
+  color: var(--blue-text);
+  font-weight: 500;
+}
+.env-versions-tag.is-lts { background: var(--green-soft); color: var(--green-text); }
+.env-versions-tag.is-current { background: var(--brand-bg); color: var(--brand-fg); }
+
+.env-versions-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+.env-versions-actions .button { padding: 5px 11px; font-size: 12px; }
+
+.env-versions-hint { font-size: 11px; color: var(--text-3); line-height: 1.5; margin-top: 8px; }
+
+/* 已装版本的一排小徽章，点一下就能切 */
+.env-version-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.env-version-chip {
+  font: 12px/1.5 Consolas, monospace;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+}
+.env-version-chip:hover { border-color: var(--blue); color: var(--blue-text); }
+.env-version-chip.is-current {
+  background: var(--brand-bg);
+  border-color: var(--brand-fg);
+  color: var(--brand-fg);
+  font-weight: 600;
+}
+.env-version-chip.is-pending { opacity: .5; cursor: not-allowed; }
+
 /* 执行输出面板：把 winget 的话原样摊开，方便用户自己判断 */
 .env-detail {
   border: 1px solid var(--line);

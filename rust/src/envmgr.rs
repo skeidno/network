@@ -118,6 +118,10 @@ impl EnvItem {
             // 过期项也需要重装按钮，所以单独给前端一个「可重装」标记。
             // 前端不能只看 outdated，因为 winget 缺失时重装也做不了。
             "canReinstall": can_auto_install(self.id),
+            // 这一项支不支持「装指定版本」。前端据此决定要不要画版本下拉框。
+            // Node 走 nvm（能装多版本并存），其它走 winget 的 --version
+            // （换个版本需要先卸载旧的，所以前端要提示用户）。
+            "supportsVersions": supports_versions(self.id),
         })
     }
 }
@@ -281,7 +285,50 @@ fn probe_python(item: &mut EnvItem) {
 }
 
 /// Node.js：node --version 输出 v22.19.0，extract_version 会去掉前缀 v。
+///
+/// 装了 nvm 的话以 nvm 为准。原因是 nvm-windows 用软链接接管 node.exe，
+/// 而软链接的指向由 nvm use 决定；同时系统里可能还躺着一份不走 nvm 的独立
+/// 安装（比如编辑器自带的），PATH 里的 node.exe 未必是用户实际在用的那个。
+/// 这时报「PATH 里那个的版本」会给出误导性的结论 —— 用户以为自己用的是
+/// 22.17.1，其实 nvm 已经切到别的版本去了。
 fn probe_node(item: &mut EnvItem) {
+    if crate::nvm::installed() {
+        let nvm_state = crate::nvm::status();
+        let installed = nvm_state
+            .get("installedVersions")
+            .and_then(|v| v.as_array())
+            .map(|list| !list.is_empty())
+            .unwrap_or(false);
+        let current = nvm_state
+            .get("current")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if installed && !current.is_empty() {
+            item.ready = true;
+            item.version = current.clone();
+            item.path = "nvm-windows 管理".to_string();
+            let count = nvm_state
+                .get("installedVersions")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            item.note = format!("由 nvm 管理，当前版本，已装 {count} 个");
+            return;
+        }
+        if installed {
+            // 装了版本但认不出当前是哪个：仍然算就绪，如实说明
+            item.ready = true;
+            let count = nvm_state
+                .get("installedVersions")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            item.path = "nvm-windows 管理".to_string();
+            item.note = format!("由 nvm 管理，已装 {count} 个，但认不出当前使用的版本（可能 PATH 里的 node 不走 nvm）");
+            return;
+        }
+    }
     if probe_by_version(item, &["node.exe"], &["--version"]) {
         return;
     }
@@ -591,6 +638,26 @@ fn scan_items() -> Vec<EnvItem> {
     node.finalize();
     items.push(node);
 
+    // nvm 本体单列一项，排在 Node 后面。
+    // 它只在「要装指定版本 Node」时才必需，所以不设最低版本 —— 老 nvm 也能用。
+    // 只装最新版：nvm 自己有 `nvm upgrade`，给它开版本选择纯属添乱。
+    let mut nvm = EnvItem::new("nvm", "nvm（Node 版本管理）", "");
+    if crate::nvm::installed() {
+        nvm.ready = true;
+        nvm.version = crate::nvm::version();
+        nvm.path = crate::nvm::nvm_home_pub();
+        let count = crate::nvm::installed_count();
+        nvm.note = if count > 0 {
+            format!("已托管 {count} 个 Node 版本")
+        } else {
+            "已安装，但还没有任何 Node 版本".to_string()
+        };
+    } else {
+        nvm.note = "未检测到 nvm；装指定版本的 Node 需要它".to_string();
+    }
+    nvm.finalize();
+    items.push(nvm);
+
     let mut git = EnvItem::new("git", "Git", MIN_GIT);
     probe_git(&mut git);
     git.finalize();
@@ -642,30 +709,41 @@ fn winget_id(id: &str) -> Option<&'static str> {
         "webview2" => Some("Microsoft.EdgeWebView2Runtime"),
         "vcredist" => Some("Microsoft.VCRedist.2015.x64"),
         "adb" => Some("Google.PlatformTools"),
+        // nvm 只装最新版，不参与 Node 的版本选择（那是 nvm install 的活）
+        "nvm" => Some(crate::nvm::NVM_WINGET_ID),
         _ => None,
     }
 }
 
-/// 跑 winget 安装。返回一段给用户看的话。
+/// 跑 winget 安装。`version` 传空串表示装最新版。
 ///
 /// 刻意同步执行而不是后台异步：安装过程要花几十秒到几分钟，
 /// 界面上一个转圈的按钮比一个不知道在干嘛的 toast 诚实得多。
-pub fn install(id: &str) -> Result<String, String> {
-    run_winget(id, false)
+///
+/// Node 走 nvm 而不是 winget：Node 要能同时装多个版本并存，winget 装的是
+/// 单一系统级安装，装第二个版本会跟第一个打架。nvm 天然解决这件事。
+pub fn install(id: &str, version: &str) -> Result<String, String> {
+    if id == "node" && !version.is_empty() {
+        return crate::nvm::install_version(version);
+    }
+    run_winget(id, false, version)
 }
 
-/// 强制重装到最新版。用于「装了但版本太老」的场景。
+/// 强制重装到最新版（或指定版本）。用于「装了但版本太老」的场景。
 ///
 /// 走的是 `winget upgrade`。不用 `install --force` 的原因：
 /// 强制安装会先卸载再装，一旦下载失败就把用户的环境弄没了 —— 先试升级，
 /// 升级不可用（版本太老不在源里、包不支持升级）再退回强制安装，
 /// 并且把降级这件事在返回文案里说清楚。
-pub fn reinstall(id: &str) -> Result<String, String> {
-    run_winget(id, true)
+pub fn reinstall(id: &str, version: &str) -> Result<String, String> {
+    if id == "node" && !version.is_empty() {
+        return crate::nvm::install_version(version);
+    }
+    run_winget(id, true, version)
 }
 
 /// 组装并执行 winget 命令。
-fn run_winget(id: &str, force: bool) -> Result<String, String> {
+fn run_winget(id: &str, force: bool, version: &str) -> Result<String, String> {
     let Some(package) = winget_id(id) else {
         return Err(format!("未知的环境条目：{id}"));
     };
@@ -682,13 +760,21 @@ fn run_winget(id: &str, force: bool) -> Result<String, String> {
     ];
 
     if force {
+        // 指定了版本就只能强制安装到那个版本：upgrade 不接受「降到某个旧版本」
+        if !version.is_empty() {
+            let detail =
+                run_winget_command("install", package, &COMMON, Some("--force"), Some(version))?;
+            return Ok(format!(
+                "{package} 已重装到指定版本 {version}（先卸载了旧版本）。\n{detail}"
+            ));
+        }
         // 先试升级：非破坏性，失败也不动用户现有环境
-        match run_winget_command("upgrade", package, &COMMON, None) {
+        match run_winget_command("upgrade", package, &COMMON, None, None) {
             Ok(detail) => return Ok(format!("{package} 已升级。\n{detail}")),
             Err(upgrade_error) => {
                 // 升级走不通（源里没新版 / 包不支持升级）才强制重装
                 // 强制安装会先卸载，所以文案必须说明这一步发生了什么
-                let detail = run_winget_command("install", package, &COMMON, Some("--force"))
+                let detail = run_winget_command("install", package, &COMMON, Some("--force"), None)
                     .map_err(|force_error| {
                         format!(
                             "重装失败。\n升级方式：{upgrade_error}\n强制安装方式：{force_error}"
@@ -701,20 +787,34 @@ fn run_winget(id: &str, force: bool) -> Result<String, String> {
         }
     }
 
-    let detail = run_winget_command("install", package, &COMMON, None)?;
+    let extra = if version.is_empty() {
+        None
+    } else {
+        Some("--force")
+    };
+    let detail =
+        run_winget_command("install", package, &COMMON, extra, if version.is_empty() { None } else { Some(version) })?;
     // winget 命中已安装时返回 0 但会说「No applicable upgrade found」，文案上区分一下
     if detail.contains("already installed") || detail.contains("已安装") {
         return Ok(format!("{package} 已经是最新状态，无需重复安装。\n{detail}"));
     }
-    Ok(format!("{package} 安装完成。\n{detail}"))
+    Ok(if version.is_empty() {
+        format!("{package} 安装完成。\n{detail}")
+    } else {
+        format!("{package} 已安装到指定版本 {version}。\n{detail}")
+    })
 }
 
 /// 执行一次 winget，返回合并后的输出文本。失败时把 winget 的话原样带回来。
+///
+/// `version` 非空时加 `-v <版本>`。winget 自己支持这个参数（`--version`，
+/// 注意它跟 winget 自身的版本无关，是「安装包的指定版本」）。
 fn run_winget_command(
     action: &str,
     package: &str,
     common: &[&str],
     extra: Option<&str>,
+    version: Option<&str>,
 ) -> Result<String, String> {
     let mut args: Vec<&str> = vec![action];
     args.push("--id");
@@ -724,6 +824,14 @@ fn run_winget_command(
     args.push("--disable-interactivity");
     if let Some(flag) = extra {
         args.push(flag);
+    }
+    if let Some(ver) = version {
+        // 放进版本号前先过一道白名单：只允许数字和点，
+        // 免得界面上算出来的空串或异常值拼进命令里
+        if !ver.is_empty() && ver.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            args.push("--version");
+            args.push(ver);
+        }
     }
 
     let output = Command::new("winget")
@@ -778,6 +886,61 @@ fn open_url(url: &str) -> Result<(), String> {
 /// 这个条目是不是「一键部署」能搞定的。
 pub fn can_auto_install(id: &str) -> bool {
     winget_id(id).is_some() && winget_available()
+}
+
+/// 这一项支不支持指定版本安装。
+///
+/// Node 特殊：它走 nvm，能同时并存多个版本，切版本不动其它项目。
+/// 其它项靠 winget 的 `--version`，但 winget 换版本要先卸载旧的
+/// （我们用 `--force` 达成），所以对用户来说是破坏性操作。
+fn supports_versions(id: &str) -> bool {
+    matches!(id, "node" | "python" | "git" | "jdk")
+}
+
+/// 列出某个项能装的版本（走 winget 的包）。
+/// Node 不在这里 —— 它的版本来自 nvm，见 crate::nvm::status。
+pub fn available_versions(id: &str) -> Result<Value, String> {
+    let Some(package) = winget_id(id) else {
+        return Err(format!("未知的环境条目：{id}"));
+    };
+    if !winget_available() {
+        return Err("本机没有 winget，无法查询可安装版本。".to_string());
+    }
+    let output = Command::new("winget")
+        .args([
+            "show",
+            "--id",
+            package,
+            "--exact",
+            "--source",
+            "winget",
+            "--versions",
+        ])
+        .output()
+        .map_err(|error| format!("调用 winget 失败：{error}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        return Err(format!("查询 {package} 的版本列表失败：\n{text}"));
+    }
+    // winget show --versions 一行一个版本号，但前面还有若干字段行，
+    // 所以逐行挑出「整行就是一个版本号」的那些
+    let versions: Vec<String> = text
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| {
+            !line.is_empty()
+                && line
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+')
+                && line.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+        })
+        .map(|line| line.to_string())
+        .collect();
+    Ok(json!({ "id": id, "versions": versions }))
 }
 
 #[cfg(test)]

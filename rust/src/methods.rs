@@ -1366,12 +1366,15 @@ pub async fn dispatch(
         // 体检是纯只读，跑起来不慢但也别塞进每轮状态里（要起好几个子进程问版本号），
         // 所以由前端进页面时主动调一次。
         "scanEnv" => Ok(crate::envmgr::scan()),
+        // 版本参数可选：不给就是装最新版，给了就是装那个版本。
+        // Node 在 envmgr 里会被转给 nvm 处理，别的走 winget 的 --version。
         "installEnv" => {
             let id = text(&args, 0).to_string();
             if id.is_empty() {
                 return Err("缺少环境条目 id".into());
             }
-            run_env_action(state, &id, crate::envmgr::install)
+            let version = text(&args, 1).to_string();
+            run_env_action(state, &id, &version, crate::envmgr::install)
         }
         // 「装了但版本太老」走重装：先试 winget upgrade，不行再退回强制安装。
         // 与 install 分开是因为语义不同 —— 强制安装会先卸载，失败的话用户环境就没了，
@@ -1381,7 +1384,70 @@ pub async fn dispatch(
             if id.is_empty() {
                 return Err("缺少环境条目 id".into());
             }
-            run_env_action(state, &id, crate::envmgr::reinstall)
+            let version = text(&args, 1).to_string();
+            run_env_action(state, &id, &version, crate::envmgr::reinstall)
+        }
+        // Node 的版本与 nvm 状态（已装哪些、可装哪些、当前用哪个）
+        "nvmStatus" => Ok(crate::nvm::status()),
+        // 装 / 切 / 卸指定的 Node 版本
+        "nvmInstallVersion" => {
+            let version = text(&args, 0).to_string();
+            state.busy = true;
+            let result = crate::nvm::install_version(&version);
+            state.busy = false;
+            let fresh = crate::nvm::status();
+            // env 一起返回：前端重画时就不用再发一次 scanEnv，
+            // 命令输出与界面状态来自同一份快照
+            let env = crate::envmgr::scan();
+            match result {
+                Ok(detail) => {
+                    state.notify("success", format!("已安装并切换到 Node {version}"));
+                    Ok(json!({ "detail": detail, "nvm": fresh, "env": env }))
+                }
+                Err(error) => {
+                    state.notify("error", error.lines().next().unwrap_or("安装失败").to_string());
+                    Err(error)
+                }
+            }
+        }
+        "nvmUseVersion" => {
+            let version = text(&args, 0).to_string();
+            let result = crate::nvm::use_version(&version);
+            let fresh = crate::nvm::status();
+            let env = crate::envmgr::scan();
+            match result {
+                Ok(detail) => {
+                    state.notify("success", format!("已切换到 Node {version}"));
+                    Ok(json!({ "detail": detail, "nvm": fresh, "env": env }))
+                }
+                Err(error) => {
+                    state.notify("error", error.lines().next().unwrap_or("切换失败").to_string());
+                    Err(error)
+                }
+            }
+        }
+        "nvmUninstallVersion" => {
+            let version = text(&args, 0).to_string();
+            state.busy = true;
+            let result = crate::nvm::uninstall_version(&version);
+            state.busy = false;
+            let fresh = crate::nvm::status();
+            let env = crate::envmgr::scan();
+            match result {
+                Ok(detail) => {
+                    state.notify("success", format!("已卸载 Node {version}"));
+                    Ok(json!({ "detail": detail, "nvm": fresh, "env": env }))
+                }
+                Err(error) => {
+                    state.notify("error", error.lines().next().unwrap_or("卸载失败").to_string());
+                    Err(error)
+                }
+            }
+        }
+        // 某一项能装哪些版本（走 winget 源，Node 走 nvm 不在这里）
+        "envAvailableVersions" => {
+            let id = text(&args, 0).to_string();
+            crate::envmgr::available_versions(&id)
         }
         "openEnvDownload" => {
             let id = text(&args, 0).to_string();
@@ -2058,11 +2124,12 @@ pub async fn dispatch(
 fn run_env_action(
     state: &mut AppState,
     id: &str,
-    action: fn(&str) -> Result<String, String>,
+    version: &str,
+    action: fn(&str, &str) -> Result<String, String>,
 ) -> Result<Value, String> {
     // 执行期间置 busy：挡住其它会改配置的调用，也提示前端转圈
     state.busy = true;
-    let result = action(id);
+    let result = action(id, version);
     state.busy = false;
     match result {
         Ok(detail) => {

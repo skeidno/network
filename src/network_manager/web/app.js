@@ -1027,6 +1027,10 @@ async function refreshLogs() {
    ------------------------------------------------------------------ */
 let envScanning = false;
 let envBusy = false;
+// nvm 状态单独缓存一份：体检结果里只有「装了哪些」，没有「能装哪些」。
+// 可装版本要调 nvm（要联网拉 available 列表），单独按需拉一次就好。
+let nvmState = null;
+let envVersionTarget = { id: "", version: "" };
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -1100,6 +1104,7 @@ function renderEnv(data) {
         ${hint}
         ${pathHint ? `<div class="env-card-path">${pathHint}</div>` : ""}
         ${item.note ? `<div class="env-card-note">${escapeHtml(item.note)}</div>` : ""}
+        ${renderVersionManager(item)}
         <div class="env-card-actions">${actions}</div>
       </div>`;
   }).join("");
@@ -1117,12 +1122,178 @@ function renderEnv(data) {
   installAll.title = hints.join("；");
 }
 
+/**
+ * 版本管理区。只画在支持指定版本的项上（目前只有 Node 走 nvm）。
+ *
+ * 分两层：
+ * - 已装版本做成可点的徽章，点一下就切（切版本不破坏任何东西，手感要快）
+ * - 没装的版本放下拉框，选中后点「安装并切换」才动手（要下载，慢）
+ */
+function renderVersionManager(item) {
+  if (!item.supportsVersions) return "";
+  // Node 才有 nvm 数据。别的项（Python/Git/JDK）走 winget 源，
+  // 版本列表要现查，装之前先让用户知道有哪些可选 —— 展开时再拉，不做无用请求。
+  if (item.id !== "node") return renderWingetVersionManager(item);
+
+  const state = nvmState;
+  if (!state || !state.installed) {
+    return `
+      <div class="env-versions">
+        <div class="env-versions-title">${icon("download")}<span>版本管理</span></div>
+        <div class="env-versions-hint">${escapeHtml(
+          state ? state.hint || "未检测到 nvm" : "正在检测 nvm…"
+        )}</div>
+        <div class="env-versions-actions" style="margin-top:8px">
+          <button type="button" class="button secondary" data-env-install="nvm">${icon("download")}<span>安装 nvm</span></button>
+        </div>
+      </div>`;
+  }
+
+  const installed = Array.isArray(state.installedVersions) ? state.installedVersions : [];
+  const available = Array.isArray(state.availableVersions) ? state.availableVersions : [];
+  const current = state.current || "";
+  // 已经装了的就不该再出现在「可安装」下拉里
+  const candidates = available.filter((entry) => !installed.includes(entry.version));
+
+  const chips = installed.length
+    ? `<div class="env-versions-row">
+        <div class="env-version-chips">
+          ${installed.map((version) => `
+            <button type="button"
+              class="env-version-chip ${version === current ? "is-current" : ""}"
+              data-nvm-use="${escapeHtml(version)}"
+              title="${version === current ? "当前正在使用" : `切换到 ${version}`}"
+              ${envBusy ? "disabled" : ""}>${escapeHtml(version)}${version === current ? " ✓" : ""}</button>
+          `).join("")}
+        </div>
+      </div>`
+    : "";
+
+  const picker = candidates.length
+    ? `<div class="env-versions-row">
+        <select class="env-versions-select" id="env-nvm-pick">
+          ${candidates.map((entry) => `<option value="${escapeHtml(entry.version)}">${escapeHtml(entry.version)}${entry.channel === "LTS" ? "（LTS）" : ""}</option>`).join("")}
+        </select>
+        <div class="env-versions-actions">
+          <button type="button" class="button primary" data-nvm-install>${icon("download")}<span>安装并切换</span></button>
+        </div>
+      </div>`
+    : `<div class="env-versions-hint">没有更多可安装的版本（已列出 nvm 提供的当前与 LTS 通道）。要装其它版本请到 <a href="https://nodejs.org/dist/" target="_blank" rel="noreferrer">nodejs.org/dist</a> 查。</div>`;
+
+  return `
+    <div class="env-versions" data-nvm-for="node">
+      <div class="env-versions-title">${icon("cpu")}<span>版本管理</span>
+        <span class="env-versions-tag">nvm ${escapeHtml(state.version || "")}</span>
+      </div>
+      ${chips}
+      ${picker}
+      <div class="env-versions-hint">已装 ${installed.length} 个版本，可并存，切版本不影响其它项目。切换后新开的终端才会生效（nvm 靠改软链接实现，已开着的窗口里还是旧版本）。</div>
+    </div>`;
+}
+
+/**
+ * 走 winget 的版本选择（Python / Git / JDK）。
+ *
+ * 与 Node 的关键差别：winget 换版本要先卸载旧的，所以文案必须说清这是破坏性操作，
+ * 不能让用户以为点一下就多出一个并存版本。
+ */
+function renderWingetVersionManager(item) {
+  // 没展开就不画这个区 —— 版本列表要调 winget 源，不该一进页面就拉
+  if (!envVersionTarget || envVersionTarget.id !== item.id) {
+    return `
+      <div class="env-versions">
+        <div class="env-versions-title">${icon("download")}<span>版本管理</span></div>
+        <div class="env-versions-actions">
+          <button type="button" class="text-button" data-env-query-versions="${escapeHtml(item.id)}">查看可安装版本</button>
+        </div>
+        <div class="env-versions-hint"><strong>这一项不能多版本并存</strong>：装指定版本会先卸载现有版本。要并存请用 Node 的 nvm。</div>
+      </div>`;
+  }
+  const versions = Array.isArray(envVersionTarget.versions) ? envVersionTarget.versions : [];
+  if (!versions.length) {
+    return `
+      <div class="env-versions">
+        <div class="env-versions-title">${icon("download")}<span>版本管理</span></div>
+        <div class="env-versions-hint">正在查询可安装版本…</div>
+      </div>`;
+  }
+  return `
+    <div class="env-versions">
+      <div class="env-versions-title">${icon("download")}<span>版本管理</span></div>
+      <div class="env-versions-row">
+        <select class="env-versions-select" data-env-version-pick="${escapeHtml(item.id)}">
+          <option value="">保持 ${escapeHtml(item.version || "当前版本")}</option>
+          ${versions.map((version) => `<option value="${escapeHtml(version)}">${escapeHtml(version)}</option>`).join("")}
+        </select>
+        <div class="env-versions-actions">
+          <button type="button" class="button primary" data-env-install-version="${escapeHtml(item.id)}">${icon("download")}<span>安装该版本</span></button>
+        </div>
+      </div>
+      <div class="env-versions-hint"><strong>与 Node 不同，这一项不能多版本并存</strong>：装指定版本会先卸载现在的版本。</div>
+    </div>`;
+}
+
+async function queryEnvVersions(id) {
+  if (envBusy) return;
+  setEnvBusy(true);
+  try {
+    const data = await invoke("envAvailableVersions", id);
+    envVersionTarget = { id, versions: Array.isArray(data?.versions) ? data.versions : [] };
+    if (!envVersionTarget.versions.length) {
+      showToast("error", "没查到可安装的版本");
+    }
+  } catch (error) {
+    showToast("error", error.message || "查询版本失败");
+    return;
+  } finally {
+    setEnvBusy(false);
+  }
+  // 重画整页：版本区是 renderEnv 的一部分
+  const data = await invoke("scanEnv");
+  renderEnv(data);
+}
+
+async function refreshNvm() {
+  try {
+    nvmState = await invoke("nvmStatus");
+  } catch (error) {
+    nvmState = { installed: false, hint: `检测 nvm 失败：${error.message || error}`, installedVersions: [], availableVersions: [], version: "", current: "" };
+  }
+}
+
+async function runNvmAction(method, version, verb) {
+  if (envBusy) return;
+  setEnvBusy(true);
+  // 后端在 nvmInstallVersion / nvmUseVersion 的返回里已经带了重扫过的 env，
+  // 直接用它，别再发一次 scanEnv —— 两边来自同一份快照才不会一个说切了、
+  // 一个说没切。
+  let freshEnv = null;
+  try {
+    const result = await invoke(method, version);
+    if (result && result.nvm) nvmState = result.nvm;
+    freshEnv = result?.env || null;
+    showEnvDetail(`${verb}输出`, result?.detail || `${verb}完成`);
+  } catch (error) {
+    showEnvDetail(`${verb}失败`, error.message || String(error));
+  } finally {
+    setEnvBusy(false);
+  }
+  // 必须在 setEnvBusy(false) 之后重画：refreshEnv 开头有 `if (envBusy) return`，
+  // 在 busy 状态下调它会被直接跳过。
+  // 失败时后端不返回 env，退回重扫（比如卸载的正好是当前版本）。
+  if (freshEnv) renderEnv(freshEnv);
+  else await refreshEnv();
+}
+
 async function refreshEnv() {
   if (envScanning || envBusy) return;
   envScanning = true;
   const summary = byId("env-summary");
   summary.textContent = "正在体检…";
   try {
+    // nvm 状态先拉：Node 卡片要靠它画版本管理区。
+    // 放在 scanEnv 之前，两个都是子进程调用，顺序不影响耗时。
+    if (!nvmState) await refreshNvm();
     const data = await invoke("scanEnv");
     renderEnv(data);
   } catch (error) {
@@ -1143,17 +1314,21 @@ function showEnvDetail(title, body) {
 function setEnvBusy(busy) {
   envBusy = busy;
   // 安装期间把所有按钮禁掉：winget 独占安装锁，连点两次只会得到一段乱序输出
-  document.querySelectorAll("[data-env-install], [data-env-reinstall], #env-install-all, #env-refresh")
+  document.querySelectorAll(
+    "[data-env-install], [data-env-reinstall], [data-env-install-version], [data-env-query-versions]," +
+    "[data-nvm-use], [data-nvm-install], #env-install-all, #env-refresh"
+  )
     .forEach((button) => { button.disabled = busy; });
   const summary = byId("env-summary");
   if (busy) summary.textContent = "正在执行安装，这一步可能要几分钟…";
 }
 
-async function runEnvAction(id, method, verb) {
+async function runEnvAction(id, method, verb, version = "") {
   if (envBusy) return;
   setEnvBusy(true);
   try {
-    const result = await invoke(method, id);
+    // 版本为空 = 装最新版；后端对 Node 会转给 nvm，其它走 winget 的 --version
+    const result = await invoke(method, id, version);
     if (result && result.env) renderEnv(result.env);
     showEnvDetail(`${verb}输出`, result?.detail || `${verb}完成`);
   } catch (error) {
@@ -2140,6 +2315,46 @@ function bindEvents() {
   byId("env-detail-close").addEventListener("click", () => { byId("env-detail").hidden = true; });
   // 卡片里的按钮是渲染出来的，用事件委托绑一次就够，不用每张卡重绑
   byId("env-grid").addEventListener("click", (event) => {
+    // 顺序有讲究：版本相关的先判，因为它们也带 data-env-* 前缀
+    const nvmUse = event.target.closest("[data-nvm-use]");
+    if (nvmUse) {
+      runNvmAction("nvmUseVersion", nvmUse.dataset.nvmUse, "切换版本");
+      return;
+    }
+    const nvmInstall = event.target.closest("[data-nvm-install]");
+    if (nvmInstall) {
+      const picker = byId("env-nvm-pick");
+      if (!picker || !picker.value) {
+        showToast("error", "先选一个要安装的版本");
+        return;
+      }
+      runNvmAction("nvmInstallVersion", picker.value, "安装版本");
+      return;
+    }
+    const installVersion = event.target.closest("[data-env-install-version]");
+    if (installVersion) {
+      const id = installVersion.dataset.envInstallVersion;
+      const picker = document.querySelector(`[data-env-version-pick="${id}"]`);
+      const version = picker ? picker.value : "";
+      if (!version) {
+        showToast("error", "先选一个要安装的版本");
+        return;
+      }
+      // 破坏性操作要确认一次：装指定版本会先卸载现在的
+      const card = document.querySelector(`.env-card[data-env-card="${id}"] .env-card-version`);
+      const current = card ? card.textContent.trim() : "当前版本";
+      if (!window.confirm(
+        `${id} 目前是 ${current}。\n` +
+        `安装 ${version} 会先卸载现有版本（不能多版本并存）。\n\n继续吗？`
+      )) return;
+      runEnvAction(id, "installEnv", "安装", version);
+      return;
+    }
+    const queryVersions = event.target.closest("[data-env-query-versions]");
+    if (queryVersions) {
+      queryEnvVersions(queryVersions.dataset.envQueryVersions);
+      return;
+    }
     const reinstall = event.target.closest("[data-env-reinstall]");
     if (reinstall) {
       reinstallEnv(reinstall.dataset.envReinstall);
