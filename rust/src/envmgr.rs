@@ -14,7 +14,7 @@
 
 use serde_json::{json, Value};
 use std::cmp::Ordering;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// 单个环境的探测结果。前端只认这些字段，别的一律塞进 `note`。
@@ -211,6 +211,22 @@ fn extract_version(text: &str) -> String {
     best
 }
 
+/// 常见安装位置：用户装在非 PATH 目录的情况。
+///
+/// 只放「装完通常不进 PATH 但确实是系统安装」的目录。**不放 conda 目录** ——
+/// Python 那一项要显式排除 conda，不能在这里悄悄把它当兜底候选。
+const EXTRA_EXE_DIRS: [&str; 9] = [
+    r"C:\Program Files\Git\cmd",
+    r"C:\Program Files\Git\bin",
+    r"C:\Program Files\nodejs",
+    r"C:\Program Files\Android\Android Studio\jbr\bin",
+    r"C:\Program Files\Microsoft\jdk-21.0.11.10-hotspot\bin",
+    r"C:\Program Files\Android\platform-tools",
+    r"C:\Program Files (x86)\Android\platform-tools",
+    r"C:\Program Files (x86)\Android\adb",
+    r"C:\Program Files\WebView2",
+];
+
 /// 在 PATH 和几个常见安装位置里找一个可执行文件。
 ///
 /// 顺序刻意是「PATH 优先，常见目录兜底」：PATH 里的那个才是用户真正在用的，
@@ -224,23 +240,53 @@ fn find_exe(names: &[&str]) -> Option<PathBuf> {
         }
     }
     // 常见安装位置（用户装在非 PATH 目录的情况）
-    let extras: Vec<PathBuf> = vec![
-        PathBuf::from(r"C:\Program Files\Git\cmd"),
-        PathBuf::from(r"C:\Program Files\Git\bin"),
-        PathBuf::from(r"C:\Program Files\nodejs"),
-        PathBuf::from(r"C:\Program Files\Android\Android Studio\jbr\bin"),
-        PathBuf::from(r"C:\Program Files\Microsoft\jdk-21.0.11.10-hotspot\bin"),
-        PathBuf::from(r"C:\Program Files\Android\platform-tools"),
-        PathBuf::from(r"C:\Program Files (x86)\Android\platform-tools"),
-        PathBuf::from(r"C:\Program Files (x86)\Android\adb"),
-        PathBuf::from(r"C:\Program Files\WebView2"),
-    ];
+    let extras: Vec<PathBuf> = EXTRA_EXE_DIRS.iter().map(PathBuf::from).collect();
     for extra in extras {
         for name in names {
             candidates.push(extra.join(name));
         }
     }
     candidates.into_iter().find(|p| p.is_file())
+}
+
+/// 列出所有匹配的候选可执行文件（find_exe 的多值版本），按优先级排序。
+///
+/// 需要「挨个试」的场景用这个：比如 Python 装了多个，第一个命中的是 conda
+/// 环境的就该跳过看下一个，而不是直接返回「没装」。
+fn find_all_exes(names: &[&str]) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            for name in names {
+                candidates.push(dir.join(name));
+            }
+        }
+    }
+    for extra in EXTRA_EXE_DIRS {
+        for name in names {
+            candidates.push(PathBuf::from(extra).join(name));
+        }
+    }
+    // 去重但保序：同一个 exe 可能同时命中 PATH 与兜底目录
+    let mut seen = Vec::new();
+    candidates
+        .into_iter()
+        .filter(|p| p.is_file())
+        .filter(|p| {
+            let key = p.to_string_lossy().to_lowercase();
+            if seen.contains(&key) {
+                false
+            } else {
+                seen.push(key);
+                true
+            }
+        })
+        .collect()
+}
+
+/// 找第一个通过筛选的候选可执行文件。
+fn find_exe_filtered(names: &[&str], accept: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    find_all_exes(names).into_iter().find(|p| accept(p))
 }
 
 // ---------------------------------------------------------------------------
@@ -268,20 +314,123 @@ fn probe_by_version(item: &mut EnvItem, exe_names: &[&str], args: &[&str]) -> bo
     true
 }
 
-/// Python：优先用 launcher（py -3），没有再找 python。
+/// Python：只认**原生**安装（python.org / Microsoft Store 那种），
+/// 明确排除 conda 环境里的解释器。
+///
+/// 为什么排除 conda：
+///
+/// 1. conda 装的 Python 依赖 `activate` 才生效，直接跑它的 `python.exe --version`
+///    拿到的版本不代表用户命令行里那个；
+/// 2. conda 环境是「一整套依赖」，我们只体检单个解释器版本，管不了它的包；
+/// 3. 这一页是给开发环境做体检的，不是包管理器 —— 装了 conda 的用户知道自己在用哪套。
+///
+/// 判定只认**安装路径**（路径里含 conda 的根目录名），不猜版本输出里的字符串：
+/// 各家 conda 的 banner 措辞不统一，靠字符串匹配等于给自己埋雷。
+///
+/// 一个原生解释器都找不到时，如果本机确实装了 conda，要说清楚为什么不算它 ——
+/// 否则用户看到「未检测到」会以为程序坏了，而实际上他机器上有 Python，
+/// 只是我们刻意没数它。
 fn probe_python(item: &mut EnvItem) {
-    if probe_by_version(item, &["py.exe"], &["-3", "--version"]) {
-        // launcher 报的是 "Python 3.13.14"，路径补成真实的解释器
-        if let Some(real) = find_exe(&["python.exe"]) {
-            item.path = real.to_string_lossy().to_string();
+    // launcher（py.exe）优先：它只列系统安装的解释器，不会把 conda 环境的
+    // 解释器算进去 —— 这正是我们要的，所以 launcher 命中就算通过
+    if let Some(launcher) = find_exe_filtered(&["py.exe"], |_| true) {
+        let launcher_str = launcher.to_string_lossy().to_string();
+        let out = run_capture(&launcher_str, &["-3", "--version"]);
+        let version = extract_version(&out);
+        if !version.is_empty() {
+            item.ready = true;
+            item.version = version;
+            item.path = launcher_str;
+            item.note = "通过 Python Launcher 探测（只列原生安装）".to_string();
+            return;
         }
-        item.note = "通过 Python Launcher 探测".to_string();
+    }
+
+    // 没有 launcher 才直接找 python.exe，此时必须排除 conda
+    for candidate in find_all_exes(&["python.exe"]) {
+        if is_conda_python(&candidate) {
+            continue;
+        }
+        let exe = candidate.to_string_lossy().to_string();
+        let out = run_capture(&exe, &["--version"]);
+        let version = extract_version(&out);
+        if version.is_empty() {
+            continue;
+        }
+        item.ready = true;
+        item.version = version;
+        item.path = exe;
+        item.note = if inside_conda_env() {
+            // 进程在 conda 环境里但解释器本身是原生的，说明是外部工具链起的进程
+            "原生安装（当前进程在 conda 环境内，探测到的是原生解释器）".to_string()
+        } else {
+            "原生安装".to_string()
+        };
         return;
     }
-    if probe_by_version(item, &["python.exe"], &["--version"]) {
-        return;
+
+    // 一个原生解释器都没找到：如果 conda 环境是现成的，说清楚为什么不算它
+    let conda_dirs = conda_install_dirs();
+    if !conda_dirs.is_empty() {
+        item.note = format!(
+            "未找到原生 Python。检测到 conda 环境（{}），本工具只体检原生安装，不使用 conda 管理的解释器",
+            conda_dirs.join("、")
+        );
+    } else {
+        item.note = "未在 PATH 中找到 py.exe 或 python.exe".to_string();
     }
-    item.note = "未在 PATH 中找到 py.exe 或 python.exe".to_string();
+}
+
+/// 当前进程是否跑在 conda 环境里（被 conda activate 过）。
+fn inside_conda_env() -> bool {
+    std::env::var_os("CONDA_PREFIX").is_some()
+}
+
+/// conda 的常见安装目录名。
+///
+/// 认目录名而不是问 conda 本体在不在：`conda` 可能不在 PATH（用户装完从没
+/// activate 过），但解释器照样在环境目录里，靠目录名反而更稳。
+const CONDA_ROOT_NAMES: [&str; 5] =
+    ["anaconda3", "miniconda3", "miniforge3", "mambaforge", "micromamba"];
+
+/// 列出本机存在的 conda 根目录（完整路径）。
+fn conda_install_dirs() -> Vec<String> {
+    let mut found = Vec::new();
+    let push_root = |base: PathBuf, out: &mut Vec<String>| {
+        if base.as_os_str().is_empty() {
+            return;
+        }
+        for name in CONDA_ROOT_NAMES {
+            let candidate = base.join(name);
+            if candidate.is_dir() {
+                out.push(candidate.to_string_lossy().to_string());
+            }
+        }
+    };
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        push_root(PathBuf::from(local).join("Programs"), &mut found);
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        push_root(PathBuf::from(profile), &mut found);
+    }
+    push_root(PathBuf::from(r"C:\ProgramData"), &mut found);
+    push_root(PathBuf::from(r"C:\"), &mut found);
+    found
+}
+
+/// 这个 python.exe 是不是 conda 环境里的。
+///
+/// 只看路径，不执行它 —— 执行 conda 解释器要连带一整套依赖，装不装得起来
+/// 都是环境自己的事，我们不该去激活它。
+///
+/// 判定刻意**不依赖路径分隔符**：Windows 上 `Path` 会把 `\` 规范成 `/`
+/// （单测里就能看到），而真实文件系统返回的又常是 `\`。写成两边都能匹配：
+/// 先把反斜杠换成正斜杠，再按「目录段」比对。
+fn is_conda_python(exe: &Path) -> bool {
+    let normalized = exe.to_string_lossy().replace('\\', "/").to_lowercase();
+    CONDA_ROOT_NAMES
+        .iter()
+        .any(|name| normalized.contains(&format!("/{name}/")))
 }
 
 /// Node.js：node --version 输出 v22.19.0，extract_version 会去掉前缀 v。
@@ -1054,6 +1203,68 @@ mod tests {
         missing.finalize();
         assert!(!missing.outdated);
         assert!(!missing.ready);
+    }
+
+    #[test]
+    fn conda环境里的解释器要认出来() {
+        // conda 根目录下的本体
+        assert!(is_conda_python(Path::new(
+            r"C:\Users\dev\anaconda3\python.exe"
+        )));
+        assert!(is_conda_python(Path::new(
+            r"C:\Users\dev\miniconda3\python.exe"
+        )));
+        // conda 环境目录里的解释器（路径含根目录名）
+        assert!(is_conda_python(Path::new(
+            r"C:\Users\dev\miniconda3\envs\web\python.exe"
+        )));
+        assert!(is_conda_python(Path::new(
+            r"C:\ProgramData\anaconda3\envs\base\python.exe"
+        )));
+        // 大小写不敏感（盘符和用户目录名都可能不同大小写）
+        assert!(is_conda_python(Path::new(
+            r"c:\users\dev\Miniconda3\python.exe"
+        )));
+        // 分隔符无关：Windows 上 Path 会把 \ 规范成 /，两种都得认
+        assert!(is_conda_python(Path::new(
+            r"C:\Users\dev\miniconda3\python.exe"
+        )));
+        assert!(is_conda_python(Path::new(
+            "C:/Users/dev/miniconda3/envs/x/python.exe"
+        )));
+        // micromamba / mambaforge 也在名单里
+        assert!(is_conda_python(Path::new(
+            r"C:\Users\dev\micromamba\python.exe"
+        )));
+    }
+
+    #[test]
+    fn 原生安装不该被误判成conda() {
+        for native in [
+            r"C:\Users\dev\AppData\Local\Programs\Python\Python313\python.exe",
+            r"C:\Python313\python.exe",
+            r"C:\Program Files\Python312\python.exe",
+            // 目录名里只是碰巧含有 conda 的子串，不该命中
+            r"C:\Users\dev\my-conda-notes\python.exe",
+        ] {
+            assert!(
+                !is_conda_python(Path::new(native)),
+                "{native} 被误判成 conda 了"
+            );
+        }
+    }
+
+    #[test]
+    fn 兜底目录里不含conda() {
+        // 否则 find_all_exes 会把 conda 的解释器当兜底候选，
+        // probe_python 里的排除逻辑就白写了
+        for dir in EXTRA_EXE_DIRS {
+            let lower = dir.to_lowercase();
+            assert!(
+                !CONDA_ROOT_NAMES.iter().any(|name| lower.contains(name)),
+                "兜底目录 {dir} 不该包含 conda"
+            );
+        }
     }
 
     #[test]
