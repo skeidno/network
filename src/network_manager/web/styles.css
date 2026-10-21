@@ -1065,6 +1065,111 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
   .toast-container { right: 12px; bottom: 12px; }
 }
 
+/* ------------------------------------------------------------------
+   环境管理页（开发环境体检 + 一键部署）
+   卡片按「就绪 / 缺失」两态着色，缺失的那几张在页面里最显眼 ——
+   用户进这个页面就是为了看缺什么。
+   ------------------------------------------------------------------ */
+.env-summary {
+  font-size: 13px;
+  color: var(--text-2);
+  margin-right: auto;
+}
+.env-summary strong { color: var(--text); font-weight: 600; }
+
+.env-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.env-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.env-card.is-ready { border-left: 3px solid var(--green); }
+.env-card.is-missing { border-left: 3px solid var(--amber); }
+
+.env-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.env-card-name { font-weight: 600; font-size: 14px; color: var(--text); }
+
+.env-badge {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.env-badge.is-ready { color: var(--green-text); background: var(--green-soft); }
+.env-badge.is-missing { color: var(--amber-text); background: var(--amber-soft); }
+
+.env-card-version {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  word-break: break-all;
+}
+.env-card-version.is-unknown { color: var(--text-2); }
+
+.env-card-path {
+  font-size: 11px;
+  color: var(--text-2);
+  word-break: break-all;
+  line-height: 1.5;
+}
+
+.env-card-note { font-size: 12px; color: var(--text-2); line-height: 1.5; }
+
+.env-card-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 4px;
+}
+.env-card-actions .button { padding: 6px 12px; font-size: 12px; }
+
+/* 执行输出面板：把 winget 的话原样摊开，方便用户自己判断 */
+.env-detail {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+.env-detail-close { margin-left: auto; align-self: center; }
+.env-detail-body {
+  margin: 12px 0 0;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--surface-inset);
+  border: 1px solid var(--line-hairline);
+  font: 12px/1.65 Consolas, monospace;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--surface-inset-text);
+}
+.env-detail-body:empty { display: none; }
+
+/* 窄屏：单列铺开，别让卡片挤成两行字 */
+@media (max-width: 640px) {
+  .env-grid { grid-template-columns: 1fr; }
+  .env-summary { flex: 1 1 100%; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
 }

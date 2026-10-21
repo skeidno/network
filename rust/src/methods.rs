@@ -1362,6 +1362,37 @@ pub async fn dispatch(
             crate::localca::open_dir()?;
             Ok(json!(true))
         }
+        // 开发环境体检与一键部署。
+        // 体检是纯只读，跑起来不慢但也别塞进每轮状态里（要起好几个子进程问版本号），
+        // 所以由前端进页面时主动调一次。
+        "scanEnv" => Ok(crate::envmgr::scan()),
+        "installEnv" => {
+            let id = text(&args, 0).to_string();
+            if id.is_empty() {
+                return Err("缺少环境条目 id".into());
+            }
+            // 安装期间置 busy：挡住其它会改配置的调用，也提示前端转圈
+            state.busy = true;
+            let result = crate::envmgr::install(&id);
+            state.busy = false;
+            match result {
+                Ok(detail) => {
+                    // 装完立刻重扫，界面上的「已就绪」当场变绿，不用用户手动刷新
+                    let fresh = crate::envmgr::scan();
+                    state.notify("success", detail.lines().next().unwrap_or("安装完成").to_string());
+                    Ok(json!({ "detail": detail, "env": fresh }))
+                }
+                Err(error) => {
+                    state.notify("error", error.lines().next().unwrap_or("安装失败").to_string());
+                    Err(error)
+                }
+            }
+        }
+        "openEnvDownload" => {
+            let id = text(&args, 0).to_string();
+            crate::envmgr::open_download(&id)?;
+            Ok(json!(true))
+        }
         "saveSources" => {
             let patch = payload(&args, 0)?;
             for (key, slot) in [("clash", "Clash 7897"), ("v2ray", "v2ray 10808")] {

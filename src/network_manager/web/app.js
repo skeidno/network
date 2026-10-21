@@ -75,6 +75,7 @@ const PAGE_TITLES = {
   nodes: "代理与节点",
   servers: "服务器部署",
   settings: "设置",
+  env: "环境管理",
   logs: "运行日志",
 };
 
@@ -173,6 +174,9 @@ function renderActivePage() {
     renderSubscriptions();
   } else if (currentPage === "servers") renderSshServers();
   else if (currentPage === "settings") renderSettings();
+  // 环境页不在每轮状态里渲染：体检要起子进程问版本号，塞进状态轮询会拖慢整页刷新。
+  // 改成切进页面时按需拉一次。
+  else if (currentPage === "env") refreshEnv();
   else if (currentPage === "logs") refreshLogs();
 }
 
@@ -1016,6 +1020,153 @@ async function refreshLogs() {
     if (shouldFollow) output.scrollTop = output.scrollHeight;
   } catch (_error) { /* state polling reports connectivity */ }
   finally { logsRefreshing = false; }
+}
+
+/* ------------------------------------------------------------------
+   环境管理页：开发环境体检 + 一键部署
+   ------------------------------------------------------------------ */
+let envScanning = false;
+let envBusy = false;
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[char]));
+}
+
+function renderEnv(data) {
+  const grid = byId("env-grid");
+  const summary = byId("env-summary");
+  const items = Array.isArray(data.items) ? data.items : [];
+
+  if (!items.length) {
+    summary.textContent = "没有可体检的项目";
+    grid.innerHTML = "";
+    return;
+  }
+
+  const missing = items.filter((item) => !item.ready);
+  summary.innerHTML = missing.length
+    ? `<strong>${data.ready}/${data.total}</strong> 已就绪 · 缺 ${missing.length} 项：${escapeHtml(missing.map((item) => item.name).join("、"))}`
+    : `<strong>${data.total}/${data.total}</strong> 全部就绪`;
+
+  grid.innerHTML = items.map((item) => {
+    // winget 不可用时不给「一键部署」，只留「去官网」，并在卡片上说明原因
+    const canInstall = Boolean(item.canInstall) && !item.ready;
+    const versionText = item.ready
+      ? (item.version || "已安装")
+      : "未检测到";
+    const pathHint = item.path
+      ? escapeHtml(item.path)
+      : (item.ready ? "位置未记录" : "");
+    return `
+      <div class="env-card ${item.ready ? "is-ready" : "is-missing"}" data-env-card="${escapeHtml(item.id)}">
+        <div class="env-card-head">
+          <span class="env-card-name">${escapeHtml(item.name)}</span>
+          <span class="env-badge ${item.ready ? "is-ready" : "is-missing"}">${item.ready ? "已就绪" : "缺失"}</span>
+        </div>
+        <div class="env-card-version ${item.ready && !item.version ? "is-unknown" : ""}">${escapeHtml(versionText)}</div>
+        ${pathHint ? `<div class="env-card-path">${pathHint}</div>` : ""}
+        ${item.note ? `<div class="env-card-note">${escapeHtml(item.note)}</div>` : ""}
+        <div class="env-card-actions">
+          ${item.ready
+            ? `<button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">打开官网</button>`
+            : `${canInstall
+                ? `<button type="button" class="button primary" data-env-install="${escapeHtml(item.id)}">${icon("download")}<span>一键部署</span></button>`
+                : ""}
+              <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">去官网下载</button>`}
+        </div>
+      </div>`;
+  }).join("");
+
+  // 一键部署只在「确有缺失且本机能自动装」时才可点
+  const installAll = byId("env-install-all");
+  const installable = missing.filter((item) => item.canInstall);
+  installAll.disabled = !installable.length || envBusy;
+  installAll.title = data.winget
+    ? (installable.length ? `将依次安装：${installable.map((item) => item.name).join("、")}` : "没有缺失项")
+    : "本机没有 winget，无法自动安装";
+}
+
+async function refreshEnv() {
+  if (envScanning || envBusy) return;
+  envScanning = true;
+  const summary = byId("env-summary");
+  summary.textContent = "正在体检…";
+  try {
+    const data = await invoke("scanEnv");
+    renderEnv(data);
+  } catch (error) {
+    summary.textContent = `体检失败：${error.message || error}`;
+  } finally {
+    envScanning = false;
+  }
+}
+
+function showEnvDetail(title, body) {
+  byId("env-detail-title").textContent = title;
+  byId("env-detail-body").textContent = body || "（无输出）";
+  const panel = byId("env-detail");
+  panel.hidden = false;
+  panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
+function setEnvBusy(busy) {
+  envBusy = busy;
+  // 安装期间把所有按钮禁掉：winget 独占安装锁，连点两次只会得到一段乱序输出
+  document.querySelectorAll("[data-env-install], #env-install-all, #env-refresh")
+    .forEach((button) => { button.disabled = busy; });
+  const summary = byId("env-summary");
+  if (busy) summary.textContent = "正在执行安装，这一步可能要几分钟…";
+}
+
+async function installEnv(id) {
+  if (envBusy) return;
+  setEnvBusy(true);
+  try {
+    const result = await invoke("installEnv", id);
+    if (result && result.env) renderEnv(result.env);
+    showEnvDetail("安装输出", result?.detail || "安装完成");
+  } catch (error) {
+    // 失败时把后端带来的详细输出也摊开，别只留一句「安装失败」
+    showEnvDetail("安装失败", error.message || String(error));
+  } finally {
+    setEnvBusy(false);
+    if (byId("env-detail").hidden) refreshEnv();
+  }
+}
+
+async function installAllEnv() {
+  if (envBusy) return;
+  // 先自己算一遍要装哪些，避免为了「拿 id 列表」多调一次 scanEnv
+  const cards = [...document.querySelectorAll(".env-card.is-missing")]
+    .map((card) => card.dataset.envCard)
+    .filter((id) => {
+      const button = document.querySelector(`[data-env-install="${id}"]`);
+      return Boolean(button);
+    });
+  if (!cards.length) {
+    showToast("success", "没有可自动安装的缺失项");
+    return;
+  }
+  setEnvBusy(true);
+  const chunks = [];
+  try {
+    for (const id of cards) {
+      // 逐个装而不是并发：winget 有全局安装锁，并发只会互相抢
+      const result = await invoke("installEnv", id);
+      if (result && result.detail) chunks.push(`### ${id}\n${result.detail}`);
+      if (result && result.env) renderEnv(result.env);
+    }
+    showEnvDetail("批量部署输出", chunks.join("\n\n"));
+    showToast("success", `已依次尝试部署 ${cards.length} 项`);
+  } catch (error) {
+    chunks.push(`### 失败\n${error.message || error}`);
+    showEnvDetail("批量部署中断", chunks.join("\n\n"));
+  } finally {
+    setEnvBusy(false);
+    refreshEnv();
+  }
 }
 
 function closeCustomSelects(except = null) {
@@ -1942,6 +2093,21 @@ function bindEvents() {
   });
   byId("clear-logs").addEventListener("click", () => { invoke("clearLogs"); refreshLogs(); });
   byId("open-logs").addEventListener("click", () => invoke("openLogs"));
+
+  // 环境管理页
+  byId("env-refresh").addEventListener("click", () => refreshEnv());
+  byId("env-install-all").addEventListener("click", () => installAllEnv());
+  byId("env-detail-close").addEventListener("click", () => { byId("env-detail").hidden = true; });
+  // 卡片里的按钮是渲染出来的，用事件委托绑一次就够，不用每张卡重绑
+  byId("env-grid").addEventListener("click", (event) => {
+    const install = event.target.closest("[data-env-install]");
+    if (install) {
+      installEnv(install.dataset.envInstall);
+      return;
+    }
+    const open = event.target.closest("[data-env-open]");
+    if (open) invoke("openEnvDownload", open.dataset.envOpen);
+  });
   byId("modal-close").addEventListener("click", closeModal);
   byId("app-modal").addEventListener("click", (event) => {
     if (event.target === byId("app-modal")) closeModal();

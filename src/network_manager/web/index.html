@@ -67,6 +67,9 @@
         <button class="nav-item" data-page="settings" title="设置">
           <span class="icon" style="--icon:url('./icons/settings.svg')"></span><span>设置</span>
         </button>
+        <button class="nav-item" data-page="env" title="环境管理">
+          <span class="icon" style="--icon:url('./icons/cpu.svg')"></span><span>环境管理</span>
+        </button>
         <button class="nav-item" data-page="logs" title="运行日志">
           <span class="icon" style="--icon:url('./icons/file-text.svg')"></span><span>运行日志</span>
         </button>
@@ -377,6 +380,24 @@
             <button id="open-logs" class="button secondary"><span class="icon" style="--icon:url('./icons/folder-open.svg')"></span><span>打开日志目录</span></button>
           </div>
           <pre id="log-output" class="log-output">暂无运行日志</pre>
+        </section>
+
+        <section id="page-env" class="page env-page">
+          <div class="page-toolbar">
+            <div class="env-summary" id="env-summary">正在体检…</div>
+            <button id="env-refresh" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span><span>重新体检</span></button>
+            <button id="env-install-all" type="button" class="button primary" disabled><span class="icon" style="--icon:url('./icons/download.svg')"></span><span>一键部署缺失项</span></button>
+          </div>
+          <div id="env-grid" class="env-grid"></div>
+          <div id="env-detail" class="env-detail" hidden>
+            <div class="panel-heading">
+              <div class="heading-icon"><span class="icon" style="--icon:url('./icons/monitor.svg')"></span></div>
+              <div><h2 id="env-detail-title">执行输出</h2><p>下面是命令的原始输出</p></div>
+              <button id="env-detail-close" type="button" class="text-button env-detail-close">关闭</button>
+            </div>
+            <pre id="env-detail-body" class="env-detail-body"></pre>
+          </div>
+          <p class="settings-note">体检只做只读检查：直接问各工具自己的 <code>--version</code>，问不到再查注册表和默认安装目录。<strong>不下载安装包、不改注册表、不动 PATH</strong>。缺什么就交给官方包管理器 winget 去装，命令与输出原样显示在这里 —— 出了问题你能自己判断是哪一步的事。</p>
         </section>
       </div>
     </main>
