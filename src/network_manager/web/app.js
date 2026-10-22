@@ -1475,6 +1475,8 @@ async function selectWinServer(profileId) {
   renderWinServerList();
   updateWinSrvApplyButton();
   await refreshWinServerMonitor();
+  // 保活清单按服务器类型（linux/windows）不同，要跟着换
+  await loadWinServerKeepAlive();
 }
 
 /// 拉取选中服务器的性能与电源设置。
@@ -1598,7 +1600,7 @@ function renderWinServerFixes() {
   // （内容竖排、每字一行，item 高得离谱）—— 实测踩过，很难一眼看出来。
   // 拆成 sibling 的 input + label 更稳。
   box.innerHTML = winSrvFixes.map((fix) => `
-    <div class="winserver-fix">
+    <div class="winserver-fix has-checkbox">
       <input type="checkbox" id="winsrv-fix-${escapeHtml(fix.id)}" value="${escapeHtml(fix.id)}"${fix.needAdmin ? ' title="需要管理员权限"' : ""}>
       <div class="winserver-fix-main">
         <label class="winserver-fix-title" for="winsrv-fix-${escapeHtml(fix.id)}">${escapeHtml(fix.title)}${fix.needAdmin ? ' <span class="winserver-item-tag">需管理员</span>' : ""}</label>
@@ -1802,6 +1804,187 @@ function openWinServerDialog(server = null) {
     if (path) byId("modal-winsrv-key-path").value = path;
   });
   updateAuthFields();
+}
+
+/* ------------------------------------------------------------------
+   远程截图 + 断开后保持运行
+   ------------------------------------------------------------------ */
+let winSrvShot = null;
+let winSrvKeepAlive = [];
+let winSrvKeepAliveStatus = null;
+let winSrvKeepAliveHardware = [];
+let winSrvShotBusy = false;
+
+async function captureWinServerScreen() {
+  if (!winSrvSelected) {
+    showToast("error", "先选一台服务器");
+    return;
+  }
+  if (winSrvShotBusy) return;
+  winSrvShotBusy = true;
+  const box = byId("winserver-shot-box");
+  const info = byId("winserver-shot-info");
+  const button = byId("winserver-shot");
+  button.disabled = true;
+  box.innerHTML = `<div class="winserver-item-reason">正在抓取屏幕…`;
+  info.textContent = "抓取中…";
+  try {
+    const result = await invoke("serverScreenshot", winSrvSelected);
+    winSrvShot = result;
+    renderWinServerShot(result);
+  } catch (error) {
+    box.innerHTML = `<div class="winserver-item-reason">抓取失败：${escapeHtml(error.message || error)}</div>`;
+    info.textContent = "抓取失败";
+  } finally {
+    winSrvShotBusy = false;
+    button.disabled = false;
+  }
+}
+
+function renderWinServerShot(result) {
+  const box = byId("winserver-shot-box");
+  const info = byId("winserver-shot-info");
+  if (!result || !result.data) {
+    box.innerHTML = `<div class="winserver-item-reason">没有拿到图片</div>`;
+    return;
+  }
+  info.textContent = `${result.width}×${result.height} · ${result.method} · ${Math.round((result.sizeBytes || 0) / 1024)} KB`;
+  // data URI 直接进 img 的 src。图片已经在后端压到 1280 宽以内，
+  // base64 后也就百来 KB，一次带过来比再设计一套图片下载接口简单。
+  box.innerHTML = `
+    <div class="winserver-shot-frame">
+      <img src="${result.data}" alt="服务器屏幕画面" class="winserver-shot-img">
+    </div>
+    <div class="winserver-shot-foot">
+      <span>${escapeHtml(result.method || "")}</span>
+      <button type="button" class="text-button" data-shot-download>下载原图</button>
+    </div>`;
+}
+
+function downloadWinServerShot() {
+  if (!winSrvShot || !winSrvShot.data) return;
+  // data URI → blob → 触发下载
+  const link = document.createElement("a");
+  link.href = winSrvShot.data;
+  link.download = `server-screen-${Date.now()}.png`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
+/** 加载保活清单与当前状态。 */
+async function loadWinServerKeepAlive() {
+  if (!winSrvSelected) return;
+  const kind = currentWinSrvKind();
+  try {
+    const list = await invoke("keepAliveList", kind);
+    winSrvKeepAlive = Array.isArray(list?.items) ? list.items : [];
+    winSrvKeepAliveHardware = Array.isArray(list?.hardware) ? list.hardware : [];
+    renderWinServerKeepAliveList(winSrvKeepAliveHardware);
+    await refreshWinServerKeepAliveStatus();
+  } catch (error) {
+    byId("winserver-keepalive-list").innerHTML =
+      `<div class="winserver-item-reason">读取失败：${escapeHtml(error.message || error)}</div>`;
+  }
+}
+
+/** 当前选中服务器的类型（linux / windows）。 */
+function currentWinSrvKind() {
+  const server = winServers().find((item) => item.profileId === winSrvSelected);
+  return server && server.kind === "windows" ? "windows" : "linux";
+}
+
+async function refreshWinServerKeepAliveStatus() {
+  if (!winSrvSelected) return;
+  const box = byId("winserver-keepalive-items");
+  try {
+    const status = await invoke("keepAliveStatus", winSrvSelected);
+    winSrvKeepAliveStatus = status;
+    // 状态到位后重画清单，条目上的「已达标/未达标」徽章才会出现
+    // （清单是先渲染的，那时还没有状态）
+    renderWinServerKeepAliveList(winSrvKeepAliveHardware || []);
+    const items = Array.isArray(status?.items) ? status.items : [];
+    if (!items.length) {
+      box.innerHTML = `<div class="winserver-item-reason">没有可检查的项</div>`;
+      return;
+    }
+    box.innerHTML = items.map((item) => `
+      <div class="winserver-item ${item.ok ? "is-ok" : "is-bad"}">
+        <span class="winserver-item-dot"></span>
+        <div class="winserver-item-main">
+          <div class="winserver-item-title">
+            ${escapeHtml(titleOfKeepAlive(item.id))}
+            <span class="winserver-item-value">${escapeHtml(item.value || "")}</span>
+          </div>
+        </div>
+      </div>
+    `).join("");
+  } catch (error) {
+    box.innerHTML = `<div class="winserver-item-reason">检查失败：${escapeHtml(error.message || error)}</div>`;
+  }
+}
+
+/** 从保活清单里取标题（状态检查只返回 id 与值）。 */
+function titleOfKeepAlive(id) {
+  const found = winSrvKeepAlive.find((item) => item.id === id);
+  return found ? found.title : id;
+}
+
+function renderWinServerKeepAliveList(hardware) {
+  const box = byId("winserver-keepalive-list");
+  if (!winSrvKeepAlive.length) {
+    box.innerHTML = `<div class="winserver-item-reason">正在读取…</div>`;
+  } else {
+    box.innerHTML = winSrvKeepAlive.map((item) => {
+      const status = (winSrvKeepAliveStatus?.items || []).find((s) => s.id === item.id);
+      const done = status ? status.ok : null;
+      return `
+        <div class="winserver-fix has-action">
+          <div class="winserver-fix-main">
+            <div class="winserver-fix-title">
+              ${escapeHtml(item.title)}
+              ${item.needAdmin ? ' <span class="winserver-item-tag">需管理员</span>' : ""}
+              ${done === true ? ' <span class="winserver-keepalive-ok">已达标</span>'
+                : done === false ? ' <span class="winserver-keepalive-bad">未达标</span>' : ""}
+            </div>
+            <div class="winserver-fix-reason">${escapeHtml(item.reason)}</div>
+            <div class="winserver-fix-command">${escapeHtml(item.script)}</div>
+          </div>
+          <button type="button" class="button secondary" data-keepalive-apply="${escapeHtml(item.id)}">${icon("play")}<span>执行</span></button>
+        </div>`;
+    }).join("");
+  }
+  const hw = byId("winserver-hardware");
+  const list = Array.isArray(hardware) ? hardware : [];
+  hw.innerHTML = list.length
+    ? list.map((item) => `
+        <div class="winserver-hardware-item">
+          <div class="winserver-hardware-title">${escapeHtml(item.title)}</div>
+          <div class="winserver-hardware-why">${escapeHtml(item.why)}</div>
+          <div class="winserver-hardware-where"><strong>去哪儿配：</strong>${escapeHtml(item.where)}</div>
+        </div>`).join("")
+    : `<div class="winserver-item-reason">没有硬件层条目</div>`;
+}
+
+async function applyWinServerKeepAlive(id) {
+  if (!winSrvSelected) {
+    showToast("error", "先选一台服务器");
+    return;
+  }
+  try {
+    const result = await invoke("keepAliveApply", winSrvSelected, id);
+    const body = byId("winserver-detail-body");
+    if (body) body.textContent = result?.detail || "已执行";
+    const panel = byId("winserver-detail");
+    if (panel) {
+      panel.hidden = false;
+      panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+    // 状态立刻重查，达标标记当场更新
+    await refreshWinServerKeepAliveStatus();
+  } catch (error) {
+    showToast("error", error.message || "执行失败");
+  }
 }
 
 function closeCustomSelects(except = null) {
@@ -2810,6 +2993,16 @@ function bindEvents() {
   byId("winserver-refresh-users").addEventListener("click", () => refreshWinServerUsers());
   byId("winserver-monitor").addEventListener("click", (event) => {
     if (event.target.closest("#winserver-refresh-monitor")) refreshWinServerMonitor();
+  });
+  // 远程截图与「断开后保持运行」
+  byId("winserver-shot").addEventListener("click", () => captureWinServerScreen());
+  byId("winserver-keepalive-refresh").addEventListener("click", () => refreshWinServerKeepAliveStatus());
+  byId("winserver-shot-box").addEventListener("click", (event) => {
+    if (event.target.closest("[data-shot-download]")) downloadWinServerShot();
+  });
+  byId("winserver-keepalive-list").addEventListener("click", (event) => {
+    const apply = event.target.closest("[data-keepalive-apply]");
+    if (apply) applyWinServerKeepAlive(apply.dataset.keepaliveApply);
   });
   byId("modal-close").addEventListener("click", closeModal);
   byId("app-modal").addEventListener("click", (event) => {

@@ -1329,12 +1329,22 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
    实测：改成 grid 后内容区 758×101，正常。 */
 .winserver-fix {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  /* 三列：勾选框、内容、执行按钮。
+     之前只写了两列（auto + 1fr），保活清单这种「没有勾选框但有按钮」的条目
+     会被当成三列塞进两列的网格里，按钮直接被推到容器外看不见。 */
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: start;
   gap: 12px;
   padding: 13px 15px;
   border-bottom: 1px solid var(--line-hairline);
   cursor: pointer;
+}
+/* 没有勾选框的条目（保活清单）不需要左边那一列空位。
+   用 class 标记而不是 :has() —— :has() 在老版本 WebView2 上不支持，
+   整条规则会被忽略，按钮就又跑到容器外去了。 */
+.winserver-fix.has-action {
+  grid-template-columns: minmax(0, 1fr) auto;
+  cursor: default;
 }
 .winserver-fix:last-child { border-bottom: 0; }
 .winserver-fix:hover { background: var(--surface-2); }
@@ -1413,6 +1423,79 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
   .winserver-checkbox { padding-bottom: 0; }
   .winserver-form-actions { flex-wrap: wrap; }
 }
+
+/* ------------------------------------------------------------------
+   远程截图 + 保持运行
+   ------------------------------------------------------------------ */
+.winserver-shot-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.winserver-shot-info { font-size: 12px; color: var(--text-3); }
+
+.winserver-shot-box {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 12px;
+}
+.winserver-shot-frame {
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface-inset);
+  line-height: 0;
+}
+.winserver-shot-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  /* 截图是像素风，放大会糊 —— 不要平滑插值 */
+  image-rendering: pixelated;
+}
+.winserver-shot-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 9px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+/* 保活：达标 / 未达标 的小标记 */
+.winserver-keepalive-ok,
+.winserver-keepalive-bad {
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.winserver-keepalive-ok { color: var(--green-text); background: var(--green-soft); }
+.winserver-keepalive-bad { color: var(--orange-text); background: var(--orange-soft); }
+
+/* 硬件层：软件搞不定的部分，给「去哪儿配」的指引 */
+.winserver-hardware { display: flex; flex-direction: column; gap: 10px; }
+.winserver-hardware-item {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 13px 15px;
+}
+.winserver-hardware-title { font-size: 13px; font-weight: 600; color: var(--text); }
+.winserver-hardware-why { font-size: 12px; color: var(--text-3); line-height: 1.6; margin-top: 5px; }
+.winserver-hardware-where {
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.6;
+  margin-top: 7px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: var(--surface-2);
+}
+.winserver-hardware-where strong { color: var(--text); }
 
 /* ------------------------------------------------------------------
    环境管理页（开发环境体检 + 一键部署）

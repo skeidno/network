@@ -1458,6 +1458,62 @@ pub async fn dispatch(
         // ---- Windows 服务器远程管理（通过 SSH 执行 PowerShell）----
         // 与 Linux 侧共用同一套 SSH 客户端与凭据存储：Windows Server 2019+
         // 内置 OpenSSH 服务端，讲标准协议，客户端不用改。
+        // ---- 远程截图（Windows 与 Linux 通用）----
+        "serverScreenshot" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let capture = if profile.kind == "windows" {
+                crate::shot::capture_windows(&profile, &credential).await?
+            } else {
+                crate::shot::capture_linux(&profile, &credential).await?
+            };
+            Ok(crate::shot::capture_to_json(&capture))
+        }
+
+        // ---- RDP 断开后保持开机 ----
+        "keepAliveList" => {
+            let kind = text(&args, 0);
+            let items = if kind == "windows" {
+                crate::keepalive::windows_keep_alive()
+            } else {
+                crate::keepalive::linux_keep_alive()
+            };
+            Ok(json!({
+                "items": crate::keepalive::keep_alive_to_json(&items),
+                // 硬件层：软件管不了，给指引
+                "hardware": crate::keepalive::hardware_layer_notes(),
+            }))
+        }
+        "keepAliveStatus" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            if profile.kind == "windows" {
+                Ok(crate::keepalive::check_windows_keep_alive(&profile, &credential).await?)
+            } else {
+                Ok(crate::keepalive::check_linux_keep_alive(&profile, &credential).await?)
+            }
+        }
+        "keepAliveApply" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let item_id = text(&args, 1).to_string();
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let kind = profile.kind.clone();
+            let items = if kind == "windows" {
+                crate::keepalive::windows_keep_alive()
+            } else {
+                crate::keepalive::linux_keep_alive()
+            };
+            let Some(item) = items.into_iter().find(|i| i.id == item_id) else {
+                return Err(format!("未知的保活项：{item_id}"));
+            };
+            let detail = if kind == "windows" {
+                crate::winsrv::run_powershell(&profile, &credential, item.script).await?
+            } else {
+                crate::winsrv::run_shell(&profile, &credential, item.script).await?
+            };
+            state.notify("success", format!("{} 已执行", item.title));
+            Ok(json!({ "detail": detail }))
+        }
         // 探活 + 确认远端确实是 Windows
         "winSrvProbeOs" => {
             let profile = win_srv_profile(state, &text(&args, 0))?;

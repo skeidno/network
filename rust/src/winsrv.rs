@@ -51,6 +51,20 @@ pub async fn run_powershell(
     Ok(result.replace("\r\n", "\n"))
 }
 
+/// 在远端跑一条 shell 命令（Linux 侧用）。
+///
+/// Windows 的 exec 通道默认跑 cmd.exe，Linux 的默认跑 sh —— 这两套语法完全不同，
+/// 所以分成两个函数，不试图用一套模板兼容两边。
+pub async fn run_shell(
+    profile: &crate::models::SshServerProfile,
+    credential: &str,
+    script: &str,
+) -> Result<String, String> {
+    let mut runner = crate::ssh::Runner::new(profile, credential)?;
+    let result = runner.run(script, 60).await?;
+    Ok(result.replace("\r\n", "\n"))
+}
+
 /// 采集性能与运行状态。
 ///
 /// 刻意用 PowerShell 的 WMI/CIM 类而不是 `typeperf` 或任务管理器 ——
