@@ -10,6 +10,8 @@ mod deploy;
 mod envmgr;
 // Node 多版本管理，走 nvm-windows（nvm）
 mod nvm;
+// Windows 服务器远程管理：通过 SSH 在目标机上执行 PowerShell
+mod winsrv;
 // 原生界面只在 Windows 上编（tao + wry）；Linux 的形态是常驻服务，用同名的
 // 空实现顶住，这样命令层照旧调用 crate::gui::*，不需要到处写 cfg。
 #[cfg(windows)]

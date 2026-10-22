@@ -73,7 +73,7 @@ const PAGE_TITLES = {
   overview: "运行概览",
   rules: "分流规则",
   nodes: "代理与节点",
-  servers: "服务器部署",
+  servers: "服务器管理",
   settings: "设置",
   env: "环境管理",
   logs: "运行日志",
@@ -172,7 +172,16 @@ function renderActivePage() {
     renderSources();
     renderNodes();
     renderSubscriptions();
-  } else if (currentPage === "servers") renderSshServers();
+  } else if (currentPage === "servers") {
+    // 同一个页面里两个标签：Linux（SSH 部署）与 Windows（RDP 会话治理）。
+    // 只渲染当前标签那半边，另一半不做无谓的子进程调用。
+    if (serverTab === "windows") {
+      renderWinServerList();
+      loadWinServerFixes();
+    } else {
+      renderSshServers();
+    }
+  }
   else if (currentPage === "settings") renderSettings();
   // 环境页不在每轮状态里渲染：体检要起子进程问版本号，塞进状态轮询会拖慢整页刷新。
   // 改成切进页面时按需拉一次。
@@ -771,7 +780,9 @@ function syncSubscriptionGroupSelect() {
 }
 
 function renderSshServers() {
-  const servers = appState.sshServers || [];
+  // 只列 Linux 侧的。Windows 服务器走 SSH 但管的是 RDP 会话，
+  // 跟「往机器上装代理」完全是两回事，混在一张表里会让人点错。
+  const servers = linuxServers();
   // 选中项只保留仍然存在的服务器，避免删除后残留
   const alive = new Set(servers.map((server) => server.profileId));
   sshSelection.forEach((id) => { if (!alive.has(id)) sshSelection.delete(id); });
@@ -821,12 +832,11 @@ function renderSshServers() {
 }
 
 function selectedSshServers() {
-  const servers = appState.sshServers || [];
-  return servers.filter((server) => sshSelection.has(server.profileId));
+  return linuxServers().filter((server) => sshSelection.has(server.profileId));
 }
 
 function updateSshSelectionUi() {
-  const servers = appState.sshServers || [];
+  const servers = linuxServers();
   const picked = selectedSshServers();
   const count = picked.length;
   const label = byId("ssh-selection-count");
@@ -1382,6 +1392,416 @@ async function installAllEnv() {
     setEnvBusy(false);
     refreshEnv();
   }
+}
+
+/* ------------------------------------------------------------------
+   服务器管理页的标签切换
+   同一页里放 Linux（SSH 部署）与 Windows（RDP 会话治理）两套完全不同的东西：
+   前者是「往机器上装代理」，后者是「让机器别睡着」。硬凑成一张表反而乱，
+   所以用标签分开，但放在同一个「服务器管理」入口下 —— 它们本来就是一件事：
+   管手头的服务器。
+   ------------------------------------------------------------------ */
+let serverTab = "linux";
+
+function setServerTab(tab) {
+  if (tab !== "linux" && tab !== "windows") return;
+  if (serverTab === tab) return;
+  serverTab = tab;
+  document.querySelectorAll("[data-server-tab]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.serverTab === tab);
+  });
+  byId("server-tab-linux").classList.toggle("is-active", tab === "linux");
+  byId("server-tab-windows").classList.toggle("is-active", tab === "windows");
+  // 切过去才渲染那半边。Windows 那半要起 powercfg / reg 子进程，
+  // 不该在用户没看它的时候白跑一趟。
+  if (tab === "windows") {
+    renderWinServerList();
+    loadWinServerFixes();
+  } else {
+    renderSshServers();
+  }
+}
+
+/* ------------------------------------------------------------------
+   服务器管理页 · Windows 标签
+   Linux 那边是「往机器上装代理」，Windows 那边是「让机器别睡着」——
+   两件事都用 SSH 连过去，Windows Server 2019+ 内置 OpenSSH，
+   所以客户端与凭据完全共用。
+
+   注意：字节格式化复用页面已有的 formatBytes，这里不重复定义。
+   ------------------------------------------------------------------ */
+let winSrvSelected = "";
+let winSrvMetrics = null;
+let winSrvPower = null;
+let winSrvFixes = [];
+let winSrvUsers = null;
+let winSrvLoading = false;
+
+function winServers() {
+  return (appState.sshServers || []).filter((server) => server.kind === "windows");
+}
+
+/** Linux 侧的服务器（走代理部署）。老配置没有 kind 字段，一律当 Linux。 */
+function linuxServers() {
+  return (appState.sshServers || []).filter((server) => server.kind !== "windows");
+}
+
+function renderWinServerList() {
+  const box = byId("winserver-list");
+  if (!box) return;
+  const servers = winServers();
+  if (!servers.length) {
+    box.innerHTML = `<div class="empty-state has-icon" style="--icon:url('./icons/server.svg')">
+      还没有 Windows 服务器。点「添加 Windows 服务器」填上 IP 与 SSH 账号即可<br>
+      <small>需要目标机开启 OpenSSH 服务器功能（Windows Server 2019+ 内置）</small>
+    </div>`;
+    return;
+  }
+  box.innerHTML = servers.map((server) => `
+    <button type="button" class="winserver-srv ${server.profileId === winSrvSelected ? "is-active" : ""}"
+      data-winsrv-pick="${escapeHtml(server.profileId)}">
+      <span class="winserver-srv-name">${escapeHtml(server.name)}</span>
+      <span class="winserver-srv-host">${escapeHtml(server.host)}:${server.port}</span>
+      <span class="winserver-srv-user">${escapeHtml(server.username)}</span>
+    </button>
+  `).join("");
+}
+
+async function selectWinServer(profileId) {
+  winSrvSelected = profileId;
+  winSrvMetrics = null;
+  winSrvPower = null;
+  winSrvUsers = null;
+  renderWinServerList();
+  updateWinSrvApplyButton();
+  await refreshWinServerMonitor();
+}
+
+/// 拉取选中服务器的性能与电源设置。
+async function refreshWinServerMonitor() {
+  if (!winSrvSelected || winSrvLoading) return;
+  winSrvLoading = true;
+  const box = byId("winserver-monitor");
+  if (box) box.innerHTML = `<div class="winserver-item-reason">正在连接服务器采集状态…</div>`;
+  try {
+    // 两项并行拉，各自走一次 SSH。串行会等两倍时间。
+    const [metrics, power] = await Promise.all([
+      invoke("winSrvMetrics", winSrvSelected),
+      invoke("winSrvPowerSettings", winSrvSelected),
+    ]);
+    winSrvMetrics = metrics;
+    winSrvPower = power;
+    renderWinServerMonitor();
+  } catch (error) {
+    if (box) {
+      box.innerHTML = `<div class="winserver-item-reason">采集失败：${escapeHtml(error.message || error)}</div>`;
+    }
+  } finally {
+    winSrvLoading = false;
+  }
+}
+
+function renderWinServerMonitor() {
+  const box = byId("winserver-monitor");
+  if (!box || !winSrvMetrics) return;
+  const m = winSrvMetrics;
+  const p = winSrvPower || {};
+
+  const gauge = (label, percent, detail) => `
+    <div class="winserver-gauge">
+      <div class="winserver-gauge-head"><span>${label}</span><strong>${percent}%</strong></div>
+      <div class="winserver-gauge-track"><span style="width:${Math.max(0, Math.min(100, percent))}%"></span></div>
+      <div class="winserver-gauge-foot">${detail}</div>
+    </div>`;
+
+  box.innerHTML = `
+    <div class="winserver-monitor-head">
+      <div>
+        <div class="winserver-monitor-host">${escapeHtml(m.hostName || "未知主机")}</div>
+        <div class="winserver-monitor-os">${escapeHtml(m.os || "")} ${escapeHtml(m.osVersion || "")} · 已运行 ${escapeHtml(m.uptimeText || "—")} · ${m.cpuCores || 0} 核</div>
+      </div>
+      <button id="winserver-refresh-monitor" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span><span>刷新</span></button>
+    </div>
+    <div class="winserver-gauges">
+      ${gauge("CPU", m.cpuPercent || 0, `${m.cpuPercent || 0}% 平均负载`)}
+      ${gauge("内存", m.memoryPercent || 0, `${formatBytes(m.memoryUsedBytes)} / ${formatBytes(m.memoryTotalBytes)}`)}
+      ${gauge("系统盘", m.diskPercent || 0, `${formatBytes(m.diskUsedBytes)} / ${formatBytes(m.diskTotalBytes)}`)}
+    </div>
+    ${renderWinPowerItems(p)}
+  `;
+}
+
+/// 远端电源/RDP 配置的达标情况。
+function renderWinPowerItems(power) {
+  if (!power || (power.sleepSeconds === undefined && power.sleepSeconds !== 0)) return "";
+  const items = [
+    {
+      title: "在此时间后睡眠",
+      ok: power.sleepSeconds === 0,
+      value: power.sleepSeconds === 0 ? "从不" : `${Math.round(power.sleepSeconds / 60)} 分钟`,
+      reason: "RDP 断开后没人动鼠标，超时就进睡眠，远程直接断。",
+    },
+    {
+      title: "在此时间后关闭显示",
+      ok: power.videoSeconds === 0,
+      value: power.videoSeconds === 0 ? "从不" : `${Math.round(power.videoSeconds / 60)} 分钟`,
+      reason: "这就是「息屏」的来源，跟睡眠是两套设置。",
+    },
+    {
+      title: "休眠文件",
+      ok: !power.hibernateFilePresent,
+      value: power.hibernateFilePresent ? "已启用" : "已禁用",
+      reason: "开着时「关机」其实是休眠，重启远程也救不回来。",
+    },
+    {
+      title: "每用户单会话",
+      ok: !power.singleSessionPerUser,
+      value: power.singleSessionPerUser ? "开启" : "关闭",
+      reason: "开启时同名用户重连会踢掉上一个会话 —— 这就是「必须用子用户」的原因。",
+    },
+    {
+      title: "屏幕保护程序",
+      ok: !power.screenSaverActive,
+      value: power.screenSaverActive ? "已启用" : "已禁用",
+      reason: "屏保会遮住画面，让人误以为远程掉线了。",
+    },
+  ];
+  return `
+    <div class="winserver-power-list">
+      <div class="env-versions-title"><span class="icon" style="--icon:url('./icons/power.svg')"></span><span>断连后会怎样</span>
+        ${power.schemeName ? `<span class="env-versions-tag">电源计划 ${escapeHtml(power.schemeName)}</span>` : ""}
+      </div>
+      ${items.map((item) => `
+        <div class="winserver-item ${item.ok ? "is-ok" : "is-bad"}">
+          <span class="winserver-item-dot"></span>
+          <div class="winserver-item-main">
+            <div class="winserver-item-title">
+              ${escapeHtml(item.title)}
+              <span class="winserver-item-value">${escapeHtml(item.value)}</span>
+            </div>
+            <div class="winserver-item-reason">${escapeHtml(item.reason)}</div>
+          </div>
+        </div>
+      `).join("")}
+    </div>`;
+}
+
+function renderWinServerFixes() {
+  const box = byId("winserver-fixes");
+  if (!box) return;
+  if (!winSrvFixes.length) {
+    box.innerHTML = `<div class="winserver-item-reason">正在读取修复项…</div>`;
+    return;
+  }
+  // 用 div + 显式 label for/id 关联，**不用 <label> 包住整个条目**。
+  // <label> 作为 flex 容器时，Chromium 会给它内部的 div 算出 0 宽度
+  // （内容竖排、每字一行，item 高得离谱）—— 实测踩过，很难一眼看出来。
+  // 拆成 sibling 的 input + label 更稳。
+  box.innerHTML = winSrvFixes.map((fix) => `
+    <div class="winserver-fix">
+      <input type="checkbox" id="winsrv-fix-${escapeHtml(fix.id)}" value="${escapeHtml(fix.id)}"${fix.needAdmin ? ' title="需要管理员权限"' : ""}>
+      <div class="winserver-fix-main">
+        <label class="winserver-fix-title" for="winsrv-fix-${escapeHtml(fix.id)}">${escapeHtml(fix.title)}${fix.needAdmin ? ' <span class="winserver-item-tag">需管理员</span>' : ""}</label>
+        <div class="winserver-fix-reason">${escapeHtml(fix.reason)}</div>
+        <div class="winserver-fix-command">${escapeHtml(fix.script)}</div>
+      </div>
+    </div>
+  `).join("");
+  updateWinSrvApplyButton();
+}
+
+function renderWinServerUsers() {
+  const box = byId("winserver-user-list");
+  if (!box) return;
+  if (!winSrvUsers) {
+    box.innerHTML = `<div class="winserver-item-reason">点「刷新用户列表」读取远端用户</div>`;
+    return;
+  }
+  const users = Array.isArray(winSrvUsers.users) ? winSrvUsers.users : [];
+  if (!users.length) {
+    box.innerHTML = `<div class="winserver-item-reason">远端没有读到用户</div>`;
+    return;
+  }
+  box.innerHTML = users.map((user) => `
+    <span class="winserver-user-chip ${user.rdpMember ? "is-rdp" : ""}"
+      title="${user.rdpMember ? "在「远程桌面用户」组里，可以远程登录" : "不在该组里，远程桌面登录会被拒绝"}">${escapeHtml(user.name)}${user.rdpMember ? " ·可远程" : ""}</span>
+  `).join("");
+}
+
+async function loadWinServerFixes() {
+  if (winSrvFixes.length) {
+    renderWinServerFixes();
+    return;
+  }
+  try {
+    winSrvFixes = (await invoke("winSrvFixes")) || [];
+  } catch (_error) {
+    winSrvFixes = [];
+  }
+  renderWinServerFixes();
+}
+
+async function refreshWinServerUsers() {
+  if (!winSrvSelected) {
+    showToast("error", "先选一台服务器");
+    return;
+  }
+  const box = byId("winserver-user-list");
+  if (box) box.innerHTML = `<div class="winserver-item-reason">正在读取远端用户…</div>`;
+  try {
+    winSrvUsers = await invoke("winSrvUsers", winSrvSelected);
+    renderWinServerUsers();
+  } catch (error) {
+    if (box) {
+      box.innerHTML = `<div class="winserver-item-reason">读取失败：${escapeHtml(error.message || error)}</div>`;
+    }
+  }
+}
+
+function updateWinSrvApplyButton() {
+  const button = byId("winserver-apply-selected");
+  if (!button) return;
+  const count = document.querySelectorAll("#winserver-fixes input[type=checkbox]:checked").length;
+  button.disabled = !count || !winSrvSelected;
+  button.textContent = count ? `在远端执行 ${count} 项` : "在远端执行";
+}
+
+async function applyWinServerFixes() {
+  if (!winSrvSelected) {
+    showToast("error", "先选一台服务器");
+    return;
+  }
+  const ids = [...document.querySelectorAll("#winserver-fixes input[type=checkbox]:checked")]
+    .map((input) => input.value);
+  if (!ids.length) {
+    showToast("error", "先勾选要执行的修复项");
+    return;
+  }
+  const chunks = [];
+  for (const id of ids) {
+    try {
+      const result = await invoke("winSrvRunFix", winSrvSelected, id);
+      chunks.push(`### ${id}\n${result?.detail || "已执行"}`);
+    } catch (error) {
+      chunks.push(`### ${id} —— 失败\n${error.message || error}`);
+    }
+  }
+  const body = byId("winserver-detail-body");
+  if (body) body.textContent = chunks.join("\n\n");
+  const panel = byId("winserver-detail");
+  if (panel) {
+    panel.hidden = false;
+    panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+  // 执行完重采一次，让达标状态立刻更新
+  await refreshWinServerMonitor();
+}
+
+async function createWinServerUser() {
+  if (!winSrvSelected) {
+    showToast("error", "先选一台服务器");
+    return;
+  }
+  const name = byId("winserver-username").value.trim();
+  const password = byId("winserver-password").value;
+  const admin = byId("winserver-admin").checked;
+  if (!name) {
+    showToast("error", "先填用户名");
+    return;
+  }
+  try {
+    const result = await invoke("winSrvCreateUser", winSrvSelected, name, password, admin);
+    const body = byId("winserver-command-body");
+    if (body) body.textContent = result.detail;
+    const panel = byId("winserver-command");
+    if (panel) panel.hidden = false;
+    byId("winserver-password").value = "";
+    await refreshWinServerUsers();
+  } catch (error) {
+    showToast("error", error.message || "创建失败");
+  }
+}
+
+async function copyWinServerCommand() {
+  const text = byId("winserver-command-body").textContent;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      // WebView2 在非安全上下文里可能不给 clipboard API，退回老办法
+      const area = document.createElement("textarea");
+      area.value = text;
+      document.body.append(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }
+    showToast("success", "已复制");
+  } catch (_error) {
+    showToast("error", "复制失败，请手动选中复制");
+  }
+}
+
+async function openWinServerRdpForSelected() {
+  if (!winSrvSelected) {
+    showToast("error", "先选一台服务器");
+    return;
+  }
+  const server = winServers().find((item) => item.profileId === winSrvSelected);
+  if (!server) return;
+  invoke("winServerOpenRdp", server.host);
+}
+
+/** 添加 / 编辑 Windows 服务器。字段比 Linux 少 —— 不需要代理端口。 */
+function openWinServerDialog(server = null) {
+  const authMethod = server?.authMethod || "password";
+  const hasSavedCredential = Boolean(server?.hasCredential);
+  openModal(server ? "编辑 Windows 服务器" : "添加 Windows 服务器", `
+    <div class="form-grid ssh-form-grid">
+      <label class="wide-field"><span>名称</span><input id="modal-winsrv-name" value="${escapeHtml(server?.name || "我的 Windows 服务器")}" required></label>
+      <label><span>服务器 IP / 域名</span><input id="modal-winsrv-host" value="${escapeHtml(server?.host || "")}" placeholder="例如 192.168.1.10" required></label>
+      <label><span>SSH 端口</span><input id="modal-winsrv-port" type="number" min="1" max="65535" value="${server?.port || 22}" required></label>
+      <label><span>用户名</span><input id="modal-winsrv-username" value="${escapeHtml(server?.username || "Administrator")}" required></label>
+      <label><span>认证方式</span><select id="modal-winsrv-auth"><option value="password"${authMethod === "password" ? " selected" : ""}>账号密码</option><option value="key"${authMethod === "key" ? " selected" : ""}>私钥文件</option><option value="agent"${authMethod === "agent" ? " selected" : ""}>SSH Agent</option></select></label>
+      <label id="modal-winsrv-secret-field"><span>密码 / 私钥口令</span><input id="modal-winsrv-password" type="password" autocomplete="new-password" placeholder="${server?.hasCredential ? "已安全保存，留空保持不变" : "连接凭据"}"></label>
+      <label id="modal-winsrv-key-field" class="wide-field"><span>私钥路径</span><div class="input-action"><input id="modal-winsrv-key-path" value="${escapeHtml(server?.keyPath || "")}" placeholder="选择 OpenSSH 私钥"><button id="modal-pick-winsrv-key" type="button" class="icon-button" title="选择私钥" aria-label="选择私钥">${icon("folder-open")}</button></div></label>
+      <label class="switch-row wide-field"><span><strong>记住凭据</strong><small>${hasSavedCredential ? "已保存密码；留空即保持不变" : "Windows 下使用当前用户 DPAPI 加密"}</small></span><input id="modal-winsrv-remember" type="checkbox"${hasSavedCredential ? " checked" : ""}><i></i></label>
+      <div class="group-dialog-summary wide-field"><strong>怎么连</strong><span>通过 SSH（OpenSSH）连到目标机执行命令。<strong>Windows Server 2019 及以后内置 OpenSSH 服务器</strong>，在「设置 → 应用 → 可选功能」里装上即可；工作组机器也能用，不需要配证书。</span></div>
+    </div>`, [
+    { label: "取消", kind: "secondary", action: closeModal },
+    { label: "保存", kind: "primary", action: () => {
+      const payload = {
+        profileId: server?.profileId || "",
+        name: byId("modal-winsrv-name").value,
+        region: "",
+        host: byId("modal-winsrv-host").value,
+        port: Number(byId("modal-winsrv-port").value),
+        username: byId("modal-winsrv-username").value,
+        proxyPort: 0,
+        authMethod: byId("modal-winsrv-auth").value,
+        keyPath: byId("modal-winsrv-key-path").value,
+        rememberPassword: byId("modal-winsrv-remember").checked,
+        kind: "windows",
+      };
+      invoke("saveSshServer", JSON.stringify(payload), byId("modal-winsrv-password").value);
+      closeModal();
+    } },
+  ]);
+  const updateAuthFields = () => {
+    const method = byId("modal-winsrv-auth").value;
+    byId("modal-winsrv-key-field").classList.toggle("is-hidden", method !== "key");
+    byId("modal-winsrv-secret-field").classList.toggle("is-hidden", method === "agent");
+    byId("modal-winsrv-remember").disabled = method === "agent";
+  };
+  byId("modal-winsrv-auth").addEventListener("change", updateAuthFields);
+  byId("modal-winsrv-password").addEventListener("input", (event) => {
+    if (event.target.value) byId("modal-winsrv-remember").checked = true;
+  });
+  byId("modal-pick-winsrv-key").addEventListener("click", async () => {
+    const path = await invoke("pickSshKey");
+    if (path) byId("modal-winsrv-key-path").value = path;
+  });
+  updateAuthFields();
 }
 
 function closeCustomSelects(except = null) {
@@ -2183,7 +2603,7 @@ function bindEvents() {
   byId("add-ssh-server").addEventListener("click", () => openSshServerDialog());
   byId("ssh-select-all").addEventListener("change", (event) => {
     sshSelection.clear();
-    if (event.target.checked) (appState.sshServers || []).forEach((server) => sshSelection.add(server.profileId));
+    if (event.target.checked) linuxServers().forEach((server) => sshSelection.add(server.profileId));
     renderSshSelectionOnly();
   });
   byId("ssh-server-body").addEventListener("change", (event) => {
@@ -2367,6 +2787,29 @@ function bindEvents() {
     }
     const open = event.target.closest("[data-env-open]");
     if (open) invoke("openEnvDownload", open.dataset.envOpen);
+  });
+
+  // 服务器管理页的标签切换
+  document.querySelectorAll("[data-server-tab]").forEach((button) => {
+    button.addEventListener("click", () => setServerTab(button.dataset.serverTab));
+  });
+
+  // Windows 服务器管理（远程，SSH）
+  byId("winserver-add").addEventListener("click", () => openWinServerDialog());
+  byId("winserver-connect").addEventListener("click", () => openWinServerRdpForSelected());
+  byId("winserver-refresh-all").addEventListener("click", () => refreshWinServerMonitor());
+  byId("winserver-list").addEventListener("click", (event) => {
+    const pick = event.target.closest("[data-winsrv-pick]");
+    if (pick) selectWinServer(pick.dataset.winsrvPick);
+  });
+  byId("winserver-fixes").addEventListener("change", updateWinSrvApplyButton);
+  byId("winserver-apply-selected").addEventListener("click", () => applyWinServerFixes());
+  byId("winserver-detail-close").addEventListener("click", () => { byId("winserver-detail").hidden = true; });
+  byId("winserver-create-user").addEventListener("click", () => createWinServerUser());
+  byId("winserver-copy-command").addEventListener("click", () => copyWinServerCommand());
+  byId("winserver-refresh-users").addEventListener("click", () => refreshWinServerUsers());
+  byId("winserver-monitor").addEventListener("click", (event) => {
+    if (event.target.closest("#winserver-refresh-monitor")) refreshWinServerMonitor();
   });
   byId("modal-close").addEventListener("click", closeModal);
   byId("app-modal").addEventListener("click", (event) => {

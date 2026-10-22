@@ -1066,6 +1066,355 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
 }
 
 /* ------------------------------------------------------------------
+   服务器管理页 · 标签与 Windows 侧
+   ------------------------------------------------------------------ */
+
+/* 标签面板：同一页里 Linux / Windows 两套东西，用标签分开 */
+.server-tab-panel { display: none; }
+.server-tab-panel.is-active { display: block; }
+
+/* Windows 侧：左边服务器列表，右边内容。两栏比一长条好读 ——
+   服务器可能有好几台，混在内容流里会找不到现在看的是哪台。 */
+.winserver-layout {
+  display: grid;
+  grid-template-columns: 250px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+.winserver-side {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 12px;
+  position: sticky;
+  top: 12px;
+}
+.winserver-main { min-width: 0; }
+
+.winserver-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.winserver-srv {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+  padding: 9px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  transition: border-color 140ms, background-color 140ms;
+}
+.winserver-srv:hover { border-color: var(--blue); }
+.winserver-srv.is-active {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+.winserver-srv-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.winserver-srv.is-active .winserver-srv-name { color: var(--blue-text); }
+.winserver-srv-host {
+  font: 11px/1.5 Consolas, monospace;
+  color: var(--text-2);
+}
+.winserver-srv-user { font-size: 11px; color: var(--text-3); }
+
+/* 监控区 */
+.winserver-monitor {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+.winserver-monitor-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.winserver-monitor-host { font-size: 15px; font-weight: 600; color: var(--text); }
+.winserver-monitor-os { font-size: 12px; color: var(--text-3); margin-top: 3px; line-height: 1.6; }
+
+.winserver-gauges {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 14px;
+  margin-bottom: 16px;
+}
+.winserver-gauge-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-2);
+  margin-bottom: 6px;
+}
+.winserver-gauge-head strong {
+  font-size: 15px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.winserver-gauge-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--surface-sunken);
+  overflow: hidden;
+}
+.winserver-gauge-track span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--blue);
+  transition: width 260ms ease;
+}
+.winserver-gauge-foot {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 电源/RDP 达标清单 */
+.winserver-power-list {
+  border-top: 1px solid var(--line-hairline);
+  padding-top: 12px;
+}
+.winserver-power-list .env-versions-title { margin-bottom: 8px; }
+
+.winserver-fix-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
+}
+
+/* 远端用户 */
+.winserver-users { margin-top: 16px; }
+.winserver-user-list { display: flex; flex-wrap: wrap; gap: 7px; }
+.winserver-user-chip {
+  font: 12px/1.5 Consolas, monospace;
+  padding: 4px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+  color: var(--text-2);
+}
+.winserver-user-chip.is-rdp { border-color: var(--green); color: var(--green-text); background: var(--green-soft); }
+
+/* 子用户表单 */
+.winserver-user-form {
+  display: grid;
+  /* 三个格子固定比例：用户名、密码、复选框。auto-fit 会让复选框独占一行，
+     看着像表单被拆散了。 */
+  grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) auto auto;
+  gap: 12px;
+  align-items: end;
+}
+.winserver-user-form label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--text-2); }
+.winserver-user-form input[type="text"],
+.winserver-user-form input[type="password"] {
+  font: 13px/1.5 inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  padding: 7px 10px;
+}
+.winserver-user-form input:focus { outline: 2px solid var(--focus-border); outline-offset: 1px; }
+.winserver-checkbox { flex-direction: row !important; align-items: center; gap: 7px !important; padding-bottom: 8px; }
+.winserver-form-actions { display: flex; gap: 8px; align-items: center; padding-bottom: 2px; }
+
+/* 执行结果 / 输出 */
+.winserver-command {
+  margin-top: 14px;
+  border: 1px solid var(--blue);
+  border-radius: 10px;
+  background: var(--blue-soft);
+  padding: 13px 15px;
+}
+.winserver-command-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--blue-text);
+  margin-bottom: 9px;
+}
+.winserver-command-head strong { font-weight: 600; }
+.winserver-command-head .text-button { margin-left: auto; }
+.winserver-command-body {
+  font: 12px/1.7 Consolas, monospace;
+  background: var(--surface-inset);
+  color: var(--surface-inset-text);
+  padding: 11px 13px;
+  border-radius: 7px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+}
+
+.winserver-detail {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+.winserver-detail-close { margin-left: auto; align-self: center; }
+
+/* 服务器项 / 修复项 / 状态点 —— 之前给本机侧写的，Windows 远程侧复用 */
+.winserver-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 11px 15px;
+  border-bottom: 1px solid var(--line-hairline);
+}
+.winserver-item:last-child { border-bottom: 0; }
+.winserver-item-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-top: 6px;
+}
+.winserver-item.is-ok .winserver-item-dot { background: var(--green); }
+.winserver-item.is-bad .winserver-item-dot { background: var(--orange); }
+.winserver-item-main { flex: 1 1 auto; min-width: 0; }
+.winserver-item-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.winserver-item-value {
+  font: 12px/1.5 Consolas, monospace;
+  color: var(--text-2);
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--surface-2);
+}
+.winserver-item.is-ok .winserver-item-value { color: var(--green-text); background: var(--green-soft); }
+.winserver-item.is-bad .winserver-item-value { color: var(--orange-text); background: var(--orange-soft); }
+.winserver-item-reason { font-size: 12px; color: var(--text-3); line-height: 1.6; margin-top: 4px; }
+.winserver-item-tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--blue-soft);
+  color: var(--blue-text);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.winserver-fixes {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  overflow: hidden;
+}
+/* 用 grid 而不是 flex 做「勾选框 + 内容」两列。
+   flex 在这里踩过一个很深的坑：内容区 `flex: 1 1 auto` 时 Chromium 算出
+   **0 宽度**（basis 取内容宽度、内容宽度本身又是 0），文字竖排、每字一行，
+   整个 item 高达 1700+ px，画面上看着像空白 —— 光看代码完全正常，
+   只有真跑起来量尺寸才发现。
+
+   grid 的 `1fr` 列直接按容器宽分配，没有这个歧义。
+   实测：改成 grid 后内容区 758×101，正常。 */
+.winserver-fix {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  padding: 13px 15px;
+  border-bottom: 1px solid var(--line-hairline);
+  cursor: pointer;
+}
+.winserver-fix:last-child { border-bottom: 0; }
+.winserver-fix:hover { background: var(--surface-2); }
+.winserver-fix input[type="checkbox"] { margin-top: 2px; }
+/* 这一条踩了很深的坑，记下来免得以后再踩：
+   父级 .winserver-fix 是 display:flex + align-items:flex-start，
+   内容区这里如果只写 `flex: 1 1 auto`，Chromium 会给它算出 **0 宽度** ——
+   basis 取内容宽度，而内容宽度本身是 0（子元素都没定宽），于是宽度塌成 0，
+   文字竖排、每字一行，整个 item 高得离谱（实测 1700+ px），画面上像是空白。
+
+   解法是 flex 填充的经典写法：`width: 0` + `flex: 1 1 0`。
+   width:0 让 flex-basis 从 0 起步（而不是去量内容），
+   flex-grow:1 再把它撑满剩余空间。实测有效。
+
+   对照实验：把父级改成 display:block 也能正常（758×101），
+   但那样 checkbox 就跟内容不并排了，所以还是用 flex + 这个写法。 */
+.winserver-fix-main { min-width: 0; }
+/* 这条 title 现在是 <label>，里面的 span 会命中全局的
+   `label > span { display: block; margin-bottom: 7px }` —— 徽章会被拉成
+   整行宽的一条蓝线。显式改回 inline-block 把它收回徽章的形状。 */
+.winserver-fix-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.winserver-fix-title > span { display: inline-block; margin-bottom: 0; }
+.winserver-fix-reason { font-size: 12px; color: var(--text-3); line-height: 1.6; margin-top: 4px; }
+.winserver-fix-command {
+  font: 11px/1.6 Consolas, monospace;
+  background: var(--surface-inset);
+  color: var(--surface-inset-text);
+  padding: 7px 10px;
+  border-radius: 6px;
+  margin-top: 8px;
+  /* 命令很长，pre 不换行会把 flex 容器撑爆 —— 父级 min-width:0 也救不回来，
+     那样整个 .winserver-fix-main 会被压成 0 宽（内容看不见）。
+     改成 pre-wrap：长命令折行显示，宽度始终受控。 */
+  white-space: pre-wrap;
+  word-break: break-all;
+  min-width: 0;
+}
+
+.winserver-summary { font-size: 13px; color: var(--text-2); margin-right: auto; }
+.winserver-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 14px;
+  margin-bottom: 16px;
+  border: 1px solid var(--amber-line);
+  background: var(--amber-soft);
+  border-radius: 10px;
+  color: var(--amber-text);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.winserver-banner .icon { flex: 0 0 auto; margin-top: 2px; }
+
+.winserver-connect { display: flex; gap: 9px; align-items: center; flex-wrap: wrap; }
+
+@media (max-width: 860px) {
+  .winserver-layout { grid-template-columns: 1fr; }
+  .winserver-side { position: static; }
+}
+
+@media (max-width: 860px) {
+  .winserver-user-form { grid-template-columns: 1fr 1fr; }
+  .winserver-form-actions { grid-column: 1 / -1; }
+}
+@media (max-width: 640px) {
+  .winserver-user-form { grid-template-columns: 1fr; }
+  .winserver-checkbox { padding-bottom: 0; }
+  .winserver-form-actions { flex-wrap: wrap; }
+}
+
+/* ------------------------------------------------------------------
    环境管理页（开发环境体检 + 一键部署）
    卡片按「就绪 / 缺失」两态着色，缺失的那几张在页面里最显眼 ——
    用户进这个页面就是为了看缺什么。

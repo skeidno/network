@@ -1454,6 +1454,87 @@ pub async fn dispatch(
             crate::envmgr::open_download(&id)?;
             Ok(json!(true))
         }
+
+        // ---- Windows 服务器远程管理（通过 SSH 执行 PowerShell）----
+        // 与 Linux 侧共用同一套 SSH 客户端与凭据存储：Windows Server 2019+
+        // 内置 OpenSSH 服务端，讲标准协议，客户端不用改。
+        // 探活 + 确认远端确实是 Windows
+        "winSrvProbeOs" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let (caption, version) =
+                crate::winsrv::probe_os(&profile, &credential).await?;
+            Ok(json!({ "os": caption, "version": version }))
+        }
+        "winSrvMetrics" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let metrics = crate::winsrv::collect_metrics(&profile, &credential).await?;
+            Ok(metrics)
+        }
+        "winSrvPowerSettings" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            Ok(crate::winsrv::collect_power_settings(&profile, &credential).await?)
+        }
+        "winSrvRunFix" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let fix_id = text(&args, 1).to_string();
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let detail = crate::winsrv::apply_remote_fix(&profile, &credential, &fix_id).await?;
+            state.notify("success", detail.lines().next().unwrap_or("已执行").to_string());
+            Ok(json!({ "detail": detail }))
+        }
+        "winSrvUsers" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            Ok(crate::winsrv::list_remote_users(&profile, &credential).await?)
+        }
+        "winSrvCreateUser" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let name = text(&args, 1).to_string();
+            let password = text(&args, 2).to_string();
+            let admin = matches!(args.get(3), Some(Value::Bool(true)));
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let detail =
+                crate::winsrv::create_remote_user(&profile, &credential, &name, &password, admin).await?;
+            state.notify("success", format!("远程用户 {name} 已处理"));
+            Ok(json!({ "detail": detail }))
+        }
+        // 远程修复项的静态清单
+        "winSrvFixes" => Ok(json!(
+            crate::winsrv::remote_fixes()
+                .iter()
+                .map(|fix| {
+                    json!({
+                        "id": fix.id,
+                        "title": fix.title,
+                        "reason": fix.reason,
+                        "script": fix.script,
+                        "needAdmin": fix.need_admin,
+                    })
+                })
+                .collect::<Vec<Value>>()
+        )),
+        // 建用户只生成命令不直接执行：动账户系统不可轻易撤销，交给用户决定何时跑
+        // 打开远程桌面并预填服务器地址。用 mstsc 而不是自己实现 RDP 协议 ——
+        // 客户端已经处理了凭据缓存、NLA、剪贴板这些细节，重造没有意义。
+        "winServerOpenRdp" => {
+            let host = text(&args, 0).trim().to_string();
+            if host.is_empty() {
+                return Err("请先填写服务器地址".into());
+            }
+            // 只放行 IPv4 / 主机名形态。mstsc 接受 IP 或域名，
+            // 但这里拦住明显的垃圾输入，免得生成一个打不开的 .rdp
+            let looks_valid = host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':');
+            if !looks_valid || host.len() > 255 {
+                return Err(format!("「{host}」不像是 IP 或域名"));
+            }
+            crate::winsrv::open_rdp(&host)?;
+            Ok(json!(true))
+        }
         "saveSources" => {
             let patch = payload(&args, 0)?;
             for (key, slot) in [("clash", "Clash 7897"), ("v2ray", "v2ray 10808")] {
@@ -2115,6 +2196,24 @@ pub async fn dispatch(
         }
         other => Err(format!("不支持的操作：{other}")),
     }
+}
+
+/// 找出一个 Windows 服务器档案并校验它是 Windows 类型。
+fn win_srv_profile(
+    state: &AppState,
+    profile_id: &str,
+) -> Result<crate::models::SshServerProfile, String> {
+    let profile = state
+        .config
+        .ssh_servers
+        .iter()
+        .find(|profile| profile.profile_id == profile_id)
+        .cloned()
+        .ok_or_else(|| "找不到这台服务器".to_string())?;
+    if profile.kind != "windows" {
+        return Err("这台服务器不是 Windows 类型".into());
+    }
+    Ok(profile)
 }
 
 /// 安装 / 重装环境条目的公共处理：置 busy、跑命令、立刻重扫、把首行结果弹成 toast。
