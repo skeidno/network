@@ -165,7 +165,7 @@ impl Default for DeployResult {
 /// Backed by the in-process SSH-2 client in `sshclient`, so password
 /// authentication never depends on `SSH_ASKPASS` (which the Windows OpenSSH
 /// build cannot always spawn).
-struct Runner {
+pub struct Runner {
     host: String,
     port: u16,
     user: String,
@@ -175,7 +175,7 @@ struct Runner {
 }
 
 impl Runner {
-    fn new(profile: &SshServerProfile, credential: &str) -> Result<Self, String> {
+    pub fn new(profile: &SshServerProfile, credential: &str) -> Result<Self, String> {
         if profile.host.trim().is_empty() {
             return Err("SSH 服务器地址为空".to_string());
         }
@@ -196,7 +196,7 @@ impl Runner {
         })
     }
 
-    async fn connected(&mut self) -> Result<&mut crate::sshclient::Client, String> {
+    pub async fn connected(&mut self) -> Result<&mut crate::sshclient::Client, String> {
         if self.client.is_none() {
             let client = crate::sshclient::Client::connect(
                 &self.host,
@@ -212,7 +212,7 @@ impl Runner {
         Ok(self.client.as_mut().expect("刚刚建立的连接"))
     }
 
-    async fn run(&mut self, remote: &str, timeout: u64) -> Result<String, String> {
+    pub async fn run(&mut self, remote: &str, timeout: u64) -> Result<String, String> {
         let client = self.connected().await?;
         let result = client.exec(remote, &[]).await?;
         if result.status != 0 {
@@ -261,7 +261,7 @@ impl Runner {
         crate::sshclient::purge_host_key(&self.known_hosts, &self.host, self.port);
     }
 
-    async fn shutdown(&mut self) {
+    pub async fn shutdown(&mut self) {
         if let Some(client) = self.client.as_mut() {
             client.close().await;
         }

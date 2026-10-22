@@ -2025,6 +2025,24 @@ pub async fn dispatch(
     }
 }
 
+/// 找出一个 Windows 服务器档案并校验它是 Windows 类型。
+fn win_srv_profile(
+    state: &AppState,
+    profile_id: &str,
+) -> Result<crate::models::SshServerProfile, String> {
+    let profile = state
+        .config
+        .ssh_servers
+        .iter()
+        .find(|profile| profile.profile_id == profile_id)
+        .cloned()
+        .ok_or_else(|| "找不到这台服务器".to_string())?;
+    if profile.kind != "windows" {
+        return Err("这台服务器不是 Windows 类型".into());
+    }
+    Ok(profile)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -387,6 +387,8 @@ pub fn build(state: &mut AppState) -> Value {
                 "host": profile.host,
                 "port": profile.port,
                 "username": profile.username,
+                // linux 走代理部署，windows 走 RDP 会话治理 —— 前端据此分标签
+                "kind": profile.kind,
                 "deployment": {
                     "status": task.map(|item| item.status.clone()).unwrap_or_else(|| "idle".into()),
                     "stage": task.map(|item| item.stage.clone()).unwrap_or_default(),

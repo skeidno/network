@@ -200,6 +200,11 @@ pub struct SshServerProfile {
     pub region: String,
     pub proxy_reachable: Option<bool>,
     pub proxy_reachability_error: String,
+    /// 服务器类型：`linux`（走代理部署）或 `windows`（走 RDP 会话治理）。
+    ///
+    /// Windows Server 2019+ 内置 OpenSSH 服务端，标准 SSH 协议，
+    /// 所以两种服务器能用同一套客户端与凭据存储 —— 区别只在管理动作。
+    pub kind: String,
 }
 
 impl Default for SshServerProfile {
@@ -222,6 +227,8 @@ impl Default for SshServerProfile {
             region: String::new(),
             proxy_reachable: None,
             proxy_reachability_error: String::new(),
+            // 默认按 Linux 处理：老配置里没有这个字段，行为保持不变
+            kind: "linux".into(),
         }
     }
 }

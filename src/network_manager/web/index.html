@@ -61,8 +61,8 @@
         <button class="nav-item" data-page="nodes" title="代理与节点">
           <span class="icon" style="--icon:url('./icons/server.svg')"></span><span>代理与节点</span>
         </button>
-        <button id="server-deployment-nav" class="nav-item" data-page="servers" title="服务器部署">
-          <span class="icon" style="--icon:url('./icons/database.svg')"></span><span>服务器部署</span>
+        <button id="server-deployment-nav" class="nav-item" data-page="servers" title="服务器管理">
+          <span class="icon" style="--icon:url('./icons/server.svg')"></span><span>服务器管理</span>
         </button>
         <button class="nav-item" data-page="settings" title="设置">
           <span class="icon" style="--icon:url('./icons/settings.svg')"></span><span>设置</span>
@@ -267,6 +267,12 @@
         </section>
 
         <section id="page-servers" class="page">
+          <div class="tab-bar" role="tablist">
+            <button class="tab is-active" data-server-tab="linux" role="tab"><span class="icon" style="--icon:url('./icons/server.svg')"></span><span>Linux 服务器</span></button>
+            <button class="tab" data-server-tab="windows" role="tab"><span class="icon" style="--icon:url('./icons/monitor.svg')"></span><span>Windows 服务器</span></button>
+          </div>
+
+          <div id="server-tab-linux" class="server-tab-panel is-active">
           <section class="panel ssh-status-panel">
             <div class="panel-heading compact">
               <div class="heading-icon"><span class="icon" style="--icon:url('./icons/database.svg')"></span></div>
@@ -295,6 +301,77 @@
             </table>
             <div id="ssh-servers-empty" class="empty-state has-icon is-hidden" style="--icon:url('./icons/database.svg')">暂无服务器，添加 SSH 登录信息后即可自动部署</div>
           </section>
+          </div>
+
+          <div id="server-tab-windows" class="server-tab-panel">
+          <div class="page-toolbar">
+            <button id="winserver-add" type="button" class="button primary"><span class="icon" style="--icon:url('./icons/circle-plus.svg')"></span><span>添加 Windows 服务器</span></button>
+            <button id="winserver-connect" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/monitor.svg')"></span><span>打开远程桌面</span></button>
+            <button id="winserver-refresh-all" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span><span>刷新状态</span></button>
+          </div>
+
+          <div class="winserver-layout">
+            <aside class="winserver-side">
+              <div class="env-versions-title"><span class="icon" style="--icon:url('./icons/server.svg')"></span><span>服务器</span></div>
+              <div id="winserver-list" class="winserver-list"></div>
+            </aside>
+
+            <div class="winserver-main">
+              <div id="winserver-monitor" class="winserver-monitor">
+                <div class="winserver-item-reason">先在左侧选一台服务器</div>
+              </div>
+
+              <div class="winserver-section">
+                <div class="panel-heading">
+                  <div class="heading-icon"><span class="icon" style="--icon:url('./icons/power.svg')"></span></div>
+                  <div><h2>可执行的修复</h2><p>在远端执行，命令与输出原样展示</p></div>
+                </div>
+                <div class="winserver-fix-actions">
+                  <button id="winserver-apply-selected" type="button" class="button primary" disabled><span class="icon" style="--icon:url('./icons/check.svg')"></span><span>在远端执行</span></button>
+                </div>
+                <div id="winserver-fixes" class="winserver-fixes"></div>
+                <p class="settings-note">这些命令<strong>在目标服务器上执行</strong>，不是在本机。改电源计划、注册表都需要管理员权限 —— 远端用普通账号登录时命令会失败，输出里会写明原因。<strong>「允许同一用户多个远程会话」改完要重启远程桌面服务</strong>才生效（会断掉当前所有 RDP 连接）。</p>
+              </div>
+
+              <div class="winserver-section">
+                <div class="panel-heading">
+                  <div class="heading-icon"><span class="icon" style="--icon:url('./icons/server.svg')"></span></div>
+                  <div><h2>远端用户</h2><p>多会话并存的关键</p></div>
+                </div>
+                <p class="settings-note">系统默认 <code>fSingleSessionPerUser=1</code>，意思是<strong>同一个用户名只允许一个远程会话</strong> —— 用 Administrator 连过一次，再用同名账号连就会把上一次踢掉。这也是为什么「加一个子用户」能让内网连接正常工作：不同用户名 = 不同会话，可以并存。</p>
+                <div class="winserver-user-form">
+                  <label><span>用户名</span><input id="winserver-username" type="text" placeholder="rdpuser" spellcheck="false"></label>
+                  <label><span>密码</span><input id="winserver-password" type="password" placeholder="至少 8 位，别用弱口令"></label>
+                  <label class="winserver-checkbox"><input id="winserver-admin" type="checkbox"><span>加入管理员组</span></label>
+                  <div class="winserver-form-actions">
+                    <button id="winserver-create-user" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/circle-plus.svg')"></span><span>在远端创建</span></button>
+                    <button id="winserver-refresh-users" type="button" class="text-button">刷新用户列表</button>
+                  </div>
+                </div>
+                <div id="winserver-command" class="winserver-command" hidden>
+                  <div class="winserver-command-head">
+                    <strong>执行结果</strong>
+                    <button id="winserver-copy-command" type="button" class="text-button">复制</button>
+                  </div>
+                  <pre id="winserver-command-body" class="winserver-command-body"></pre>
+                </div>
+                <div class="winserver-users">
+                  <div class="env-versions-title"><span class="icon" style="--icon:url('./icons/list-filter.svg')"></span><span>远端用户</span></div>
+                  <div id="winserver-user-list" class="winserver-user-list"></div>
+                </div>
+              </div>
+
+              <div id="winserver-detail" class="winserver-detail" hidden>
+                <div class="panel-heading">
+                  <div class="heading-icon"><span class="icon" style="--icon:url('./icons/file-text.svg')"></span></div>
+                  <div><h2>执行输出</h2><p>下面是每条命令在远端的原始输出</p></div>
+                  <button id="winserver-detail-close" type="button" class="text-button winserver-detail-close">关闭</button>
+                </div>
+                <pre id="winserver-detail-body" class="winserver-output-body"></pre>
+              </div>
+            </div>
+          </div>
+          </div>
         </section>
 
         <section id="page-settings" class="page">
