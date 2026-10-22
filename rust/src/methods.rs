@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -1591,6 +1592,120 @@ pub async fn dispatch(
             crate::winsrv::open_rdp(&host)?;
             Ok(json!(true))
         }
+
+        // ---- 文件快传与同步 ----
+        // 走的是那条已有的 SSH exec 通道（逐文件 + 分块 base64），不是 SFTP ——
+        // 手写的 SSH 客户端只实现了 exec，再实现一套 SSH_FXP 协议的收益远小于成本。
+        // 详见 rust/src/filetransfer.rs 顶部的说明。
+        "fileTransferPickLocal" => {
+            let want_directory = matches!(args.first(), Some(Value::Bool(true)));
+            let picked = tokio::task::spawn_blocking(move || {
+                crate::gui::pick_local_path_blocking(want_directory)
+            })
+            .await
+            .unwrap_or(None);
+            Ok(picked.map(Value::String).unwrap_or(Value::Null))
+        }
+        "fileTransferBrowse" => {
+            let profile = srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            Ok(crate::filetransfer::browse_remote(
+                &profile,
+                &credential,
+                &text(&args, 1),
+            )
+            .await?)
+        }
+        "fileTransferUpload" => {
+            let profile = srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let local = PathBuf::from(text(&args, 1).trim());
+            let remote = text(&args, 2).trim().to_string();
+            let incremental = matches!(args.get(3), Some(Value::Bool(true)));
+            let mirror = matches!(args.get(4), Some(Value::Bool(true)));
+            let stats = crate::filetransfer::upload(&profile, &credential, &local, &remote, incremental, mirror)
+                .await?;
+            state.notify("success", filetransfer_summary("已上传到远端", &stats));
+            Ok(stats.to_json())
+        }
+        "fileTransferDownload" => {
+            let profile = srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let remote = text(&args, 1).trim().to_string();
+            let local = PathBuf::from(text(&args, 2).trim());
+            let incremental = matches!(args.get(3), Some(Value::Bool(true)));
+            let mirror = matches!(args.get(4), Some(Value::Bool(true)));
+            let stats = crate::filetransfer::download(
+                &profile,
+                &credential,
+                &remote,
+                &local,
+                incremental,
+                mirror,
+            )
+            .await?;
+            state.notify("success", filetransfer_summary("已下载到本机", &stats));
+            Ok(stats.to_json())
+        }
+        // 服务器之间互传：源 → 本机暂存 → 目标。
+        // 不让两台机器直连 —— 那要求源机能主动连上目标机，现实里大多不成立。
+        "fileTransferMove" => {
+            let source = srv_profile(state, &text(&args, 0))?;
+            let target = srv_profile(state, &text(&args, 1))?;
+            if source.profile_id == target.profile_id {
+                return Err("源服务器与目标服务器是同一台".into());
+            }
+            let source_credential = crate::credentials::get(&source.profile_id).unwrap_or_default();
+            let target_credential = crate::credentials::get(&target.profile_id).unwrap_or_default();
+            let remote = text(&args, 2).trim().to_string();
+            let mirror = matches!(args.get(3), Some(Value::Bool(true)));
+            let stats = crate::filetransfer::move_between(
+                &source,
+                &source_credential,
+                &target,
+                &target_credential,
+                &remote,
+                mirror,
+            )
+            .await?;
+            state.notify("success", filetransfer_summary("已在两台服务器间同步", &stats));
+            Ok(stats.to_json())
+        }
+        // 批量推到多台：一次开太多条 SSH 连接会打满本机 fd，也容易被远端 sshd 的
+        // MaxSessions 挡掉，所以后端按 4 台一批排队（filetransfer::push_to_many 内部处理）。
+        "fileTransferPushMany" => {
+            let ids = args
+                .first()
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let local = PathBuf::from(text(&args, 1).trim());
+            let remote = text(&args, 2).trim().to_string();
+            let incremental = matches!(args.get(3), Some(Value::Bool(true)));
+            let mirror = matches!(args.get(4), Some(Value::Bool(true)));
+            if ids.is_empty() {
+                return Err("先选至少一台服务器".into());
+            }
+            let mut targets = Vec::new();
+            for id in ids {
+                let Some(id) = id.as_str() else { continue };
+                let profile = srv_profile(state, id)?;
+                let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+                targets.push((profile, credential));
+            }
+            let result =
+                crate::filetransfer::push_to_many(&targets, &local, &remote, incremental, mirror)
+                    .await?;
+            let succeeded = result.get("succeeded").and_then(|v| v.as_u64()).unwrap_or(0);
+            let failed = result.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+            if failed == 0 {
+                state.notify("success", format!("{succeeded} 台服务器已同步完毕"));
+            } else {
+                state.notify("error", format!("{succeeded} 台成功，{failed} 台失败"));
+            }
+            Ok(result)
+        }
+
         "saveSources" => {
             let patch = payload(&args, 0)?;
             for (key, slot) in [("clash", "Clash 7897"), ("v2ray", "v2ray 10808")] {
@@ -2252,6 +2367,39 @@ pub async fn dispatch(
         }
         other => Err(format!("不支持的操作：{other}")),
     }
+}
+
+/// 找出任意一个服务器档案（Linux、Windows 都要）—— 文件快传两侧都得用。
+///
+/// 与 `win_srv_profile` 分开：那个只认 Windows，是因为它后面执行的是 PowerShell。
+fn srv_profile(state: &AppState, profile_id: &str) -> Result<crate::models::SshServerProfile, String> {
+    state
+        .config
+        .ssh_servers
+        .iter()
+        .find(|profile| profile.profile_id == profile_id)
+        .cloned()
+        .ok_or_else(|| "找不到这台服务器".to_string())
+}
+
+/// 弹给用户的传输结果摘要。
+///
+/// 只写一句概览 —— 逐文件的明细已经在 `notes` 里，界面上自己铺开，
+/// 再塞进 toast 会让通知框比正文还长。
+fn filetransfer_summary(prefix: &str, stats: &crate::filetransfer::TransferStats) -> String {
+    let mut summary = format!(
+        "{}：{} 个文件，{}",
+        prefix,
+        stats.files,
+        crate::filetransfer::human_bytes(stats.bytes)
+    );
+    if stats.skipped > 0 {
+        summary.push_str(&format!("，跳过 {}", stats.skipped));
+    }
+    if stats.removed > 0 {
+        summary.push_str(&format!("，删除 {}", stats.removed));
+    }
+    summary
 }
 
 /// 找出一个 Windows 服务器档案并校验它是 Windows 类型。

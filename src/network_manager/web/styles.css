@@ -1700,3 +1700,247 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
 }
+
+/* ------------------------------------------------------------------
+   服务器管理页 · 文件快传
+   ------------------------------------------------------------------ */
+
+/* 左边选机器，右边干活。与 Windows 侧同一个骨架 —— 两栏的左边都是"目标"，
+   用户不用重新学一遍布局。 */
+.xfer-layout {
+  display: grid;
+  grid-template-columns: 250px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+.xfer-side {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 12px;
+  position: sticky;
+  top: 12px;
+}
+.xfer-main { min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+
+.xfer-server-list { display: flex; flex-direction: column; gap: 6px; margin: 10px 0; }
+.xfer-server {
+  display: grid;
+  /* 勾选序号 / 名称与地址 / 系统标记。用 grid 而不是 flex：
+     flex 下 `minmax(0,1fr)` 那种收缩行为会算出 0 宽度，文字被挤成竖排。 */
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  transition: border-color 140ms, background-color 140ms;
+}
+.xfer-server:hover { border-color: var(--blue); }
+.xfer-server.is-picked { border-color: var(--blue); background: var(--blue-soft); }
+.xfer-server-box {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--blue-text);
+}
+.xfer-server.is-picked .xfer-server-box { border-color: var(--blue); background: var(--blue); color: #fff; }
+.xfer-server-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.xfer-server-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.xfer-server.is-picked .xfer-server-name { color: var(--blue-text); }
+.xfer-server-host {
+  font: 11px/1.5 Consolas, monospace;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.xfer-server-kind {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--text-3);
+}
+
+.xfer-section {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 14px 16px;
+}
+
+/* 三个方向按钮：等宽，选中态用主色，不靠 hover 提示 */
+.xfer-directions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+.xfer-direction {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line-2);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 13px;
+  transition: border-color 140ms, background-color 140ms, color 140ms;
+}
+.xfer-direction:hover { border-color: var(--blue); color: var(--text); }
+.xfer-direction.is-active {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+  color: var(--blue-text);
+  font-weight: 600;
+}
+
+.xfer-fields { display: flex; flex-direction: column; gap: 12px; margin-top: 10px; }
+.xfer-field { display: flex; flex-direction: column; gap: 6px; }
+.xfer-field-label { font-size: 12px; color: var(--text-2); }
+/* 输入框吃掉剩余宽度，两个按钮各自撑到内容宽度。grid 在这里是刻意的：
+   用 flex 时 `flex: 1 1 auto` 配上父级 align-items 会让 Chromium 算出 0 宽度。 */
+.xfer-input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+.xfer-input-row input {
+  font: 13px/1.5 Consolas, monospace;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  padding: 8px 10px;
+  min-width: 0;
+}
+.xfer-input-row input:focus { outline: 2px solid var(--focus-border); outline-offset: 1px; }
+.xfer-input-row input:disabled { background: var(--surface-3); color: var(--text-3); }
+
+.xfer-browse:empty { display: none; }
+.xfer-browse {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.xfer-browse-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  font: 11px/1.6 Consolas, monospace;
+  color: var(--text-2);
+}
+.xfer-browse-head span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.xfer-browse-list { max-height: 260px; overflow: auto; }
+.xfer-entry {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  padding: 6px 12px;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--line-hairline);
+  font-size: 12px;
+  color: var(--text-2);
+}
+.xfer-entry:last-child { border-bottom: 0; }
+.xfer-entry:hover { background: var(--blue-soft); color: var(--text); }
+.xfer-entry.is-dir .xfer-entry-name { color: var(--text); font-weight: 600; }
+.xfer-entry-icon { display: inline-flex; color: var(--text-3); }
+.xfer-entry-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.xfer-entry-meta { font: 11px Consolas, monospace; color: var(--text-3); }
+
+.xfer-options { display: flex; flex-direction: column; gap: 8px; }
+.xfer-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.xfer-check input {
+  margin-top: 2px;
+}
+/* 全局 `input, select, textarea { width: 100%; min-height: 38px; padding: 8px 10px }`
+   对复选框同样生效 —— 不收回来的话勾选框会被拉成 38px 高的一大块，
+   旁边的文字被挤到右边去。 */
+.xfer-check input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  min-height: 0;
+  padding: 0;
+  margin: 3px 0 0;
+  flex: 0 0 auto;
+  accent-color: var(--blue);
+}
+/* 全局 `label > span { display: block; margin-bottom: 7px }` 会把这里的文字
+   拉成整行 —— 它本来就在 flex 里，这里只是把外边距收回 */
+.xfer-check > span { display: inline !important; margin-bottom: 0 !important; }
+
+.xfer-actions { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
+
+/* 镜像的"第二次点击"要用危险色，避免和普通传输长得一样 */
+.button.is-danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+.button.is-danger:hover { background: var(--danger-text); border-color: var(--danger-text); }
+
+.xfer-result { margin-top: 10px; max-height: 320px; overflow: auto; }
+.xfer-stat-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.xfer-stat-head strong { font-size: 13px; color: var(--text); }
+.xfer-notes { display: flex; flex-direction: column; gap: 3px; }
+.xfer-note {
+  font: 11px/1.7 Consolas, "Microsoft YaHei UI", monospace;
+  color: var(--text-2);
+  word-break: break-all;
+}
+.xfer-note.is-ok { color: var(--green-text); }
+.xfer-note.is-bad { color: var(--danger-text); }
+.xfer-note strong { color: var(--text); font-weight: 600; }
+
+@media (max-width: 860px) {
+  .xfer-layout { grid-template-columns: 1fr; }
+  .xfer-side { position: static; }
+  .xfer-directions { grid-template-columns: 1fr; }
+  .xfer-input-row { grid-template-columns: minmax(0, 1fr); }
+}

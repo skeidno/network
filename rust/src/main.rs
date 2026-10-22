@@ -14,6 +14,8 @@ mod nvm;
 mod winsrv;
 // 远程截图：Windows 与 Linux 两种服务器（shot）
 mod shot;
+// 文件快传同步：基于 SSH exec 通道的分块 base64 传输（filetransfer）
+mod filetransfer;
 // RDP 断开后保持开机：软件层措施 + 硬件层指引（keepalive）
 mod keepalive;
 // 原生界面只在 Windows 上编（tao + wry）；Linux 的形态是常驻服务，用同名的

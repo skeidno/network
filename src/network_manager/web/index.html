@@ -273,6 +273,7 @@
           <div class="tab-bar" role="tablist">
             <button class="tab is-active" data-server-tab="linux" role="tab"><span class="icon" style="--icon:url('./icons/server.svg')"></span><span>Linux 服务器</span></button>
             <button class="tab" data-server-tab="windows" role="tab"><span class="icon" style="--icon:url('./icons/monitor.svg')"></span><span>Windows 服务器</span></button>
+            <button class="tab" data-server-tab="transfer" role="tab"><span class="icon" style="--icon:url('./icons/hard-drive-download.svg')"></span><span>文件快传</span></button>
           </div>
 
           <div id="server-tab-linux" class="server-tab-panel is-active">
@@ -407,6 +408,69 @@
                   <button id="winserver-detail-close" type="button" class="text-button winserver-detail-close">关闭</button>
                 </div>
                 <pre id="winserver-detail-body" class="env-detail-body"></pre>
+              </div>
+            </div>
+          </div>
+          </div>
+
+          <div id="server-tab-transfer" class="server-tab-panel">
+          <div class="xfer-layout">
+            <aside class="xfer-side">
+              <div class="env-versions-title"><span class="icon" style="--icon:url('./icons/server.svg')"></span><span>服务器</span></div>
+              <div id="xfer-server-list" class="xfer-server-list"></div>
+              <p class="settings-note">勾选要传的机器。<strong>「服务器之间」方向要正好勾两台</strong>：先勾的是源，后勾的是目标 —— 数据经本机中转，不要求两台机器能互相直连。</p>
+            </aside>
+
+            <div class="xfer-main">
+              <div class="xfer-section">
+                <div class="panel-heading">
+                  <div class="heading-icon"><span class="icon" style="--icon:url('./icons/hard-drive-download.svg')"></span></div>
+                  <div><h2>传输</h2><p>走已有的 SSH 连接，逐文件分块传 —— 断了重跑只补差的那部分</p></div>
+                </div>
+                <div class="xfer-directions" role="tablist">
+                  <button type="button" class="xfer-direction is-active" data-xfer-mode="upload"><span class="icon" style="--icon:url('./icons/upload.svg')"></span><span>本机 → 远端</span></button>
+                  <button type="button" class="xfer-direction" data-xfer-mode="download"><span class="icon" style="--icon:url('./icons/download.svg')"></span><span>远端 → 本机</span></button>
+                  <button type="button" class="xfer-direction" data-xfer-mode="move"><span class="icon" style="--icon:url('./icons/network.svg')"></span><span>服务器之间</span></button>
+                </div>
+              </div>
+
+              <div class="xfer-section">
+                <div class="env-versions-title"><span class="icon" style="--icon:url('./icons/folder-open.svg')"></span><span>路径</span></div>
+                <div class="xfer-fields">
+                  <div class="xfer-field">
+                    <span class="xfer-field-label">本机路径</span>
+                    <div class="xfer-input-row">
+                      <input id="xfer-local" type="text" placeholder="C:\Users\me\build" spellcheck="false">
+                      <button id="xfer-pick-file" type="button" class="button secondary">选文件</button>
+                      <button id="xfer-pick-dir" type="button" class="button secondary">选目录</button>
+                    </div>
+                  </div>
+                  <div class="xfer-field">
+                    <span class="xfer-field-label">远端路径</span>
+                    <div class="xfer-input-row">
+                      <input id="xfer-remote" type="text" placeholder="/var/www/site" spellcheck="false">
+                      <button id="xfer-browse-up" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/arrow-up.svg')"></span><span>上一级</span></button>
+                      <button id="xfer-browse" type="button" class="button secondary">浏览</button>
+                    </div>
+                  </div>
+                </div>
+                <div id="xfer-browse-box" class="xfer-browse"></div>
+              </div>
+
+              <div class="xfer-section">
+                <div class="xfer-options">
+                  <label class="xfer-check"><input id="xfer-sync" type="checkbox" checked><span>增量：只传变化的文件（大小和修改时间都比）</span></label>
+                  <label class="xfer-check"><input id="xfer-mirror" type="checkbox"><span>镜像：连目标端多出来的文件一起删掉</span></label>
+                </div>
+                <div class="xfer-actions">
+                  <button id="xfer-start" type="button" class="button primary"><span class="icon" style="--icon:url('./icons/play.svg')"></span><span>开始传输</span></button>
+                  <span id="xfer-hint" class="toolbar-context">先在左边勾一台服务器</span>
+                </div>
+              </div>
+
+              <div class="xfer-section">
+                <div class="env-versions-title"><span class="icon" style="--icon:url('./icons/list-filter.svg')"></span><span>结果</span></div>
+                <div id="xfer-result" class="xfer-result"><div class="winserver-item-reason">还没传过东西</div></div>
               </div>
             </div>
           </div>

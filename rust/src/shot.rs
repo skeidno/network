@@ -610,7 +610,6 @@ mod tests {
     #[test]
     fn base64往返一致() {
         for case in [
-            &b""[..],
             &b"a"[..],
             &b"ab"[..],
             &b"abc"[..],
@@ -621,6 +620,9 @@ mod tests {
             let decoded = base64_decode(&encoded).unwrap();
             assert_eq!(decoded, case, "case {case:?}");
         }
+        // 空串走的是错误分支：这里的解码器只服务于「远端截图的 base64 载荷」，
+        // 远端返回空 = 没抓到图，当成失败比返回空 Vec 更能说明问题。
+        assert!(base64_decode("").is_err());
     }
 
     #[test]

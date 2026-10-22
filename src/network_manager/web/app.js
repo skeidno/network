@@ -173,11 +173,13 @@ function renderActivePage() {
     renderNodes();
     renderSubscriptions();
   } else if (currentPage === "servers") {
-    // 同一个页面里两个标签：Linux（SSH 部署）与 Windows（RDP 会话治理）。
+    // 同一个页面里三个标签：Linux（SSH 部署）、Windows（RDP 会话治理）、文件快传。
     // 只渲染当前标签那半边，另一半不做无谓的子进程调用。
     if (serverTab === "windows") {
       renderWinServerList();
       loadWinServerFixes();
+    } else if (serverTab === "transfer") {
+      renderXferServers();
     } else {
       renderSshServers();
     }
@@ -1404,7 +1406,7 @@ async function installAllEnv() {
 let serverTab = "linux";
 
 function setServerTab(tab) {
-  if (tab !== "linux" && tab !== "windows") return;
+  if (tab !== "linux" && tab !== "windows" && tab !== "transfer") return;
   if (serverTab === tab) return;
   serverTab = tab;
   document.querySelectorAll("[data-server-tab]").forEach((button) => {
@@ -1412,11 +1414,15 @@ function setServerTab(tab) {
   });
   byId("server-tab-linux").classList.toggle("is-active", tab === "linux");
   byId("server-tab-windows").classList.toggle("is-active", tab === "windows");
+  byId("server-tab-transfer").classList.toggle("is-active", tab === "transfer");
   // 切过去才渲染那半边。Windows 那半要起 powercfg / reg 子进程，
   // 不该在用户没看它的时候白跑一趟。
   if (tab === "windows") {
     renderWinServerList();
     loadWinServerFixes();
+  } else if (tab === "transfer") {
+    // 服务器清单与另外两个标签共用同一份 appState，切过来重画一次即可
+    renderXferServers();
   } else {
     renderSshServers();
   }
@@ -1987,8 +1993,289 @@ async function applyWinServerKeepAlive(id) {
   }
 }
 
-function closeCustomSelects(except = null) {
-  document.querySelectorAll(".custom-select.is-open").forEach((root) => {
+/* ------------------------------------------------------------------
+   服务器管理页 · 文件快传
+
+   复用的是「本机 ⇄ 远端」那条 SSH 连接。后端实现是逐文件 + 分块 base64
+   （手写的 SSH 客户端只有 exec 通道，没有 SFTP），所以：
+   - 断在中途不会有"半个文件"—— 每个文件重传时第一块是 `>` 截断；
+   - 增量与镜像是**按文件**比对（大小 + 修改时间），不是整包哈希；
+   - 目录会递归，空目录不保留（没有文件的目录没有传输意义）。
+
+   镜像会删东西，所以按钮做成了「点两次」的两段式确认 ——
+   不依赖 window.confirm（wry 里对 script dialog 的支持不保证）。
+   ------------------------------------------------------------------ */
+let xferMode = "upload";
+/** 勾选的服务器，**保持点击顺序** —— 服务器互传要靠顺序区分源和目标。 */
+let xferPicked = [];
+let xferBusy = false;
+let xferBrowsePath = "";
+let xferMirrorArmed = false;
+
+function xferServers() {
+  return (appState?.sshServers || []).map((server) => ({
+    profileId: server.profileId,
+    name: server.name || server.host,
+    host: server.host,
+    port: server.port,
+    kind: server.kind === "windows" ? "windows" : "linux",
+  }));
+}
+
+function xferServerById(profileId) {
+  return xferServers().find((server) => server.profileId === profileId) || null;
+}
+
+function renderXferServers() {
+  const box = byId("xfer-server-list");
+  if (!box) return;
+  const servers = xferServers();
+  if (!servers.length) {
+    box.innerHTML = `<div class="winserver-item-reason">还没有服务器。先去「Linux 服务器」或「Windows 服务器」加一台。</div>`;
+    updateXferHint();
+    return;
+  }
+  box.innerHTML = servers.map((server, index) => {
+    const order = xferPicked.indexOf(server.profileId);
+    const picked = order >= 0;
+    return `
+      <button type="button" class="xfer-server ${picked ? "is-picked" : ""}" data-xfer-pick="${escapeHtml(server.profileId)}">
+        <span class="xfer-server-box">${picked ? order + 1 : ""}</span>
+        <span class="xfer-server-main">
+          <span class="xfer-server-name">${escapeHtml(server.name)}</span>
+          <span class="xfer-server-host">${escapeHtml(server.host)}:${server.port}</span>
+        </span>
+        <span class="xfer-server-kind">${server.kind === "windows" ? "Win" : "Linux"}</span>
+      </button>`;
+  }).join("");
+  updateXferHint();
+}
+
+function toggleXferPick(profileId) {
+  const index = xferPicked.indexOf(profileId);
+  if (index >= 0) xferPicked.splice(index, 1);
+  else xferPicked.push(profileId);
+  // 换服务器等于换了目标机，之前浏览出来的目录清单不再对得上
+  xferBrowsePath = "";
+  byId("xfer-browse-box").innerHTML = "";
+  renderXferServers();
+  armXferMirror(false);
+}
+
+function updateXferHint() {
+  const hint = byId("xfer-hint");
+  const start = byId("xfer-start");
+  if (!hint || !start) return;
+  const count = xferPicked.length;
+  let text = "";
+  if (xferMode === "move") {
+    text = count === 2
+      ? `${xferServerById(xferPicked[0])?.name || "源"} → ${xferServerById(xferPicked[1])?.name || "目标"}`
+      : `勾两台（现在是 ${count} 台）：先源后目标`;
+  } else if (count === 0) {
+    text = "先在左边勾一台服务器";
+  } else if (count === 1) {
+    text = xferServerById(xferPicked[0])?.name || "";
+  } else {
+    text = `已勾 ${count} 台，会依次推过去（后端一批 4 台）`;
+  }
+  hint.textContent = text;
+  const label = start.querySelector("span:last-child");
+  if (label) {
+    label.textContent = xferMirrorArmed
+      ? "再点一次：确认删除"
+      : xferMode === "move" ? "开始中转" : xferMode === "download" ? "下载到本机" : count > 1 ? `推送到 ${count} 台` : "开始传输";
+  }
+  start.classList.toggle("is-danger", xferMirrorArmed);
+}
+
+function setXferMode(mode) {
+  if (!["upload", "download", "move"].includes(mode)) return;
+  xferMode = mode;
+  document.querySelectorAll("[data-xfer-mode]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.xferMode === mode);
+  });
+  const local = byId("xfer-local");
+  const remote = byId("xfer-remote");
+  if (mode === "upload") {
+    local.placeholder = "C:\\Users\\me\\build";
+    remote.placeholder = "/var/www/site";
+  } else if (mode === "download") {
+    local.placeholder = "D:\\backup\\site";
+    remote.placeholder = "/var/www/site";
+  } else {
+    local.placeholder = "（服务器之间不需要本机路径）";
+    remote.placeholder = "/var/www/site";
+  }
+  local.disabled = mode === "move";
+  byId("xfer-pick-file").disabled = mode === "move";
+  byId("xfer-pick-dir").disabled = mode === "move";
+  armXferMirror(false);
+  updateXferHint();
+}
+
+/** 镜像的两段式确认：勾上之后第一次点只是「上膛」，第二次才真的动手。 */
+function armXferMirror(armed) {
+  xferMirrorArmed = armed;
+  updateXferHint();
+}
+
+async function pickXferLocal(selectDirectory) {
+  try {
+    const picked = await invoke("fileTransferPickLocal", selectDirectory);
+    if (picked) {
+      byId("xfer-local").value = picked;
+      armXferMirror(false);
+    }
+  } catch (error) {
+    showToast("error", error.message || "选择失败");
+  }
+}
+
+function joinRemotePath(base, name) {
+  const trimmed = String(base || "").replace(/[\\/]+$/, "");
+  if (!trimmed) return name;
+  return `${trimmed}/${name}`;
+}
+
+async function browseXferRemote(path) {
+  if (!xferPicked.length) {
+    showToast("error", "先在左边勾一台服务器");
+    return;
+  }
+  const box = byId("xfer-browse-box");
+  const target = xferPicked[0];
+  const wanted = path || byId("xfer-remote").value.trim() || (xferServerById(target)?.kind === "windows" ? "C:/" : "/");
+  box.innerHTML = `<div class="winserver-item-reason">正在列目录…</div>`;
+  try {
+    const result = await invoke("fileTransferBrowse", target, wanted);
+    xferBrowsePath = result.path || wanted;
+    byId("xfer-remote").value = xferBrowsePath;
+    armXferMirror(false);
+    renderXferBrowse(result);
+  } catch (error) {
+    box.innerHTML = `<div class="winserver-item-reason">列目录失败：${escapeHtml(error.message || error)}</div>`;
+  }
+}
+
+function renderXferBrowse(result) {
+  const box = byId("xfer-browse-box");
+  const entries = Array.isArray(result?.entries) ? result.entries : [];
+  const parent = result?.parent || "";
+  const rows = [];
+  if (parent) {
+    rows.push(`<button type="button" class="xfer-entry is-dir" data-xfer-enter="${escapeHtml(parent)}">
+      <span class="xfer-entry-icon">${icon("arrow-up")}</span><span class="xfer-entry-name">..</span></button>`);
+  }
+  for (const entry of entries) {
+    const name = entry.name || "";
+    const isDir = entry.kind === "dir";
+    const meta = isDir ? "目录" : formatBytes(entry.size || 0);
+    const attr = isDir
+      ? `data-xfer-enter="${escapeHtml(joinRemotePath(xferBrowsePath, name))}"`
+      : `data-xfer-file="${escapeHtml(joinRemotePath(xferBrowsePath, name))}"`;
+    rows.push(`<button type="button" class="xfer-entry ${isDir ? "is-dir" : ""}" ${attr}>
+      <span class="xfer-entry-icon">${icon(isDir ? "folder-open" : "file-text")}</span>
+      <span class="xfer-entry-name">${escapeHtml(name)}</span>
+      <span class="xfer-entry-meta">${escapeHtml(meta)}</span></button>`);
+  }
+  box.innerHTML = `
+    <div class="xfer-browse-head">
+      <span>${escapeHtml(result?.path || xferBrowsePath)}</span>
+      <span>${entries.length} 项</span>
+    </div>
+    <div class="xfer-browse-list">${rows.join("") || `<div class="winserver-item-reason">空目录</div>`}</div>`;
+}
+
+async function startXfer() {
+  if (xferBusy) return;
+  const local = byId("xfer-local").value.trim();
+  const remote = byId("xfer-remote").value.trim();
+  const sync = byId("xfer-sync").checked;
+  const mirror = byId("xfer-mirror").checked;
+
+  if (!xferPicked.length) {
+    showToast("error", "先在左边勾一台服务器");
+    return;
+  }
+  if (xferMode === "move" && xferPicked.length !== 2) {
+    showToast("error", "服务器之间要正好勾两台：先源后目标");
+    return;
+  }
+  if (xferMode !== "move" && !local) {
+    showToast("error", "先填本机路径");
+    return;
+  }
+  if (!remote) {
+    showToast("error", "先填远端路径");
+    return;
+  }
+  if (mirror && !xferMirrorArmed) {
+    armXferMirror(true);
+    showToast("info", "镜像会删掉目标端多出来的文件，再点一次才动手");
+    return;
+  }
+
+  xferBusy = true;
+  const start = byId("xfer-start");
+  start.disabled = true;
+  byId("xfer-result").innerHTML = `<div class="winserver-item-reason">正在传输…大目录可能要等一会儿，别关窗口</div>`;
+  try {
+    if (xferMode === "upload" && xferPicked.length > 1) {
+      const result = await invoke("fileTransferPushMany", xferPicked, local, remote, sync, mirror);
+      renderXferMulti(result);
+    } else if (xferMode === "upload") {
+      const stats = await invoke("fileTransferUpload", xferPicked[0], local, remote, sync, mirror);
+      renderXferStats(`${xferServerById(xferPicked[0])?.name || "服务器"} · 已上传`, stats);
+    } else if (xferMode === "download") {
+      const stats = await invoke("fileTransferDownload", xferPicked[0], remote, local, sync, mirror);
+      renderXferStats(`${xferServerById(xferPicked[0])?.name || "服务器"} · 已下载`, stats);
+    } else {
+      const stats = await invoke("fileTransferMove", xferPicked[0], xferPicked[1], remote, mirror);
+      renderXferStats(`${xferServerById(xferPicked[0])?.name || "源"} → ${xferServerById(xferPicked[1])?.name || "目标"}`, stats);
+    }
+  } catch (error) {
+    byId("xfer-result").innerHTML = `<div class="winserver-item-reason">传输失败：${escapeHtml(error.message || error)}</div>`;
+    showToast("error", error.message || "传输失败");
+  } finally {
+    xferBusy = false;
+    start.disabled = false;
+    armXferMirror(false);
+  }
+}
+
+function renderXferStats(title, stats) {
+  const notes = Array.isArray(stats?.notes) ? stats.notes : [];
+  const bits = [`${stats?.files || 0} 个文件`, formatBytes(stats?.bytes || 0)];
+  if (stats?.skipped) bits.push(`跳过 ${stats.skipped}`);
+  if (stats?.removed) bits.push(`删除 ${stats.removed}`);
+  byId("xfer-result").innerHTML = `
+    <div class="xfer-stat-head">
+      <strong>${escapeHtml(title)}</strong>
+      <span>${escapeHtml(bits.join(" · "))}</span>
+    </div>
+    <div class="xfer-notes">${notes
+      .map((note) => `<div class="xfer-note">${escapeHtml(note)}</div>`)
+      .join("") || `<div class="winserver-item-reason">没有可展示的明细</div>`}</div>`;
+}
+
+function renderXferMulti(result) {
+  const rows = Array.isArray(result?.results) ? result.results : [];
+  byId("xfer-result").innerHTML = `
+    <div class="xfer-stat-head">
+      <strong>批量推送</strong>
+      <span>${result?.succeeded || 0} 台成功 · ${result?.failed || 0} 台失败</span>
+    </div>
+    <div class="xfer-notes">${rows
+      .map((row) => `<div class="xfer-note ${row.ok ? "is-ok" : "is-bad"}">
+        <span>${row.ok ? "✓" : "✕"}</span>
+        <strong>${escapeHtml(row.name || row.profileId || "未知")}</strong>
+        <span>${escapeHtml(row.detail || "")}</span>
+      </div>`)
+      .join("")}</div>`;
+}
+
+function closeCustomSelects(except = null) {  document.querySelectorAll(".custom-select.is-open").forEach((root) => {
     if (root === except) return;
     root.classList.remove("is-open");
     root.classList.remove("opens-up");
@@ -3004,6 +3291,40 @@ function bindEvents() {
     const apply = event.target.closest("[data-keepalive-apply]");
     if (apply) applyWinServerKeepAlive(apply.dataset.keepaliveApply);
   });
+
+  // 文件快传
+  byId("xfer-server-list").addEventListener("click", (event) => {
+    const pick = event.target.closest("[data-xfer-pick]");
+    if (pick) toggleXferPick(pick.dataset.xferPick);
+  });
+  document.querySelectorAll("[data-xfer-mode]").forEach((button) => {
+    button.addEventListener("click", () => setXferMode(button.dataset.xferMode));
+  });
+  byId("xfer-pick-file").addEventListener("click", () => pickXferLocal(false));
+  byId("xfer-pick-dir").addEventListener("click", () => pickXferLocal(true));
+  byId("xfer-browse").addEventListener("click", () => browseXferRemote());
+  byId("xfer-browse-up").addEventListener("click", () => {
+    const current = byId("xfer-remote").value.trim() || xferBrowsePath;
+    const parent = current.replace(/[\\/]+$/, "").replace(/[\\/][^\\/]*$/, "");
+    browseXferRemote(parent || (xferServerById(xferPicked[0])?.kind === "windows" ? "C:/" : "/"));
+  });
+  byId("xfer-browse-box").addEventListener("click", (event) => {
+    const enter = event.target.closest("[data-xfer-enter]");
+    if (enter) {
+      browseXferRemote(enter.dataset.xferEnter);
+      return;
+    }
+    const file = event.target.closest("[data-xfer-file]");
+    if (file) {
+      byId("xfer-remote").value = file.dataset.xferFile;
+      armXferMirror(false);
+    }
+  });
+  byId("xfer-start").addEventListener("click", () => startXfer());
+  // 改路径 / 改镜像勾选都要把「已上膛」的状态收回去，否则下一次点击会直接删东西
+  byId("xfer-local").addEventListener("input", () => armXferMirror(false));
+  byId("xfer-remote").addEventListener("input", () => armXferMirror(false));
+  byId("xfer-mirror").addEventListener("change", () => armXferMirror(false));
   byId("modal-close").addEventListener("click", closeModal);
   byId("app-modal").addEventListener("click", (event) => {
     if (event.target === byId("app-modal")) closeModal();
