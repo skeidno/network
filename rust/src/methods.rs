@@ -1362,6 +1362,142 @@ pub async fn dispatch(
             crate::localca::open_dir()?;
             Ok(json!(true))
         }
+        // ---- Windows 服务器远程管理（通过 SSH 执行 PowerShell）----
+        // 与 Linux 侧共用同一套 SSH 客户端与凭据存储：Windows Server 2019+
+        // 内置 OpenSSH 服务端，讲标准协议，客户端不用改。
+        // ---- 远程截图（Windows 与 Linux 通用）----
+        "serverScreenshot" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let capture = if profile.kind == "windows" {
+                crate::shot::capture_windows(&profile, &credential).await?
+            } else {
+                crate::shot::capture_linux(&profile, &credential).await?
+            };
+            Ok(crate::shot::capture_to_json(&capture))
+        }
+
+        // ---- RDP 断开后保持开机 ----
+        "keepAliveList" => {
+            let kind = text(&args, 0);
+            let items = if kind == "windows" {
+                crate::keepalive::windows_keep_alive()
+            } else {
+                crate::keepalive::linux_keep_alive()
+            };
+            Ok(json!({
+                "items": crate::keepalive::keep_alive_to_json(&items),
+                // 硬件层：软件管不了，给指引
+                "hardware": crate::keepalive::hardware_layer_notes(),
+            }))
+        }
+        "keepAliveStatus" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            if profile.kind == "windows" {
+                Ok(crate::keepalive::check_windows_keep_alive(&profile, &credential).await?)
+            } else {
+                Ok(crate::keepalive::check_linux_keep_alive(&profile, &credential).await?)
+            }
+        }
+        "keepAliveApply" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let item_id = text(&args, 1).to_string();
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let kind = profile.kind.clone();
+            let items = if kind == "windows" {
+                crate::keepalive::windows_keep_alive()
+            } else {
+                crate::keepalive::linux_keep_alive()
+            };
+            let Some(item) = items.into_iter().find(|i| i.id == item_id) else {
+                return Err(format!("未知的保活项：{item_id}"));
+            };
+            let detail = if kind == "windows" {
+                crate::winsrv::run_powershell(&profile, &credential, item.script).await?
+            } else {
+                crate::winsrv::run_shell(&profile, &credential, item.script).await?
+            };
+            state.notify("success", format!("{} 已执行", item.title));
+            Ok(json!({ "detail": detail }))
+        }
+        // 探活 + 确认远端确实是 Windows
+        "winSrvProbeOs" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let (caption, version) =
+                crate::winsrv::probe_os(&profile, &credential).await?;
+            Ok(json!({ "os": caption, "version": version }))
+        }
+        "winSrvMetrics" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let metrics = crate::winsrv::collect_metrics(&profile, &credential).await?;
+            Ok(metrics)
+        }
+        "winSrvPowerSettings" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            Ok(crate::winsrv::collect_power_settings(&profile, &credential).await?)
+        }
+        "winSrvRunFix" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let fix_id = text(&args, 1).to_string();
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let detail = crate::winsrv::apply_remote_fix(&profile, &credential, &fix_id).await?;
+            state.notify("success", detail.lines().next().unwrap_or("已执行").to_string());
+            Ok(json!({ "detail": detail }))
+        }
+        "winSrvUsers" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            Ok(crate::winsrv::list_remote_users(&profile, &credential).await?)
+        }
+        "winSrvCreateUser" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let name = text(&args, 1).to_string();
+            let password = text(&args, 2).to_string();
+            let admin = matches!(args.get(3), Some(Value::Bool(true)));
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let detail =
+                crate::winsrv::create_remote_user(&profile, &credential, &name, &password, admin).await?;
+            state.notify("success", format!("远程用户 {name} 已处理"));
+            Ok(json!({ "detail": detail }))
+        }
+        // 远程修复项的静态清单
+        "winSrvFixes" => Ok(json!(
+            crate::winsrv::remote_fixes()
+                .iter()
+                .map(|fix| {
+                    json!({
+                        "id": fix.id,
+                        "title": fix.title,
+                        "reason": fix.reason,
+                        "script": fix.script,
+                        "needAdmin": fix.need_admin,
+                    })
+                })
+                .collect::<Vec<Value>>()
+        )),
+        // 建用户只生成命令不直接执行：动账户系统不可轻易撤销，交给用户决定何时跑
+        // 打开远程桌面并预填服务器地址。用 mstsc 而不是自己实现 RDP 协议 ——
+        // 客户端已经处理了凭据缓存、NLA、剪贴板这些细节，重造没有意义。
+        "winServerOpenRdp" => {
+            let host = text(&args, 0).trim().to_string();
+            if host.is_empty() {
+                return Err("请先填写服务器地址".into());
+            }
+            // 只放行 IPv4 / 主机名形态。mstsc 接受 IP 或域名，
+            // 但这里拦住明显的垃圾输入，免得生成一个打不开的 .rdp
+            let looks_valid = host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':');
+            if !looks_valid || host.len() > 255 {
+                return Err(format!("「{host}」不像是 IP 或域名"));
+            }
+            crate::winsrv::open_rdp(&host)?;
+            Ok(json!(true))
+        }
         "saveSources" => {
             let patch = payload(&args, 0)?;
             for (key, slot) in [("clash", "Clash 7897"), ("v2ray", "v2ray 10808")] {

@@ -312,7 +312,7 @@
 
           <div class="winserver-layout">
             <aside class="winserver-side">
-              <div class="env-versions-title"><span class="icon" style="--icon:url('./icons/server.svg')"></span><span>服务器</span></div>
+              <div class="winserver-section-title"><span class="icon" style="--icon:url('./icons/server.svg')"></span><span>服务器</span></div>
               <div id="winserver-list" class="winserver-list"></div>
             </aside>
 
@@ -333,6 +333,42 @@
                 <p class="settings-note">这些命令<strong>在目标服务器上执行</strong>，不是在本机。改电源计划、注册表都需要管理员权限 —— 远端用普通账号登录时命令会失败，输出里会写明原因。<strong>「允许同一用户多个远程会话」改完要重启远程桌面服务</strong>才生效（会断掉当前所有 RDP 连接）。</p>
               </div>
 
+
+              <div class="winserver-section">
+                <div class="panel-heading">
+                  <div class="heading-icon"><span class="icon" style="--icon:url('./icons/monitor.svg')"></span></div>
+                  <div><h2>屏幕画面</h2><p>看一眼服务器现在显示着什么</p></div>
+                </div>
+                <div class="winserver-shot-toolbar">
+                  <button id="winserver-shot" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/monitor.svg')"></span><span>抓取屏幕</span></button>
+                  <span id="winserver-shot-info" class="winserver-shot-info">还没抓过</span>
+                </div>
+                <div id="winserver-shot-box" class="winserver-shot-box">
+                  <div class="winserver-item-reason">点「抓取屏幕」看看服务器现在的画面</div>
+                </div>
+                <p class="settings-note"><strong>Windows 上截图需要目标机有交互式桌面</strong>：SSH 登录的进程跑在 Session 0（没有桌面），所以程序会建一个「以交互方式运行」的计划任务，让它进到已登录用户的会话里再抓 —— 这也是为什么第一次用可能慢几秒。<strong>没人在本地登录过的机器是抓不到的</strong>（没有桌面可截），RDP 连上去之后会自动建一个会话，那时就能截了。Linux 上要有 X11 或 Wayland 会话，纯命令行的云镜像本来就没有桌面。</p>
+              </div>
+
+              <div class="winserver-section">
+                <div class="panel-heading">
+                  <div class="heading-icon"><span class="icon" style="--icon:url('./icons/power.svg')"></span></div>
+                  <div><h2>断开后保持运行</h2><p>RDP 关了别让服务器睡过去</p></div>
+                </div>
+                <div id="winserver-keepalive-items" class="winserver-items"></div>
+                <div class="winserver-fix-actions">
+                  <button id="winserver-keepalive-refresh" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span><span>重新检查</span></button>
+                </div>
+                <div id="winserver-keepalive-list" class="winserver-fixes"></div>
+              </div>
+
+              <div class="winserver-section">
+                <div class="panel-heading">
+                  <div class="heading-icon"><span class="icon" style="--icon:url('./icons/server.svg')"></span></div>
+                  <div><h2>硬件层：软件管不了的部分</h2><p>这些必须去机房或云控制台配</p></div>
+                </div>
+                <div id="winserver-hardware" class="winserver-hardware"></div>
+                <p class="settings-note"><strong>系统一旦开始关机流程，任何软件都拦不住。</strong>上面那些措施能保证「不睡眠、不注销、会话保留」，但如果是真的被人按了关机键、或者机房断电了，只有 BIOS/UEFI 与云平台那层的设置能救 —— 下面列的就是要去哪儿开那个选项。</p>
+              </div>
               <div class="winserver-section">
                 <div class="panel-heading">
                   <div class="heading-icon"><span class="icon" style="--icon:url('./icons/server.svg')"></span></div>
@@ -356,7 +392,7 @@
                   <pre id="winserver-command-body" class="winserver-command-body"></pre>
                 </div>
                 <div class="winserver-users">
-                  <div class="env-versions-title"><span class="icon" style="--icon:url('./icons/list-filter.svg')"></span><span>远端用户</span></div>
+                  <div class="winserver-section-title"><span class="icon" style="--icon:url('./icons/list-filter.svg')"></span><span>远端用户</span></div>
                   <div id="winserver-user-list" class="winserver-user-list"></div>
                 </div>
               </div>
