@@ -452,6 +452,84 @@ fn toggle_core(runtime: &tokio::runtime::Handle, shared: &Shared) {
 }
 
 #[cfg(windows)]
+pub fn pick_local_path_blocking(select_directory: bool) -> Option<String> {
+    if select_directory {
+        pick_folder_blocking()
+    } else {
+        pick_file_blocking()
+    }
+}
+
+/// 文件快传的「选文件」。
+///
+/// 与选私钥用同一个 API，只是不加过滤器——要传的东西什么后缀都有，
+/// 加过滤只会让用户找不到文件。
+#[cfg(windows)]
+fn pick_file_blocking() -> Option<String> {
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OPEN_FILENAME_FLAGS, OPENFILENAMEW,
+    };
+
+    unsafe {
+        let mut buffer = vec![0u16; 4096];
+        let mut filter: Vec<u16> = Vec::new();
+        for part in ["所有文件\0*.*\0"] {
+            filter.extend(part.encode_utf16());
+        }
+        filter.push(0);
+        let mut info: OPENFILENAMEW = std::mem::zeroed();
+        info.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+        info.lpstrFilter = PCWSTR::from_raw(filter.as_ptr());
+        info.lpstrFile = PWSTR::from_raw(buffer.as_mut_ptr());
+        info.nMaxFile = buffer.len() as u32;
+        info.Flags = OPEN_FILENAME_FLAGS(0x0000_1000 | 0x0000_0004); // OFN_FILEMUSTEXIST | OFN_EXPLORER
+        if GetOpenFileNameW(&mut info).as_bool() {
+            let length = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+            Some(String::from_utf16_lossy(&buffer[..length]))
+        } else {
+            None
+        }
+    }
+}
+
+/// 文件快传的「选目录」。
+///
+/// 走 `SHBrowseForFolderW` 而不是把 `GetOpenFileNameW` 改成选任意文件再取父目录 ——
+/// 后者的对话框头文件名的输入框还在，用户会以为自己在选文件。
+/// `BIF_RETURNONLYFSDIRS` 过滤掉「网上邻居」这类非文件系统项：那是 Shell 名字空间对象，
+/// 拿回来拼成本地路径会得到一个根本不存在的东西。
+#[cfg(windows)]
+fn pick_folder_blocking() -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::{ILFree, SHBrowseForFolderW, SHGetPathFromIDListW, BROWSEINFOW};
+
+    unsafe {
+        let title: Vec<u16> = "选一个本地目录".encode_utf16().chain(std::iter::once(0)).collect();
+        let mut display = [0u16; 260];
+        let mut info: BROWSEINFOW = std::mem::zeroed();
+        info.pszDisplayName = windows::core::PWSTR::from_raw(display.as_mut_ptr());
+        info.lpszTitle = PCWSTR::from_raw(title.as_ptr());
+        info.ulFlags = 0x0000_0001 | 0x0000_0040; // BIF_RETURNONLYFSDIRS | BIF_RETURNFSANCESTORS
+
+        let pidl = SHBrowseForFolderW(&info);
+        if pidl.is_null() {
+            return None;
+        }
+        let mut path = [0u16; 260];
+        let resolved = SHGetPathFromIDListW(pidl, &mut path).as_bool();
+        ILFree(Some(pidl));
+        if !resolved {
+            return None;
+        }
+        let length = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+        Some(String::from_utf16_lossy(&path[..length]))
+    }
+}
+
+// 非 Windows 平台的同名函数在 gui_stub.rs 里（Linux 是常驻服务，没有对话框）。
+
+#[cfg(windows)]
 pub fn pick_ssh_key_blocking() -> Option<String> {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::UI::Controls::Dialogs::{

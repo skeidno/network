@@ -12,3 +12,9 @@ pub fn send(_event: AppEvent) {}
 pub fn pick_ssh_key_blocking() -> Option<String> {
     None
 }
+
+/// 同理：文件快传的本机路径在服务端场景只能手输（浏览器那边选不了
+/// 服务器上的路径），返回 None 让前端保留用户填的内容。
+pub fn pick_local_path_blocking(_select_directory: bool) -> Option<String> {
+    None
+}

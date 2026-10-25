@@ -73,8 +73,9 @@ const PAGE_TITLES = {
   overview: "运行概览",
   rules: "分流规则",
   nodes: "代理与节点",
-  servers: "服务器部署",
+  servers: "服务器管理",
   settings: "设置",
+  env: "环境管理",
   logs: "运行日志",
 };
 
@@ -171,8 +172,22 @@ function renderActivePage() {
     renderSources();
     renderNodes();
     renderSubscriptions();
-  } else if (currentPage === "servers") renderSshServers();
+  } else if (currentPage === "servers") {
+    // 同一个页面里三个标签：Linux（SSH 部署）、Windows（RDP 会话治理）、文件快传。
+    // 只渲染当前标签那半边，另一半不做无谓的子进程调用。
+    if (serverTab === "windows") {
+      renderWinServerList();
+      loadWinServerFixes();
+    } else if (serverTab === "transfer") {
+      renderXferServers();
+    } else {
+      renderSshServers();
+    }
+  }
   else if (currentPage === "settings") renderSettings();
+  // 环境页不在每轮状态里渲染：体检要起子进程问版本号，塞进状态轮询会拖慢整页刷新。
+  // 改成切进页面时按需拉一次。
+  else if (currentPage === "env") refreshEnv();
   else if (currentPage === "logs") refreshLogs();
 }
 
@@ -767,7 +782,9 @@ function syncSubscriptionGroupSelect() {
 }
 
 function renderSshServers() {
-  const servers = appState.sshServers || [];
+  // 只列 Linux 侧的。Windows 服务器走 SSH 但管的是 RDP 会话，
+  // 跟「往机器上装代理」完全是两回事，混在一张表里会让人点错。
+  const servers = linuxServers();
   // 选中项只保留仍然存在的服务器，避免删除后残留
   const alive = new Set(servers.map((server) => server.profileId));
   sshSelection.forEach((id) => { if (!alive.has(id)) sshSelection.delete(id); });
@@ -817,12 +834,11 @@ function renderSshServers() {
 }
 
 function selectedSshServers() {
-  const servers = appState.sshServers || [];
-  return servers.filter((server) => sshSelection.has(server.profileId));
+  return linuxServers().filter((server) => sshSelection.has(server.profileId));
 }
 
 function updateSshSelectionUi() {
-  const servers = appState.sshServers || [];
+  const servers = linuxServers();
   const picked = selectedSshServers();
   const count = picked.length;
   const label = byId("ssh-selection-count");
@@ -1018,8 +1034,1248 @@ async function refreshLogs() {
   finally { logsRefreshing = false; }
 }
 
-function closeCustomSelects(except = null) {
-  document.querySelectorAll(".custom-select.is-open").forEach((root) => {
+/* ------------------------------------------------------------------
+   环境管理页：开发环境体检 + 一键部署
+   ------------------------------------------------------------------ */
+let envScanning = false;
+let envBusy = false;
+// nvm 状态单独缓存一份：体检结果里只有「装了哪些」，没有「能装哪些」。
+// 可装版本要调 nvm（要联网拉 available 列表），单独按需拉一次就好。
+let nvmState = null;
+let envVersionTarget = { id: "", version: "" };
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[char]));
+}
+
+function renderEnv(data) {
+  const grid = byId("env-grid");
+  const summary = byId("env-summary");
+  const items = Array.isArray(data.items) ? data.items : [];
+
+  if (!items.length) {
+    summary.textContent = "没有可体检的项目";
+    grid.innerHTML = "";
+    return;
+  }
+
+  const outdated = items.filter((item) => item.outdated);
+  const missing = items.filter((item) => !item.ready);
+  // 摘要把三种情况分开讲。混成一句「N/M 就绪」的话，
+  // 用户看到 5/7 会不知道剩下两项是没装还是版本旧，而这两者要做的事完全不同。
+  const parts = [`<strong>${data.ready}/${data.total}</strong> 已就绪`];
+  if (outdated.length) parts.push(`${outdated.length} 项版本过旧（${escapeHtml(outdated.map((i) => i.name).join("、"))}）`);
+  if (missing.length) parts.push(`${missing.length} 项缺失（${escapeHtml(missing.map((i) => i.name).join("、"))}）`);
+  summary.innerHTML = parts.join(" · ");
+
+  grid.innerHTML = items.map((item) => {
+    // winget 不可用时不给「一键部署」，只留「去官网」，并在卡片上说明原因
+    const canInstall = Boolean(item.canInstall);
+    const canReinstall = Boolean(item.canReinstall) && item.outdated;
+    // 三态决定徽章与卡片配色：就绪 / 缺失 / 版本过旧
+    const state = item.outdated ? "outdated" : (item.ready ? "ready" : "missing");
+    const badgeText = item.outdated ? "版本过旧" : (item.ready ? "已就绪" : "缺失");
+    const versionText = item.ready ? (item.version || "已安装") : "未检测到";
+    const pathHint = item.path
+      ? escapeHtml(item.path)
+      : (item.ready ? "位置未记录" : "");
+
+    // 版本过旧时把「需要哪个版本」摆出来。后端的 outdatedNote 里也带当前版本，
+    // 但那是给 toast 用的单行摘要；这里已经有版本号单独一行了，再拼一遍会变成
+    // 「需要 20.0.0 或更高；当前 18.19.0，建议 20.0.0 以上」—— 同一句话说三遍。
+    // outdatedNote 不丢，挪到 title 上做悬浮提示，信息还在但不占版面。
+    const hint = item.outdated
+      ? `<div class="env-card-hint"${item.outdatedNote ? ` title="${escapeHtml(item.outdatedNote)}"` : ""}>需要 <code>${escapeHtml(item.minVersion)}</code> 或更高版本，重装可升级到最新版</div>`
+      : "";
+
+    let actions;
+    if (item.outdated) {
+      // 过期项给「重装」，不给「一键部署」—— 重装走 upgrade，破坏性小得多
+      actions = `${canReinstall
+          ? `<button type="button" class="button primary" data-env-reinstall="${escapeHtml(item.id)}">${icon("refresh-cw")}<span>重装升级</span></button>`
+          : ""}
+        <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">查看官网版本</button>`;
+    } else if (item.ready) {
+      actions = `<button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">打开官网</button>`;
+    } else {
+      actions = `${canInstall
+          ? `<button type="button" class="button primary" data-env-install="${escapeHtml(item.id)}">${icon("download")}<span>一键部署</span></button>`
+          : ""}
+        <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">去官网下载</button>`;
+    }
+
+    return `
+      <div class="env-card is-${state}" data-env-card="${escapeHtml(item.id)}">
+        <div class="env-card-head">
+          <span class="env-card-name">${escapeHtml(item.name)}</span>
+          <span class="env-badge is-${state}">${badgeText}</span>
+        </div>
+        <div class="env-card-version ${item.ready && !item.version ? "is-unknown" : ""}">${escapeHtml(versionText)}</div>
+        ${hint}
+        ${pathHint ? `<div class="env-card-path">${pathHint}</div>` : ""}
+        ${item.note ? `<div class="env-card-note">${escapeHtml(item.note)}</div>` : ""}
+        ${renderVersionManager(item)}
+        <div class="env-card-actions">${actions}</div>
+      </div>`;
+  }).join("");
+
+  // 一键部署只在「确有缺失且本机能自动装」时才可点。
+  // 过期项不算在内 —— 它需要的是重装，混进批量安装会让 winget 去做破坏性更大的事。
+  const installAll = byId("env-install-all");
+  const installable = missing.filter((item) => item.canInstall);
+  installAll.disabled = !installable.length || envBusy;
+  const hints = [];
+  if (!data.winget) hints.push("本机没有 winget，无法自动安装");
+  else if (installable.length) hints.push(`将依次安装：${installable.map((item) => item.name).join("、")}`);
+  else hints.push("没有缺失项");
+  if (outdated.length) hints.push(`过期项请单独点「重装升级」`);
+  installAll.title = hints.join("；");
+}
+
+/**
+ * 版本管理区。只画在支持指定版本的项上（目前只有 Node 走 nvm）。
+ *
+ * 分两层：
+ * - 已装版本做成可点的徽章，点一下就切（切版本不破坏任何东西，手感要快）
+ * - 没装的版本放下拉框，选中后点「安装并切换」才动手（要下载，慢）
+ */
+function renderVersionManager(item) {
+  if (!item.supportsVersions) return "";
+  // Node 才有 nvm 数据。别的项（Python/Git/JDK）走 winget 源，
+  // 版本列表要现查，装之前先让用户知道有哪些可选 —— 展开时再拉，不做无用请求。
+  if (item.id !== "node") return renderWingetVersionManager(item);
+
+  const state = nvmState;
+  if (!state || !state.installed) {
+    return `
+      <div class="env-versions">
+        <div class="env-versions-title">${icon("download")}<span>版本管理</span></div>
+        <div class="env-versions-hint">${escapeHtml(
+          state ? state.hint || "未检测到 nvm" : "正在检测 nvm…"
+        )}</div>
+        <div class="env-versions-actions" style="margin-top:8px">
+          <button type="button" class="button secondary" data-env-install="nvm">${icon("download")}<span>安装 nvm</span></button>
+        </div>
+      </div>`;
+  }
+
+  const installed = Array.isArray(state.installedVersions) ? state.installedVersions : [];
+  const available = Array.isArray(state.availableVersions) ? state.availableVersions : [];
+  const current = state.current || "";
+  // 已经装了的就不该再出现在「可安装」下拉里
+  const candidates = available.filter((entry) => !installed.includes(entry.version));
+
+  const chips = installed.length
+    ? `<div class="env-versions-row">
+        <div class="env-version-chips">
+          ${installed.map((version) => `
+            <button type="button"
+              class="env-version-chip ${version === current ? "is-current" : ""}"
+              data-nvm-use="${escapeHtml(version)}"
+              title="${version === current ? "当前正在使用" : `切换到 ${version}`}"
+              ${envBusy ? "disabled" : ""}>${escapeHtml(version)}${version === current ? " ✓" : ""}</button>
+          `).join("")}
+        </div>
+      </div>`
+    : "";
+
+  const picker = candidates.length
+    ? `<div class="env-versions-row">
+        <select class="env-versions-select" id="env-nvm-pick">
+          ${candidates.map((entry) => `<option value="${escapeHtml(entry.version)}">${escapeHtml(entry.version)}${entry.channel === "LTS" ? "（LTS）" : ""}</option>`).join("")}
+        </select>
+        <div class="env-versions-actions">
+          <button type="button" class="button primary" data-nvm-install>${icon("download")}<span>安装并切换</span></button>
+        </div>
+      </div>`
+    : `<div class="env-versions-hint">没有更多可安装的版本（已列出 nvm 提供的当前与 LTS 通道）。要装其它版本请到 <a href="https://nodejs.org/dist/" target="_blank" rel="noreferrer">nodejs.org/dist</a> 查。</div>`;
+
+  return `
+    <div class="env-versions" data-nvm-for="node">
+      <div class="env-versions-title">${icon("cpu")}<span>版本管理</span>
+        <span class="env-versions-tag">nvm ${escapeHtml(state.version || "")}</span>
+      </div>
+      ${chips}
+      ${picker}
+      <div class="env-versions-hint">已装 ${installed.length} 个版本，可并存，切版本不影响其它项目。切换后新开的终端才会生效（nvm 靠改软链接实现，已开着的窗口里还是旧版本）。</div>
+    </div>`;
+}
+
+/**
+ * 走 winget 的版本选择（Python / Git / JDK）。
+ *
+ * 与 Node 的关键差别：winget 换版本要先卸载旧的，所以文案必须说清这是破坏性操作，
+ * 不能让用户以为点一下就多出一个并存版本。
+ */
+function renderWingetVersionManager(item) {
+  // 没展开就不画这个区 —— 版本列表要调 winget 源，不该一进页面就拉
+  if (!envVersionTarget || envVersionTarget.id !== item.id) {
+    return `
+      <div class="env-versions">
+        <div class="env-versions-title">${icon("download")}<span>版本管理</span></div>
+        <div class="env-versions-actions">
+          <button type="button" class="text-button" data-env-query-versions="${escapeHtml(item.id)}">查看可安装版本</button>
+        </div>
+        <div class="env-versions-hint"><strong>这一项不能多版本并存</strong>：装指定版本会先卸载现有版本。要并存请用 Node 的 nvm。</div>
+      </div>`;
+  }
+  const versions = Array.isArray(envVersionTarget.versions) ? envVersionTarget.versions : [];
+  if (!versions.length) {
+    return `
+      <div class="env-versions">
+        <div class="env-versions-title">${icon("download")}<span>版本管理</span></div>
+        <div class="env-versions-hint">正在查询可安装版本…</div>
+      </div>`;
+  }
+  return `
+    <div class="env-versions">
+      <div class="env-versions-title">${icon("download")}<span>版本管理</span></div>
+      <div class="env-versions-row">
+        <select class="env-versions-select" data-env-version-pick="${escapeHtml(item.id)}">
+          <option value="">保持 ${escapeHtml(item.version || "当前版本")}</option>
+          ${versions.map((version) => `<option value="${escapeHtml(version)}">${escapeHtml(version)}</option>`).join("")}
+        </select>
+        <div class="env-versions-actions">
+          <button type="button" class="button primary" data-env-install-version="${escapeHtml(item.id)}">${icon("download")}<span>安装该版本</span></button>
+        </div>
+      </div>
+      <div class="env-versions-hint"><strong>与 Node 不同，这一项不能多版本并存</strong>：装指定版本会先卸载现在的版本。</div>
+    </div>`;
+}
+
+async function queryEnvVersions(id) {
+  if (envBusy) return;
+  setEnvBusy(true);
+  try {
+    const data = await invoke("envAvailableVersions", id);
+    envVersionTarget = { id, versions: Array.isArray(data?.versions) ? data.versions : [] };
+    if (!envVersionTarget.versions.length) {
+      showToast("error", "没查到可安装的版本");
+    }
+  } catch (error) {
+    showToast("error", error.message || "查询版本失败");
+    return;
+  } finally {
+    setEnvBusy(false);
+  }
+  // 重画整页：版本区是 renderEnv 的一部分
+  const data = await invoke("scanEnv");
+  renderEnv(data);
+}
+
+async function refreshNvm() {
+  try {
+    nvmState = await invoke("nvmStatus");
+  } catch (error) {
+    nvmState = { installed: false, hint: `检测 nvm 失败：${error.message || error}`, installedVersions: [], availableVersions: [], version: "", current: "" };
+  }
+}
+
+async function runNvmAction(method, version, verb) {
+  if (envBusy) return;
+  setEnvBusy(true);
+  // 后端在 nvmInstallVersion / nvmUseVersion 的返回里已经带了重扫过的 env，
+  // 直接用它，别再发一次 scanEnv —— 两边来自同一份快照才不会一个说切了、
+  // 一个说没切。
+  let freshEnv = null;
+  try {
+    const result = await invoke(method, version);
+    if (result && result.nvm) nvmState = result.nvm;
+    freshEnv = result?.env || null;
+    showEnvDetail(`${verb}输出`, result?.detail || `${verb}完成`);
+  } catch (error) {
+    showEnvDetail(`${verb}失败`, error.message || String(error));
+  } finally {
+    setEnvBusy(false);
+  }
+  // 必须在 setEnvBusy(false) 之后重画：refreshEnv 开头有 `if (envBusy) return`，
+  // 在 busy 状态下调它会被直接跳过。
+  // 失败时后端不返回 env，退回重扫（比如卸载的正好是当前版本）。
+  if (freshEnv) renderEnv(freshEnv);
+  else await refreshEnv();
+}
+
+async function refreshEnv() {
+  if (envScanning || envBusy) return;
+  envScanning = true;
+  const summary = byId("env-summary");
+  summary.textContent = "正在体检…";
+  try {
+    // nvm 状态先拉：Node 卡片要靠它画版本管理区。
+    // 放在 scanEnv 之前，两个都是子进程调用，顺序不影响耗时。
+    if (!nvmState) await refreshNvm();
+    const data = await invoke("scanEnv");
+    renderEnv(data);
+  } catch (error) {
+    summary.textContent = `体检失败：${error.message || error}`;
+  } finally {
+    envScanning = false;
+  }
+}
+
+function showEnvDetail(title, body) {
+  byId("env-detail-title").textContent = title;
+  byId("env-detail-body").textContent = body || "（无输出）";
+  const panel = byId("env-detail");
+  panel.hidden = false;
+  panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
+function setEnvBusy(busy) {
+  envBusy = busy;
+  // 安装期间把所有按钮禁掉：winget 独占安装锁，连点两次只会得到一段乱序输出
+  document.querySelectorAll(
+    "[data-env-install], [data-env-reinstall], [data-env-install-version], [data-env-query-versions]," +
+    "[data-nvm-use], [data-nvm-install], #env-install-all, #env-refresh"
+  )
+    .forEach((button) => { button.disabled = busy; });
+  const summary = byId("env-summary");
+  if (busy) summary.textContent = "正在执行安装，这一步可能要几分钟…";
+}
+
+async function runEnvAction(id, method, verb, version = "") {
+  if (envBusy) return;
+  setEnvBusy(true);
+  try {
+    // 版本为空 = 装最新版；后端对 Node 会转给 nvm，其它走 winget 的 --version
+    const result = await invoke(method, id, version);
+    if (result && result.env) renderEnv(result.env);
+    showEnvDetail(`${verb}输出`, result?.detail || `${verb}完成`);
+  } catch (error) {
+    // 失败时把后端带来的详细输出也摊开，别只留一句「安装失败」
+    showEnvDetail(`${verb}失败`, error.message || String(error));
+  } finally {
+    setEnvBusy(false);
+    if (byId("env-detail").hidden) refreshEnv();
+  }
+}
+
+async function installEnv(id) {
+  return runEnvAction(id, "installEnv", "安装");
+}
+
+async function reinstallEnv(id) {
+  return runEnvAction(id, "reinstallEnv", "重装");
+}
+
+async function installAllEnv() {
+  if (envBusy) return;
+  // 先自己算一遍要装哪些，避免为了「拿 id 列表」多调一次 scanEnv。
+  // 只取 is-missing —— 过期项是 is-outdated，天然被排除在批量安装之外。
+  // 这是故意的：批量走的是 install，而重装会先卸载，两者破坏性不同，
+  // 不该由一个「一键」按钮替用户决定。
+  const cards = [...document.querySelectorAll(".env-card.is-missing")]
+    .map((card) => card.dataset.envCard)
+    .filter((id) => {
+      const button = document.querySelector(`[data-env-install="${id}"]`);
+      return Boolean(button);
+    });
+  if (!cards.length) {
+    showToast("success", "没有可自动安装的缺失项");
+    return;
+  }
+  setEnvBusy(true);
+  const chunks = [];
+  try {
+    for (const id of cards) {
+      // 逐个装而不是并发：winget 有全局安装锁，并发只会互相抢
+      const result = await invoke("installEnv", id);
+      if (result && result.detail) chunks.push(`### ${id}\n${result.detail}`);
+      if (result && result.env) renderEnv(result.env);
+    }
+    showEnvDetail("批量部署输出", chunks.join("\n\n"));
+    showToast("success", `已依次尝试部署 ${cards.length} 项`);
+  } catch (error) {
+    chunks.push(`### 失败\n${error.message || error}`);
+    showEnvDetail("批量部署中断", chunks.join("\n\n"));
+  } finally {
+    setEnvBusy(false);
+    refreshEnv();
+  }
+}
+
+/* ------------------------------------------------------------------
+   服务器管理页的标签切换
+   同一页里放 Linux（SSH 部署）与 Windows（RDP 会话治理）两套完全不同的东西：
+   前者是「往机器上装代理」，后者是「让机器别睡着」。硬凑成一张表反而乱，
+   所以用标签分开，但放在同一个「服务器管理」入口下 —— 它们本来就是一件事：
+   管手头的服务器。
+   ------------------------------------------------------------------ */
+let serverTab = "linux";
+
+function setServerTab(tab) {
+  if (tab !== "linux" && tab !== "windows" && tab !== "transfer") return;
+  if (serverTab === tab) return;
+  serverTab = tab;
+  document.querySelectorAll("[data-server-tab]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.serverTab === tab);
+  });
+  byId("server-tab-linux").classList.toggle("is-active", tab === "linux");
+  byId("server-tab-windows").classList.toggle("is-active", tab === "windows");
+  byId("server-tab-transfer").classList.toggle("is-active", tab === "transfer");
+  // 切过去才渲染那半边。Windows 那半要起 powercfg / reg 子进程，
+  // 不该在用户没看它的时候白跑一趟。
+  if (tab === "windows") {
+    renderWinServerList();
+    loadWinServerFixes();
+  } else if (tab === "transfer") {
+    // 服务器清单与另外两个标签共用同一份 appState，切过来重画一次即可
+    renderXferServers();
+  } else {
+    renderSshServers();
+  }
+}
+
+/* ------------------------------------------------------------------
+   服务器管理页 · Windows 标签
+   Linux 那边是「往机器上装代理」，Windows 那边是「让机器别睡着」——
+   两件事都用 SSH 连过去，Windows Server 2019+ 内置 OpenSSH，
+   所以客户端与凭据完全共用。
+
+   注意：字节格式化复用页面已有的 formatBytes，这里不重复定义。
+   ------------------------------------------------------------------ */
+let winSrvSelected = "";
+let winSrvMetrics = null;
+let winSrvPower = null;
+let winSrvFixes = [];
+let winSrvUsers = null;
+let winSrvLoading = false;
+
+function winServers() {
+  return (appState.sshServers || []).filter((server) => server.kind === "windows");
+}
+
+/** Linux 侧的服务器（走代理部署）。老配置没有 kind 字段，一律当 Linux。 */
+function linuxServers() {
+  return (appState.sshServers || []).filter((server) => server.kind !== "windows");
+}
+
+function renderWinServerList() {
+  const box = byId("winserver-list");
+  if (!box) return;
+  const servers = winServers();
+  if (!servers.length) {
+    box.innerHTML = `<div class="empty-state has-icon" style="--icon:url('./icons/server.svg')">
+      还没有 Windows 服务器。点「添加 Windows 服务器」填上 IP 与 SSH 账号即可<br>
+      <small>需要目标机开启 OpenSSH 服务器功能（Windows Server 2019+ 内置）</small>
+    </div>`;
+    return;
+  }
+  box.innerHTML = servers.map((server) => `
+    <button type="button" class="winserver-srv ${server.profileId === winSrvSelected ? "is-active" : ""}"
+      data-winsrv-pick="${escapeHtml(server.profileId)}">
+      <span class="winserver-srv-name">${escapeHtml(server.name)}</span>
+      <span class="winserver-srv-host">${escapeHtml(server.host)}:${server.port}</span>
+      <span class="winserver-srv-user">${escapeHtml(server.username)}</span>
+    </button>
+  `).join("");
+}
+
+async function selectWinServer(profileId) {
+  winSrvSelected = profileId;
+  winSrvMetrics = null;
+  winSrvPower = null;
+  winSrvUsers = null;
+  renderWinServerList();
+  updateWinSrvApplyButton();
+  await refreshWinServerMonitor();
+  // 保活清单按服务器类型（linux/windows）不同，要跟着换
+  await loadWinServerKeepAlive();
+}
+
+/// 拉取选中服务器的性能与电源设置。
+async function refreshWinServerMonitor() {
+  if (!winSrvSelected || winSrvLoading) return;
+  winSrvLoading = true;
+  const box = byId("winserver-monitor");
+  if (box) box.innerHTML = `<div class="winserver-item-reason">正在连接服务器采集状态…</div>`;
+  try {
+    // 两项并行拉，各自走一次 SSH。串行会等两倍时间。
+    const [metrics, power] = await Promise.all([
+      invoke("winSrvMetrics", winSrvSelected),
+      invoke("winSrvPowerSettings", winSrvSelected),
+    ]);
+    winSrvMetrics = metrics;
+    winSrvPower = power;
+    renderWinServerMonitor();
+  } catch (error) {
+    if (box) {
+      box.innerHTML = `<div class="winserver-item-reason">采集失败：${escapeHtml(error.message || error)}</div>`;
+    }
+  } finally {
+    winSrvLoading = false;
+  }
+}
+
+function renderWinServerMonitor() {
+  const box = byId("winserver-monitor");
+  if (!box || !winSrvMetrics) return;
+  const m = winSrvMetrics;
+  const p = winSrvPower || {};
+
+  const gauge = (label, percent, detail) => `
+    <div class="winserver-gauge">
+      <div class="winserver-gauge-head"><span>${label}</span><strong>${percent}%</strong></div>
+      <div class="winserver-gauge-track"><span style="width:${Math.max(0, Math.min(100, percent))}%"></span></div>
+      <div class="winserver-gauge-foot">${detail}</div>
+    </div>`;
+
+  box.innerHTML = `
+    <div class="winserver-monitor-head">
+      <div>
+        <div class="winserver-monitor-host">${escapeHtml(m.hostName || "未知主机")}</div>
+        <div class="winserver-monitor-os">${escapeHtml(m.os || "")} ${escapeHtml(m.osVersion || "")} · 已运行 ${escapeHtml(m.uptimeText || "—")} · ${m.cpuCores || 0} 核</div>
+      </div>
+      <button id="winserver-refresh-monitor" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span><span>刷新</span></button>
+    </div>
+    <div class="winserver-gauges">
+      ${gauge("CPU", m.cpuPercent || 0, `${m.cpuPercent || 0}% 平均负载`)}
+      ${gauge("内存", m.memoryPercent || 0, `${formatBytes(m.memoryUsedBytes)} / ${formatBytes(m.memoryTotalBytes)}`)}
+      ${gauge("系统盘", m.diskPercent || 0, `${formatBytes(m.diskUsedBytes)} / ${formatBytes(m.diskTotalBytes)}`)}
+    </div>
+    ${renderWinPowerItems(p)}
+  `;
+}
+
+/// 远端电源/RDP 配置的达标情况。
+function renderWinPowerItems(power) {
+  if (!power || (power.sleepSeconds === undefined && power.sleepSeconds !== 0)) return "";
+  const items = [
+    {
+      title: "在此时间后睡眠",
+      ok: power.sleepSeconds === 0,
+      value: power.sleepSeconds === 0 ? "从不" : `${Math.round(power.sleepSeconds / 60)} 分钟`,
+      reason: "RDP 断开后没人动鼠标，超时就进睡眠，远程直接断。",
+    },
+    {
+      title: "在此时间后关闭显示",
+      ok: power.videoSeconds === 0,
+      value: power.videoSeconds === 0 ? "从不" : `${Math.round(power.videoSeconds / 60)} 分钟`,
+      reason: "这就是「息屏」的来源，跟睡眠是两套设置。",
+    },
+    {
+      title: "休眠文件",
+      ok: !power.hibernateFilePresent,
+      value: power.hibernateFilePresent ? "已启用" : "已禁用",
+      reason: "开着时「关机」其实是休眠，重启远程也救不回来。",
+    },
+    {
+      title: "每用户单会话",
+      ok: !power.singleSessionPerUser,
+      value: power.singleSessionPerUser ? "开启" : "关闭",
+      reason: "开启时同名用户重连会踢掉上一个会话 —— 这就是「必须用子用户」的原因。",
+    },
+    {
+      title: "屏幕保护程序",
+      ok: !power.screenSaverActive,
+      value: power.screenSaverActive ? "已启用" : "已禁用",
+      reason: "屏保会遮住画面，让人误以为远程掉线了。",
+    },
+  ];
+  return `
+    <div class="winserver-power-list">
+      <div class="env-versions-title"><span class="icon" style="--icon:url('./icons/power.svg')"></span><span>断连后会怎样</span>
+        ${power.schemeName ? `<span class="env-versions-tag">电源计划 ${escapeHtml(power.schemeName)}</span>` : ""}
+      </div>
+      ${items.map((item) => `
+        <div class="winserver-item ${item.ok ? "is-ok" : "is-bad"}">
+          <span class="winserver-item-dot"></span>
+          <div class="winserver-item-main">
+            <div class="winserver-item-title">
+              ${escapeHtml(item.title)}
+              <span class="winserver-item-value">${escapeHtml(item.value)}</span>
+            </div>
+            <div class="winserver-item-reason">${escapeHtml(item.reason)}</div>
+          </div>
+        </div>
+      `).join("")}
+    </div>`;
+}
+
+function renderWinServerFixes() {
+  const box = byId("winserver-fixes");
+  if (!box) return;
+  if (!winSrvFixes.length) {
+    box.innerHTML = `<div class="winserver-item-reason">正在读取修复项…</div>`;
+    return;
+  }
+  // 用 div + 显式 label for/id 关联，**不用 <label> 包住整个条目**。
+  // <label> 作为 flex 容器时，Chromium 会给它内部的 div 算出 0 宽度
+  // （内容竖排、每字一行，item 高得离谱）—— 实测踩过，很难一眼看出来。
+  // 拆成 sibling 的 input + label 更稳。
+  box.innerHTML = winSrvFixes.map((fix) => `
+    <div class="winserver-fix has-checkbox">
+      <input type="checkbox" id="winsrv-fix-${escapeHtml(fix.id)}" value="${escapeHtml(fix.id)}"${fix.needAdmin ? ' title="需要管理员权限"' : ""}>
+      <div class="winserver-fix-main">
+        <label class="winserver-fix-title" for="winsrv-fix-${escapeHtml(fix.id)}">${escapeHtml(fix.title)}${fix.needAdmin ? ' <span class="winserver-item-tag">需管理员</span>' : ""}</label>
+        <div class="winserver-fix-reason">${escapeHtml(fix.reason)}</div>
+        <div class="winserver-fix-command">${escapeHtml(fix.script)}</div>
+      </div>
+    </div>
+  `).join("");
+  updateWinSrvApplyButton();
+}
+
+function renderWinServerUsers() {
+  const box = byId("winserver-user-list");
+  if (!box) return;
+  if (!winSrvUsers) {
+    box.innerHTML = `<div class="winserver-item-reason">点「刷新用户列表」读取远端用户</div>`;
+    return;
+  }
+  const users = Array.isArray(winSrvUsers.users) ? winSrvUsers.users : [];
+  if (!users.length) {
+    box.innerHTML = `<div class="winserver-item-reason">远端没有读到用户</div>`;
+    return;
+  }
+  box.innerHTML = users.map((user) => `
+    <span class="winserver-user-chip ${user.rdpMember ? "is-rdp" : ""}"
+      title="${user.rdpMember ? "在「远程桌面用户」组里，可以远程登录" : "不在该组里，远程桌面登录会被拒绝"}">${escapeHtml(user.name)}${user.rdpMember ? " ·可远程" : ""}</span>
+  `).join("");
+}
+
+async function loadWinServerFixes() {
+  if (winSrvFixes.length) {
+    renderWinServerFixes();
+    return;
+  }
+  try {
+    winSrvFixes = (await invoke("winSrvFixes")) || [];
+  } catch (_error) {
+    winSrvFixes = [];
+  }
+  renderWinServerFixes();
+}
+
+async function refreshWinServerUsers() {
+  if (!winSrvSelected) {
+    showToast("error", "先选一台服务器");
+    return;
+  }
+  const box = byId("winserver-user-list");
+  if (box) box.innerHTML = `<div class="winserver-item-reason">正在读取远端用户…</div>`;
+  try {
+    winSrvUsers = await invoke("winSrvUsers", winSrvSelected);
+    renderWinServerUsers();
+  } catch (error) {
+    if (box) {
+      box.innerHTML = `<div class="winserver-item-reason">读取失败：${escapeHtml(error.message || error)}</div>`;
+    }
+  }
+}
+
+function updateWinSrvApplyButton() {
+  const button = byId("winserver-apply-selected");
+  if (!button) return;
+  const count = document.querySelectorAll("#winserver-fixes input[type=checkbox]:checked").length;
+  button.disabled = !count || !winSrvSelected;
+  button.textContent = count ? `在远端执行 ${count} 项` : "在远端执行";
+}
+
+async function applyWinServerFixes() {
+  if (!winSrvSelected) {
+    showToast("error", "先选一台服务器");
+    return;
+  }
+  const ids = [...document.querySelectorAll("#winserver-fixes input[type=checkbox]:checked")]
+    .map((input) => input.value);
+  if (!ids.length) {
+    showToast("error", "先勾选要执行的修复项");
+    return;
+  }
+  const chunks = [];
+  for (const id of ids) {
+    try {
+      const result = await invoke("winSrvRunFix", winSrvSelected, id);
+      chunks.push(`### ${id}\n${result?.detail || "已执行"}`);
+    } catch (error) {
+      chunks.push(`### ${id} —— 失败\n${error.message || error}`);
+    }
+  }
+  const body = byId("winserver-detail-body");
+  if (body) body.textContent = chunks.join("\n\n");
+  const panel = byId("winserver-detail");
+  if (panel) {
+    panel.hidden = false;
+    panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+  // 执行完重采一次，让达标状态立刻更新
+  await refreshWinServerMonitor();
+}
+
+async function createWinServerUser() {
+  if (!winSrvSelected) {
+    showToast("error", "先选一台服务器");
+    return;
+  }
+  const name = byId("winserver-username").value.trim();
+  const password = byId("winserver-password").value;
+  const admin = byId("winserver-admin").checked;
+  if (!name) {
+    showToast("error", "先填用户名");
+    return;
+  }
+  try {
+    const result = await invoke("winSrvCreateUser", winSrvSelected, name, password, admin);
+    const body = byId("winserver-command-body");
+    if (body) body.textContent = result.detail;
+    const panel = byId("winserver-command");
+    if (panel) panel.hidden = false;
+    byId("winserver-password").value = "";
+    await refreshWinServerUsers();
+  } catch (error) {
+    showToast("error", error.message || "创建失败");
+  }
+}
+
+async function copyWinServerCommand() {
+  const text = byId("winserver-command-body").textContent;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      // WebView2 在非安全上下文里可能不给 clipboard API，退回老办法
+      const area = document.createElement("textarea");
+      area.value = text;
+      document.body.append(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }
+    showToast("success", "已复制");
+  } catch (_error) {
+    showToast("error", "复制失败，请手动选中复制");
+  }
+}
+
+async function openWinServerRdpForSelected() {
+  if (!winSrvSelected) {
+    showToast("error", "先选一台服务器");
+    return;
+  }
+  const server = winServers().find((item) => item.profileId === winSrvSelected);
+  if (!server) return;
+  invoke("winServerOpenRdp", server.host);
+}
+
+/** 添加 / 编辑 Windows 服务器。字段比 Linux 少 —— 不需要代理端口。 */
+function openWinServerDialog(server = null) {
+  const authMethod = server?.authMethod || "password";
+  const hasSavedCredential = Boolean(server?.hasCredential);
+  openModal(server ? "编辑 Windows 服务器" : "添加 Windows 服务器", `
+    <div class="form-grid ssh-form-grid">
+      <label class="wide-field"><span>名称</span><input id="modal-winsrv-name" value="${escapeHtml(server?.name || "我的 Windows 服务器")}" required></label>
+      <label><span>服务器 IP / 域名</span><input id="modal-winsrv-host" value="${escapeHtml(server?.host || "")}" placeholder="例如 192.168.1.10" required></label>
+      <label><span>SSH 端口</span><input id="modal-winsrv-port" type="number" min="1" max="65535" value="${server?.port || 22}" required></label>
+      <label><span>用户名</span><input id="modal-winsrv-username" value="${escapeHtml(server?.username || "Administrator")}" required></label>
+      <label><span>认证方式</span><select id="modal-winsrv-auth"><option value="password"${authMethod === "password" ? " selected" : ""}>账号密码</option><option value="key"${authMethod === "key" ? " selected" : ""}>私钥文件</option><option value="agent"${authMethod === "agent" ? " selected" : ""}>SSH Agent</option></select></label>
+      <label id="modal-winsrv-secret-field"><span>密码 / 私钥口令</span><input id="modal-winsrv-password" type="password" autocomplete="new-password" placeholder="${server?.hasCredential ? "已安全保存，留空保持不变" : "连接凭据"}"></label>
+      <label id="modal-winsrv-key-field" class="wide-field"><span>私钥路径</span><div class="input-action"><input id="modal-winsrv-key-path" value="${escapeHtml(server?.keyPath || "")}" placeholder="选择 OpenSSH 私钥"><button id="modal-pick-winsrv-key" type="button" class="icon-button" title="选择私钥" aria-label="选择私钥">${icon("folder-open")}</button></div></label>
+      <label class="switch-row wide-field"><span><strong>记住凭据</strong><small>${hasSavedCredential ? "已保存密码；留空即保持不变" : "Windows 下使用当前用户 DPAPI 加密"}</small></span><input id="modal-winsrv-remember" type="checkbox"${hasSavedCredential ? " checked" : ""}><i></i></label>
+      <div class="group-dialog-summary wide-field"><strong>怎么连</strong><span>通过 SSH（OpenSSH）连到目标机执行命令。<strong>Windows Server 2019 及以后内置 OpenSSH 服务器</strong>，在「设置 → 应用 → 可选功能」里装上即可；工作组机器也能用，不需要配证书。</span></div>
+    </div>`, [
+    { label: "取消", kind: "secondary", action: closeModal },
+    { label: "保存", kind: "primary", action: () => {
+      const payload = {
+        profileId: server?.profileId || "",
+        name: byId("modal-winsrv-name").value,
+        region: "",
+        host: byId("modal-winsrv-host").value,
+        port: Number(byId("modal-winsrv-port").value),
+        username: byId("modal-winsrv-username").value,
+        proxyPort: 0,
+        authMethod: byId("modal-winsrv-auth").value,
+        keyPath: byId("modal-winsrv-key-path").value,
+        rememberPassword: byId("modal-winsrv-remember").checked,
+        kind: "windows",
+      };
+      invoke("saveSshServer", JSON.stringify(payload), byId("modal-winsrv-password").value);
+      closeModal();
+    } },
+  ]);
+  const updateAuthFields = () => {
+    const method = byId("modal-winsrv-auth").value;
+    byId("modal-winsrv-key-field").classList.toggle("is-hidden", method !== "key");
+    byId("modal-winsrv-secret-field").classList.toggle("is-hidden", method === "agent");
+    byId("modal-winsrv-remember").disabled = method === "agent";
+  };
+  byId("modal-winsrv-auth").addEventListener("change", updateAuthFields);
+  byId("modal-winsrv-password").addEventListener("input", (event) => {
+    if (event.target.value) byId("modal-winsrv-remember").checked = true;
+  });
+  byId("modal-pick-winsrv-key").addEventListener("click", async () => {
+    const path = await invoke("pickSshKey");
+    if (path) byId("modal-winsrv-key-path").value = path;
+  });
+  updateAuthFields();
+}
+
+/* ------------------------------------------------------------------
+   远程截图 + 断开后保持运行
+   ------------------------------------------------------------------ */
+let winSrvShot = null;
+let winSrvKeepAlive = [];
+let winSrvKeepAliveStatus = null;
+let winSrvKeepAliveHardware = [];
+let winSrvShotBusy = false;
+
+async function captureWinServerScreen() {
+  if (!winSrvSelected) {
+    showToast("error", "先选一台服务器");
+    return;
+  }
+  if (winSrvShotBusy) return;
+  winSrvShotBusy = true;
+  const box = byId("winserver-shot-box");
+  const info = byId("winserver-shot-info");
+  const button = byId("winserver-shot");
+  button.disabled = true;
+  box.innerHTML = `<div class="winserver-item-reason">正在抓取屏幕…`;
+  info.textContent = "抓取中…";
+  try {
+    const result = await invoke("serverScreenshot", winSrvSelected);
+    winSrvShot = result;
+    renderWinServerShot(result);
+  } catch (error) {
+    box.innerHTML = `<div class="winserver-item-reason">抓取失败：${escapeHtml(error.message || error)}</div>`;
+    info.textContent = "抓取失败";
+  } finally {
+    winSrvShotBusy = false;
+    button.disabled = false;
+  }
+}
+
+function renderWinServerShot(result) {
+  const box = byId("winserver-shot-box");
+  const info = byId("winserver-shot-info");
+  if (!result || !result.data) {
+    box.innerHTML = `<div class="winserver-item-reason">没有拿到图片</div>`;
+    return;
+  }
+  info.textContent = `${result.width}×${result.height} · ${result.method} · ${Math.round((result.sizeBytes || 0) / 1024)} KB`;
+  // data URI 直接进 img 的 src。图片已经在后端压到 1280 宽以内，
+  // base64 后也就百来 KB，一次带过来比再设计一套图片下载接口简单。
+  box.innerHTML = `
+    <div class="winserver-shot-frame">
+      <img src="${result.data}" alt="服务器屏幕画面" class="winserver-shot-img">
+    </div>
+    <div class="winserver-shot-foot">
+      <span>${escapeHtml(result.method || "")}</span>
+      <button type="button" class="text-button" data-shot-download>下载原图</button>
+    </div>`;
+}
+
+function downloadWinServerShot() {
+  if (!winSrvShot || !winSrvShot.data) return;
+  // data URI → blob → 触发下载
+  const link = document.createElement("a");
+  link.href = winSrvShot.data;
+  link.download = `server-screen-${Date.now()}.png`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
+/** 加载保活清单与当前状态。 */
+async function loadWinServerKeepAlive() {
+  if (!winSrvSelected) return;
+  const kind = currentWinSrvKind();
+  try {
+    const list = await invoke("keepAliveList", kind);
+    winSrvKeepAlive = Array.isArray(list?.items) ? list.items : [];
+    winSrvKeepAliveHardware = Array.isArray(list?.hardware) ? list.hardware : [];
+    renderWinServerKeepAliveList(winSrvKeepAliveHardware);
+    await refreshWinServerKeepAliveStatus();
+  } catch (error) {
+    byId("winserver-keepalive-list").innerHTML =
+      `<div class="winserver-item-reason">读取失败：${escapeHtml(error.message || error)}</div>`;
+  }
+}
+
+/** 当前选中服务器的类型（linux / windows）。 */
+function currentWinSrvKind() {
+  const server = winServers().find((item) => item.profileId === winSrvSelected);
+  return server && server.kind === "windows" ? "windows" : "linux";
+}
+
+async function refreshWinServerKeepAliveStatus() {
+  if (!winSrvSelected) return;
+  const box = byId("winserver-keepalive-items");
+  try {
+    const status = await invoke("keepAliveStatus", winSrvSelected);
+    winSrvKeepAliveStatus = status;
+    // 状态到位后重画清单，条目上的「已达标/未达标」徽章才会出现
+    // （清单是先渲染的，那时还没有状态）
+    renderWinServerKeepAliveList(winSrvKeepAliveHardware || []);
+    const items = Array.isArray(status?.items) ? status.items : [];
+    if (!items.length) {
+      box.innerHTML = `<div class="winserver-item-reason">没有可检查的项</div>`;
+      return;
+    }
+    box.innerHTML = items.map((item) => `
+      <div class="winserver-item ${item.ok ? "is-ok" : "is-bad"}">
+        <span class="winserver-item-dot"></span>
+        <div class="winserver-item-main">
+          <div class="winserver-item-title">
+            ${escapeHtml(titleOfKeepAlive(item.id))}
+            <span class="winserver-item-value">${escapeHtml(item.value || "")}</span>
+          </div>
+        </div>
+      </div>
+    `).join("");
+  } catch (error) {
+    box.innerHTML = `<div class="winserver-item-reason">检查失败：${escapeHtml(error.message || error)}</div>`;
+  }
+}
+
+/** 从保活清单里取标题（状态检查只返回 id 与值）。 */
+function titleOfKeepAlive(id) {
+  const found = winSrvKeepAlive.find((item) => item.id === id);
+  return found ? found.title : id;
+}
+
+function renderWinServerKeepAliveList(hardware) {
+  const box = byId("winserver-keepalive-list");
+  if (!winSrvKeepAlive.length) {
+    box.innerHTML = `<div class="winserver-item-reason">正在读取…</div>`;
+  } else {
+    box.innerHTML = winSrvKeepAlive.map((item) => {
+      const status = (winSrvKeepAliveStatus?.items || []).find((s) => s.id === item.id);
+      const done = status ? status.ok : null;
+      return `
+        <div class="winserver-fix has-action">
+          <div class="winserver-fix-main">
+            <div class="winserver-fix-title">
+              ${escapeHtml(item.title)}
+              ${item.needAdmin ? ' <span class="winserver-item-tag">需管理员</span>' : ""}
+              ${done === true ? ' <span class="winserver-keepalive-ok">已达标</span>'
+                : done === false ? ' <span class="winserver-keepalive-bad">未达标</span>' : ""}
+            </div>
+            <div class="winserver-fix-reason">${escapeHtml(item.reason)}</div>
+            <div class="winserver-fix-command">${escapeHtml(item.script)}</div>
+          </div>
+          <button type="button" class="button secondary" data-keepalive-apply="${escapeHtml(item.id)}">${icon("play")}<span>执行</span></button>
+        </div>`;
+    }).join("");
+  }
+  const hw = byId("winserver-hardware");
+  const list = Array.isArray(hardware) ? hardware : [];
+  hw.innerHTML = list.length
+    ? list.map((item) => `
+        <div class="winserver-hardware-item">
+          <div class="winserver-hardware-title">${escapeHtml(item.title)}</div>
+          <div class="winserver-hardware-why">${escapeHtml(item.why)}</div>
+          <div class="winserver-hardware-where"><strong>去哪儿配：</strong>${escapeHtml(item.where)}</div>
+        </div>`).join("")
+    : `<div class="winserver-item-reason">没有硬件层条目</div>`;
+}
+
+async function applyWinServerKeepAlive(id) {
+  if (!winSrvSelected) {
+    showToast("error", "先选一台服务器");
+    return;
+  }
+  try {
+    const result = await invoke("keepAliveApply", winSrvSelected, id);
+    const body = byId("winserver-detail-body");
+    if (body) body.textContent = result?.detail || "已执行";
+    const panel = byId("winserver-detail");
+    if (panel) {
+      panel.hidden = false;
+      panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+    // 状态立刻重查，达标标记当场更新
+    await refreshWinServerKeepAliveStatus();
+  } catch (error) {
+    showToast("error", error.message || "执行失败");
+  }
+}
+
+/* ------------------------------------------------------------------
+   服务器管理页 · 文件快传
+
+   复用的是「本机 ⇄ 远端」那条 SSH 连接。后端实现是逐文件 + 分块 base64
+   （手写的 SSH 客户端只有 exec 通道，没有 SFTP），所以：
+   - 断在中途不会有"半个文件"—— 每个文件重传时第一块是 `>` 截断；
+   - 增量与镜像是**按文件**比对（大小 + 修改时间），不是整包哈希；
+   - 目录会递归，空目录不保留（没有文件的目录没有传输意义）。
+
+   镜像会删东西，所以按钮做成了「点两次」的两段式确认 ——
+   不依赖 window.confirm（wry 里对 script dialog 的支持不保证）。
+   ------------------------------------------------------------------ */
+let xferMode = "upload";
+/** 勾选的服务器，**保持点击顺序** —— 服务器互传要靠顺序区分源和目标。 */
+let xferPicked = [];
+let xferBusy = false;
+let xferBrowsePath = "";
+let xferMirrorArmed = false;
+
+function xferServers() {
+  return (appState?.sshServers || []).map((server) => ({
+    profileId: server.profileId,
+    name: server.name || server.host,
+    host: server.host,
+    port: server.port,
+    kind: server.kind === "windows" ? "windows" : "linux",
+  }));
+}
+
+function xferServerById(profileId) {
+  return xferServers().find((server) => server.profileId === profileId) || null;
+}
+
+function renderXferServers() {
+  const box = byId("xfer-server-list");
+  if (!box) return;
+  const servers = xferServers();
+  if (!servers.length) {
+    box.innerHTML = `<div class="winserver-item-reason">还没有服务器。先去「Linux 服务器」或「Windows 服务器」加一台。</div>`;
+    updateXferHint();
+    return;
+  }
+  box.innerHTML = servers.map((server, index) => {
+    const order = xferPicked.indexOf(server.profileId);
+    const picked = order >= 0;
+    return `
+      <button type="button" class="xfer-server ${picked ? "is-picked" : ""}" data-xfer-pick="${escapeHtml(server.profileId)}">
+        <span class="xfer-server-box">${picked ? order + 1 : ""}</span>
+        <span class="xfer-server-main">
+          <span class="xfer-server-name">${escapeHtml(server.name)}</span>
+          <span class="xfer-server-host">${escapeHtml(server.host)}:${server.port}</span>
+        </span>
+        <span class="xfer-server-kind">${server.kind === "windows" ? "Win" : "Linux"}</span>
+      </button>`;
+  }).join("");
+  updateXferHint();
+}
+
+function toggleXferPick(profileId) {
+  const index = xferPicked.indexOf(profileId);
+  if (index >= 0) xferPicked.splice(index, 1);
+  else xferPicked.push(profileId);
+  // 换服务器等于换了目标机，之前浏览出来的目录清单不再对得上
+  xferBrowsePath = "";
+  byId("xfer-browse-box").innerHTML = "";
+  renderXferServers();
+  armXferMirror(false);
+}
+
+function updateXferHint() {
+  const hint = byId("xfer-hint");
+  const start = byId("xfer-start");
+  if (!hint || !start) return;
+  const count = xferPicked.length;
+  let text = "";
+  if (xferMode === "move") {
+    text = count === 2
+      ? `${xferServerById(xferPicked[0])?.name || "源"} → ${xferServerById(xferPicked[1])?.name || "目标"}`
+      : `勾两台（现在是 ${count} 台）：先源后目标`;
+  } else if (count === 0) {
+    text = "先在左边勾一台服务器";
+  } else if (count === 1) {
+    text = xferServerById(xferPicked[0])?.name || "";
+  } else {
+    text = `已勾 ${count} 台，会依次推过去（后端一批 4 台）`;
+  }
+  hint.textContent = text;
+  const label = start.querySelector("span:last-child");
+  if (label) {
+    label.textContent = xferMirrorArmed
+      ? "再点一次：确认删除"
+      : xferMode === "move" ? "开始中转" : xferMode === "download" ? "下载到本机" : count > 1 ? `推送到 ${count} 台` : "开始传输";
+  }
+  start.classList.toggle("is-danger", xferMirrorArmed);
+}
+
+function setXferMode(mode) {
+  if (!["upload", "download", "move"].includes(mode)) return;
+  xferMode = mode;
+  document.querySelectorAll("[data-xfer-mode]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.xferMode === mode);
+  });
+  const local = byId("xfer-local");
+  const remote = byId("xfer-remote");
+  if (mode === "upload") {
+    local.placeholder = "C:\\Users\\me\\build";
+    remote.placeholder = "/var/www/site";
+  } else if (mode === "download") {
+    local.placeholder = "D:\\backup\\site";
+    remote.placeholder = "/var/www/site";
+  } else {
+    local.placeholder = "（服务器之间不需要本机路径）";
+    remote.placeholder = "/var/www/site";
+  }
+  local.disabled = mode === "move";
+  byId("xfer-pick-file").disabled = mode === "move";
+  byId("xfer-pick-dir").disabled = mode === "move";
+  armXferMirror(false);
+  updateXferHint();
+}
+
+/** 镜像的两段式确认：勾上之后第一次点只是「上膛」，第二次才真的动手。 */
+function armXferMirror(armed) {
+  xferMirrorArmed = armed;
+  updateXferHint();
+}
+
+async function pickXferLocal(selectDirectory) {
+  try {
+    const picked = await invoke("fileTransferPickLocal", selectDirectory);
+    if (picked) {
+      byId("xfer-local").value = picked;
+      armXferMirror(false);
+    }
+  } catch (error) {
+    showToast("error", error.message || "选择失败");
+  }
+}
+
+function joinRemotePath(base, name) {
+  const trimmed = String(base || "").replace(/[\\/]+$/, "");
+  if (!trimmed) return name;
+  return `${trimmed}/${name}`;
+}
+
+async function browseXferRemote(path) {
+  if (!xferPicked.length) {
+    showToast("error", "先在左边勾一台服务器");
+    return;
+  }
+  const box = byId("xfer-browse-box");
+  const target = xferPicked[0];
+  const wanted = path || byId("xfer-remote").value.trim() || (xferServerById(target)?.kind === "windows" ? "C:/" : "/");
+  box.innerHTML = `<div class="winserver-item-reason">正在列目录…</div>`;
+  try {
+    const result = await invoke("fileTransferBrowse", target, wanted);
+    xferBrowsePath = result.path || wanted;
+    byId("xfer-remote").value = xferBrowsePath;
+    armXferMirror(false);
+    renderXferBrowse(result);
+  } catch (error) {
+    box.innerHTML = `<div class="winserver-item-reason">列目录失败：${escapeHtml(error.message || error)}</div>`;
+  }
+}
+
+function renderXferBrowse(result) {
+  const box = byId("xfer-browse-box");
+  const entries = Array.isArray(result?.entries) ? result.entries : [];
+  const parent = result?.parent || "";
+  const rows = [];
+  if (parent) {
+    rows.push(`<button type="button" class="xfer-entry is-dir" data-xfer-enter="${escapeHtml(parent)}">
+      <span class="xfer-entry-icon">${icon("arrow-up")}</span><span class="xfer-entry-name">..</span></button>`);
+  }
+  for (const entry of entries) {
+    const name = entry.name || "";
+    const isDir = entry.kind === "dir";
+    const meta = isDir ? "目录" : formatBytes(entry.size || 0);
+    const attr = isDir
+      ? `data-xfer-enter="${escapeHtml(joinRemotePath(xferBrowsePath, name))}"`
+      : `data-xfer-file="${escapeHtml(joinRemotePath(xferBrowsePath, name))}"`;
+    rows.push(`<button type="button" class="xfer-entry ${isDir ? "is-dir" : ""}" ${attr}>
+      <span class="xfer-entry-icon">${icon(isDir ? "folder-open" : "file-text")}</span>
+      <span class="xfer-entry-name">${escapeHtml(name)}</span>
+      <span class="xfer-entry-meta">${escapeHtml(meta)}</span></button>`);
+  }
+  box.innerHTML = `
+    <div class="xfer-browse-head">
+      <span>${escapeHtml(result?.path || xferBrowsePath)}</span>
+      <span>${entries.length} 项</span>
+    </div>
+    <div class="xfer-browse-list">${rows.join("") || `<div class="winserver-item-reason">空目录</div>`}</div>`;
+}
+
+async function startXfer() {
+  if (xferBusy) return;
+  const local = byId("xfer-local").value.trim();
+  const remote = byId("xfer-remote").value.trim();
+  const sync = byId("xfer-sync").checked;
+  const mirror = byId("xfer-mirror").checked;
+
+  if (!xferPicked.length) {
+    showToast("error", "先在左边勾一台服务器");
+    return;
+  }
+  if (xferMode === "move" && xferPicked.length !== 2) {
+    showToast("error", "服务器之间要正好勾两台：先源后目标");
+    return;
+  }
+  if (xferMode !== "move" && !local) {
+    showToast("error", "先填本机路径");
+    return;
+  }
+  if (!remote) {
+    showToast("error", "先填远端路径");
+    return;
+  }
+  if (mirror && !xferMirrorArmed) {
+    armXferMirror(true);
+    showToast("info", "镜像会删掉目标端多出来的文件，再点一次才动手");
+    return;
+  }
+
+  xferBusy = true;
+  const start = byId("xfer-start");
+  start.disabled = true;
+  byId("xfer-result").innerHTML = `<div class="winserver-item-reason">正在传输…大目录可能要等一会儿，别关窗口</div>`;
+  try {
+    if (xferMode === "upload" && xferPicked.length > 1) {
+      const result = await invoke("fileTransferPushMany", xferPicked, local, remote, sync, mirror);
+      renderXferMulti(result);
+    } else if (xferMode === "upload") {
+      const stats = await invoke("fileTransferUpload", xferPicked[0], local, remote, sync, mirror);
+      renderXferStats(`${xferServerById(xferPicked[0])?.name || "服务器"} · 已上传`, stats);
+    } else if (xferMode === "download") {
+      const stats = await invoke("fileTransferDownload", xferPicked[0], remote, local, sync, mirror);
+      renderXferStats(`${xferServerById(xferPicked[0])?.name || "服务器"} · 已下载`, stats);
+    } else {
+      const stats = await invoke("fileTransferMove", xferPicked[0], xferPicked[1], remote, mirror);
+      renderXferStats(`${xferServerById(xferPicked[0])?.name || "源"} → ${xferServerById(xferPicked[1])?.name || "目标"}`, stats);
+    }
+  } catch (error) {
+    byId("xfer-result").innerHTML = `<div class="winserver-item-reason">传输失败：${escapeHtml(error.message || error)}</div>`;
+    showToast("error", error.message || "传输失败");
+  } finally {
+    xferBusy = false;
+    start.disabled = false;
+    armXferMirror(false);
+  }
+}
+
+function renderXferStats(title, stats) {
+  const notes = Array.isArray(stats?.notes) ? stats.notes : [];
+  const bits = [`${stats?.files || 0} 个文件`, formatBytes(stats?.bytes || 0)];
+  if (stats?.skipped) bits.push(`跳过 ${stats.skipped}`);
+  if (stats?.removed) bits.push(`删除 ${stats.removed}`);
+  byId("xfer-result").innerHTML = `
+    <div class="xfer-stat-head">
+      <strong>${escapeHtml(title)}</strong>
+      <span>${escapeHtml(bits.join(" · "))}</span>
+    </div>
+    <div class="xfer-notes">${notes
+      .map((note) => `<div class="xfer-note">${escapeHtml(note)}</div>`)
+      .join("") || `<div class="winserver-item-reason">没有可展示的明细</div>`}</div>`;
+}
+
+function renderXferMulti(result) {
+  const rows = Array.isArray(result?.results) ? result.results : [];
+  byId("xfer-result").innerHTML = `
+    <div class="xfer-stat-head">
+      <strong>批量推送</strong>
+      <span>${result?.succeeded || 0} 台成功 · ${result?.failed || 0} 台失败</span>
+    </div>
+    <div class="xfer-notes">${rows
+      .map((row) => `<div class="xfer-note ${row.ok ? "is-ok" : "is-bad"}">
+        <span>${row.ok ? "✓" : "✕"}</span>
+        <strong>${escapeHtml(row.name || row.profileId || "未知")}</strong>
+        <span>${escapeHtml(row.detail || "")}</span>
+      </div>`)
+      .join("")}</div>`;
+}
+
+function closeCustomSelects(except = null) {  document.querySelectorAll(".custom-select.is-open").forEach((root) => {
     if (root === except) return;
     root.classList.remove("is-open");
     root.classList.remove("opens-up");
@@ -1817,7 +3073,7 @@ function bindEvents() {
   byId("add-ssh-server").addEventListener("click", () => openSshServerDialog());
   byId("ssh-select-all").addEventListener("change", (event) => {
     sshSelection.clear();
-    if (event.target.checked) (appState.sshServers || []).forEach((server) => sshSelection.add(server.profileId));
+    if (event.target.checked) linuxServers().forEach((server) => sshSelection.add(server.profileId));
     renderSshSelectionOnly();
   });
   byId("ssh-server-body").addEventListener("change", (event) => {
@@ -1942,6 +3198,133 @@ function bindEvents() {
   });
   byId("clear-logs").addEventListener("click", () => { invoke("clearLogs"); refreshLogs(); });
   byId("open-logs").addEventListener("click", () => invoke("openLogs"));
+
+  // 环境管理页
+  byId("env-refresh").addEventListener("click", () => refreshEnv());
+  byId("env-install-all").addEventListener("click", () => installAllEnv());
+  byId("env-detail-close").addEventListener("click", () => { byId("env-detail").hidden = true; });
+  // 卡片里的按钮是渲染出来的，用事件委托绑一次就够，不用每张卡重绑
+  byId("env-grid").addEventListener("click", (event) => {
+    // 顺序有讲究：版本相关的先判，因为它们也带 data-env-* 前缀
+    const nvmUse = event.target.closest("[data-nvm-use]");
+    if (nvmUse) {
+      runNvmAction("nvmUseVersion", nvmUse.dataset.nvmUse, "切换版本");
+      return;
+    }
+    const nvmInstall = event.target.closest("[data-nvm-install]");
+    if (nvmInstall) {
+      const picker = byId("env-nvm-pick");
+      if (!picker || !picker.value) {
+        showToast("error", "先选一个要安装的版本");
+        return;
+      }
+      runNvmAction("nvmInstallVersion", picker.value, "安装版本");
+      return;
+    }
+    const installVersion = event.target.closest("[data-env-install-version]");
+    if (installVersion) {
+      const id = installVersion.dataset.envInstallVersion;
+      const picker = document.querySelector(`[data-env-version-pick="${id}"]`);
+      const version = picker ? picker.value : "";
+      if (!version) {
+        showToast("error", "先选一个要安装的版本");
+        return;
+      }
+      // 破坏性操作要确认一次：装指定版本会先卸载现在的
+      const card = document.querySelector(`.env-card[data-env-card="${id}"] .env-card-version`);
+      const current = card ? card.textContent.trim() : "当前版本";
+      if (!window.confirm(
+        `${id} 目前是 ${current}。\n` +
+        `安装 ${version} 会先卸载现有版本（不能多版本并存）。\n\n继续吗？`
+      )) return;
+      runEnvAction(id, "installEnv", "安装", version);
+      return;
+    }
+    const queryVersions = event.target.closest("[data-env-query-versions]");
+    if (queryVersions) {
+      queryEnvVersions(queryVersions.dataset.envQueryVersions);
+      return;
+    }
+    const reinstall = event.target.closest("[data-env-reinstall]");
+    if (reinstall) {
+      reinstallEnv(reinstall.dataset.envReinstall);
+      return;
+    }
+    const install = event.target.closest("[data-env-install]");
+    if (install) {
+      installEnv(install.dataset.envInstall);
+      return;
+    }
+    const open = event.target.closest("[data-env-open]");
+    if (open) invoke("openEnvDownload", open.dataset.envOpen);
+  });
+
+  // 服务器管理页的标签切换
+  document.querySelectorAll("[data-server-tab]").forEach((button) => {
+    button.addEventListener("click", () => setServerTab(button.dataset.serverTab));
+  });
+
+  // Windows 服务器管理（远程，SSH）
+  byId("winserver-add").addEventListener("click", () => openWinServerDialog());
+  byId("winserver-connect").addEventListener("click", () => openWinServerRdpForSelected());
+  byId("winserver-refresh-all").addEventListener("click", () => refreshWinServerMonitor());
+  byId("winserver-list").addEventListener("click", (event) => {
+    const pick = event.target.closest("[data-winsrv-pick]");
+    if (pick) selectWinServer(pick.dataset.winsrvPick);
+  });
+  byId("winserver-fixes").addEventListener("change", updateWinSrvApplyButton);
+  byId("winserver-apply-selected").addEventListener("click", () => applyWinServerFixes());
+  byId("winserver-detail-close").addEventListener("click", () => { byId("winserver-detail").hidden = true; });
+  byId("winserver-create-user").addEventListener("click", () => createWinServerUser());
+  byId("winserver-copy-command").addEventListener("click", () => copyWinServerCommand());
+  byId("winserver-refresh-users").addEventListener("click", () => refreshWinServerUsers());
+  byId("winserver-monitor").addEventListener("click", (event) => {
+    if (event.target.closest("#winserver-refresh-monitor")) refreshWinServerMonitor();
+  });
+  // 远程截图与「断开后保持运行」
+  byId("winserver-shot").addEventListener("click", () => captureWinServerScreen());
+  byId("winserver-keepalive-refresh").addEventListener("click", () => refreshWinServerKeepAliveStatus());
+  byId("winserver-shot-box").addEventListener("click", (event) => {
+    if (event.target.closest("[data-shot-download]")) downloadWinServerShot();
+  });
+  byId("winserver-keepalive-list").addEventListener("click", (event) => {
+    const apply = event.target.closest("[data-keepalive-apply]");
+    if (apply) applyWinServerKeepAlive(apply.dataset.keepaliveApply);
+  });
+
+  // 文件快传
+  byId("xfer-server-list").addEventListener("click", (event) => {
+    const pick = event.target.closest("[data-xfer-pick]");
+    if (pick) toggleXferPick(pick.dataset.xferPick);
+  });
+  document.querySelectorAll("[data-xfer-mode]").forEach((button) => {
+    button.addEventListener("click", () => setXferMode(button.dataset.xferMode));
+  });
+  byId("xfer-pick-file").addEventListener("click", () => pickXferLocal(false));
+  byId("xfer-pick-dir").addEventListener("click", () => pickXferLocal(true));
+  byId("xfer-browse").addEventListener("click", () => browseXferRemote());
+  byId("xfer-browse-up").addEventListener("click", () => {
+    const current = byId("xfer-remote").value.trim() || xferBrowsePath;
+    const parent = current.replace(/[\\/]+$/, "").replace(/[\\/][^\\/]*$/, "");
+    browseXferRemote(parent || (xferServerById(xferPicked[0])?.kind === "windows" ? "C:/" : "/"));
+  });
+  byId("xfer-browse-box").addEventListener("click", (event) => {
+    const enter = event.target.closest("[data-xfer-enter]");
+    if (enter) {
+      browseXferRemote(enter.dataset.xferEnter);
+      return;
+    }
+    const file = event.target.closest("[data-xfer-file]");
+    if (file) {
+      byId("xfer-remote").value = file.dataset.xferFile;
+      armXferMirror(false);
+    }
+  });
+  byId("xfer-start").addEventListener("click", () => startXfer());
+  // 改路径 / 改镜像勾选都要把「已上膛」的状态收回去，否则下一次点击会直接删东西
+  byId("xfer-local").addEventListener("input", () => armXferMirror(false));
+  byId("xfer-remote").addEventListener("input", () => armXferMirror(false));
+  byId("xfer-mirror").addEventListener("change", () => armXferMirror(false));
   byId("modal-close").addEventListener("click", closeModal);
   byId("app-modal").addEventListener("click", (event) => {
     if (event.target === byId("app-modal")) closeModal();

@@ -937,7 +937,23 @@ impl Client {
         Ok((local, remote))
     }
 
+    /// 执行一次远端命令，`stdin` 一次性送出（SSH 的 exec 通道不支持流式喂）。
     pub async fn exec(&mut self, command: &str, stdin: &[u8]) -> ReadResult<ExecResult> {
+        self.exec_with_deadline(command, stdin, self.timeout).await
+    }
+
+    /// 与 [`Client::exec`] 相同，但本次调用单独用一个 deadline。
+    ///
+    /// 为什么要单独开一个入口：连接握手用的 timeout（20 秒）同时也是 exec 的默认
+    /// deadline，而**传文件时一次往返可能远超 20 秒**（一块 256KB 要编码、过链路、
+    /// 再让远端写盘）。沿用默认值会在慢链上直接报「执行远端命令超时」——
+    /// 而那个提示会把人误导到"命令写错了"上去。
+    pub async fn exec_with_deadline(
+        &mut self,
+        command: &str,
+        stdin: &[u8],
+        timeout: Duration,
+    ) -> ReadResult<ExecResult> {
         let (_local, remote) = self.open_channel().await?;
 
         let mut request = Writer::new();
@@ -956,7 +972,7 @@ impl Client {
         let mut closed = false;
         let mut started = false;
         let mut failed = false;
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let deadline = tokio::time::Instant::now() + timeout;
 
         while !(closed && status.is_some()) {
             let wait = deadline.saturating_duration_since(tokio::time::Instant::now());

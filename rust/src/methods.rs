@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -1362,6 +1363,349 @@ pub async fn dispatch(
             crate::localca::open_dir()?;
             Ok(json!(true))
         }
+        // 开发环境体检与一键部署。
+        // 体检是纯只读，跑起来不慢但也别塞进每轮状态里（要起好几个子进程问版本号），
+        // 所以由前端进页面时主动调一次。
+        "scanEnv" => Ok(crate::envmgr::scan()),
+        // 版本参数可选：不给就是装最新版，给了就是装那个版本。
+        // Node 在 envmgr 里会被转给 nvm 处理，别的走 winget 的 --version。
+        "installEnv" => {
+            let id = text(&args, 0).to_string();
+            if id.is_empty() {
+                return Err("缺少环境条目 id".into());
+            }
+            let version = text(&args, 1).to_string();
+            run_env_action(state, &id, &version, crate::envmgr::install)
+        }
+        // 「装了但版本太老」走重装：先试 winget upgrade，不行再退回强制安装。
+        // 与 install 分开是因为语义不同 —— 强制安装会先卸载，失败的话用户环境就没了，
+        // 不能让前端在「一键部署缺失项」里顺手触发。
+        "reinstallEnv" => {
+            let id = text(&args, 0).to_string();
+            if id.is_empty() {
+                return Err("缺少环境条目 id".into());
+            }
+            let version = text(&args, 1).to_string();
+            run_env_action(state, &id, &version, crate::envmgr::reinstall)
+        }
+        // Node 的版本与 nvm 状态（已装哪些、可装哪些、当前用哪个）
+        "nvmStatus" => Ok(crate::nvm::status()),
+        // 装 / 切 / 卸指定的 Node 版本
+        "nvmInstallVersion" => {
+            let version = text(&args, 0).to_string();
+            state.busy = true;
+            let result = crate::nvm::install_version(&version);
+            state.busy = false;
+            let fresh = crate::nvm::status();
+            // env 一起返回：前端重画时就不用再发一次 scanEnv，
+            // 命令输出与界面状态来自同一份快照
+            let env = crate::envmgr::scan();
+            match result {
+                Ok(detail) => {
+                    state.notify("success", format!("已安装并切换到 Node {version}"));
+                    Ok(json!({ "detail": detail, "nvm": fresh, "env": env }))
+                }
+                Err(error) => {
+                    state.notify("error", error.lines().next().unwrap_or("安装失败").to_string());
+                    Err(error)
+                }
+            }
+        }
+        "nvmUseVersion" => {
+            let version = text(&args, 0).to_string();
+            let result = crate::nvm::use_version(&version);
+            let fresh = crate::nvm::status();
+            let env = crate::envmgr::scan();
+            match result {
+                Ok(detail) => {
+                    state.notify("success", format!("已切换到 Node {version}"));
+                    Ok(json!({ "detail": detail, "nvm": fresh, "env": env }))
+                }
+                Err(error) => {
+                    state.notify("error", error.lines().next().unwrap_or("切换失败").to_string());
+                    Err(error)
+                }
+            }
+        }
+        "nvmUninstallVersion" => {
+            let version = text(&args, 0).to_string();
+            state.busy = true;
+            let result = crate::nvm::uninstall_version(&version);
+            state.busy = false;
+            let fresh = crate::nvm::status();
+            let env = crate::envmgr::scan();
+            match result {
+                Ok(detail) => {
+                    state.notify("success", format!("已卸载 Node {version}"));
+                    Ok(json!({ "detail": detail, "nvm": fresh, "env": env }))
+                }
+                Err(error) => {
+                    state.notify("error", error.lines().next().unwrap_or("卸载失败").to_string());
+                    Err(error)
+                }
+            }
+        }
+        // 某一项能装哪些版本（走 winget 源，Node 走 nvm 不在这里）
+        "envAvailableVersions" => {
+            let id = text(&args, 0).to_string();
+            crate::envmgr::available_versions(&id)
+        }
+        "openEnvDownload" => {
+            let id = text(&args, 0).to_string();
+            crate::envmgr::open_download(&id)?;
+            Ok(json!(true))
+        }
+
+        // ---- Windows 服务器远程管理（通过 SSH 执行 PowerShell）----
+        // 与 Linux 侧共用同一套 SSH 客户端与凭据存储：Windows Server 2019+
+        // 内置 OpenSSH 服务端，讲标准协议，客户端不用改。
+        // ---- 远程截图（Windows 与 Linux 通用）----
+        "serverScreenshot" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let capture = if profile.kind == "windows" {
+                crate::shot::capture_windows(&profile, &credential).await?
+            } else {
+                crate::shot::capture_linux(&profile, &credential).await?
+            };
+            Ok(crate::shot::capture_to_json(&capture))
+        }
+
+        // ---- RDP 断开后保持开机 ----
+        "keepAliveList" => {
+            let kind = text(&args, 0);
+            let items = if kind == "windows" {
+                crate::keepalive::windows_keep_alive()
+            } else {
+                crate::keepalive::linux_keep_alive()
+            };
+            Ok(json!({
+                "items": crate::keepalive::keep_alive_to_json(&items),
+                // 硬件层：软件管不了，给指引
+                "hardware": crate::keepalive::hardware_layer_notes(),
+            }))
+        }
+        "keepAliveStatus" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            if profile.kind == "windows" {
+                Ok(crate::keepalive::check_windows_keep_alive(&profile, &credential).await?)
+            } else {
+                Ok(crate::keepalive::check_linux_keep_alive(&profile, &credential).await?)
+            }
+        }
+        "keepAliveApply" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let item_id = text(&args, 1).to_string();
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let kind = profile.kind.clone();
+            let items = if kind == "windows" {
+                crate::keepalive::windows_keep_alive()
+            } else {
+                crate::keepalive::linux_keep_alive()
+            };
+            let Some(item) = items.into_iter().find(|i| i.id == item_id) else {
+                return Err(format!("未知的保活项：{item_id}"));
+            };
+            let detail = if kind == "windows" {
+                crate::winsrv::run_powershell(&profile, &credential, item.script).await?
+            } else {
+                crate::winsrv::run_shell(&profile, &credential, item.script).await?
+            };
+            state.notify("success", format!("{} 已执行", item.title));
+            Ok(json!({ "detail": detail }))
+        }
+        // 探活 + 确认远端确实是 Windows
+        "winSrvProbeOs" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let (caption, version) =
+                crate::winsrv::probe_os(&profile, &credential).await?;
+            Ok(json!({ "os": caption, "version": version }))
+        }
+        "winSrvMetrics" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let metrics = crate::winsrv::collect_metrics(&profile, &credential).await?;
+            Ok(metrics)
+        }
+        "winSrvPowerSettings" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            Ok(crate::winsrv::collect_power_settings(&profile, &credential).await?)
+        }
+        "winSrvRunFix" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let fix_id = text(&args, 1).to_string();
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let detail = crate::winsrv::apply_remote_fix(&profile, &credential, &fix_id).await?;
+            state.notify("success", detail.lines().next().unwrap_or("已执行").to_string());
+            Ok(json!({ "detail": detail }))
+        }
+        "winSrvUsers" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            Ok(crate::winsrv::list_remote_users(&profile, &credential).await?)
+        }
+        "winSrvCreateUser" => {
+            let profile = win_srv_profile(state, &text(&args, 0))?;
+            let name = text(&args, 1).to_string();
+            let password = text(&args, 2).to_string();
+            let admin = matches!(args.get(3), Some(Value::Bool(true)));
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let detail =
+                crate::winsrv::create_remote_user(&profile, &credential, &name, &password, admin).await?;
+            state.notify("success", format!("远程用户 {name} 已处理"));
+            Ok(json!({ "detail": detail }))
+        }
+        // 远程修复项的静态清单
+        "winSrvFixes" => Ok(json!(
+            crate::winsrv::remote_fixes()
+                .iter()
+                .map(|fix| {
+                    json!({
+                        "id": fix.id,
+                        "title": fix.title,
+                        "reason": fix.reason,
+                        "script": fix.script,
+                        "needAdmin": fix.need_admin,
+                    })
+                })
+                .collect::<Vec<Value>>()
+        )),
+        // 建用户只生成命令不直接执行：动账户系统不可轻易撤销，交给用户决定何时跑
+        // 打开远程桌面并预填服务器地址。用 mstsc 而不是自己实现 RDP 协议 ——
+        // 客户端已经处理了凭据缓存、NLA、剪贴板这些细节，重造没有意义。
+        "winServerOpenRdp" => {
+            let host = text(&args, 0).trim().to_string();
+            if host.is_empty() {
+                return Err("请先填写服务器地址".into());
+            }
+            // 只放行 IPv4 / 主机名形态。mstsc 接受 IP 或域名，
+            // 但这里拦住明显的垃圾输入，免得生成一个打不开的 .rdp
+            let looks_valid = host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':');
+            if !looks_valid || host.len() > 255 {
+                return Err(format!("「{host}」不像是 IP 或域名"));
+            }
+            crate::winsrv::open_rdp(&host)?;
+            Ok(json!(true))
+        }
+
+        // ---- 文件快传与同步 ----
+        // 走的是那条已有的 SSH exec 通道（逐文件 + 分块 base64），不是 SFTP ——
+        // 手写的 SSH 客户端只实现了 exec，再实现一套 SSH_FXP 协议的收益远小于成本。
+        // 详见 rust/src/filetransfer.rs 顶部的说明。
+        "fileTransferPickLocal" => {
+            let want_directory = matches!(args.first(), Some(Value::Bool(true)));
+            let picked = tokio::task::spawn_blocking(move || {
+                crate::gui::pick_local_path_blocking(want_directory)
+            })
+            .await
+            .unwrap_or(None);
+            Ok(picked.map(Value::String).unwrap_or(Value::Null))
+        }
+        "fileTransferBrowse" => {
+            let profile = srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            Ok(crate::filetransfer::browse_remote(
+                &profile,
+                &credential,
+                &text(&args, 1),
+            )
+            .await?)
+        }
+        "fileTransferUpload" => {
+            let profile = srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let local = PathBuf::from(text(&args, 1).trim());
+            let remote = text(&args, 2).trim().to_string();
+            let incremental = matches!(args.get(3), Some(Value::Bool(true)));
+            let mirror = matches!(args.get(4), Some(Value::Bool(true)));
+            let stats = crate::filetransfer::upload(&profile, &credential, &local, &remote, incremental, mirror)
+                .await?;
+            state.notify("success", filetransfer_summary("已上传到远端", &stats));
+            Ok(stats.to_json())
+        }
+        "fileTransferDownload" => {
+            let profile = srv_profile(state, &text(&args, 0))?;
+            let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+            let remote = text(&args, 1).trim().to_string();
+            let local = PathBuf::from(text(&args, 2).trim());
+            let incremental = matches!(args.get(3), Some(Value::Bool(true)));
+            let mirror = matches!(args.get(4), Some(Value::Bool(true)));
+            let stats = crate::filetransfer::download(
+                &profile,
+                &credential,
+                &remote,
+                &local,
+                incremental,
+                mirror,
+            )
+            .await?;
+            state.notify("success", filetransfer_summary("已下载到本机", &stats));
+            Ok(stats.to_json())
+        }
+        // 服务器之间互传：源 → 本机暂存 → 目标。
+        // 不让两台机器直连 —— 那要求源机能主动连上目标机，现实里大多不成立。
+        "fileTransferMove" => {
+            let source = srv_profile(state, &text(&args, 0))?;
+            let target = srv_profile(state, &text(&args, 1))?;
+            if source.profile_id == target.profile_id {
+                return Err("源服务器与目标服务器是同一台".into());
+            }
+            let source_credential = crate::credentials::get(&source.profile_id).unwrap_or_default();
+            let target_credential = crate::credentials::get(&target.profile_id).unwrap_or_default();
+            let remote = text(&args, 2).trim().to_string();
+            let mirror = matches!(args.get(3), Some(Value::Bool(true)));
+            let stats = crate::filetransfer::move_between(
+                &source,
+                &source_credential,
+                &target,
+                &target_credential,
+                &remote,
+                mirror,
+            )
+            .await?;
+            state.notify("success", filetransfer_summary("已在两台服务器间同步", &stats));
+            Ok(stats.to_json())
+        }
+        // 批量推到多台：一次开太多条 SSH 连接会打满本机 fd，也容易被远端 sshd 的
+        // MaxSessions 挡掉，所以后端按 4 台一批排队（filetransfer::push_to_many 内部处理）。
+        "fileTransferPushMany" => {
+            let ids = args
+                .first()
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let local = PathBuf::from(text(&args, 1).trim());
+            let remote = text(&args, 2).trim().to_string();
+            let incremental = matches!(args.get(3), Some(Value::Bool(true)));
+            let mirror = matches!(args.get(4), Some(Value::Bool(true)));
+            if ids.is_empty() {
+                return Err("先选至少一台服务器".into());
+            }
+            let mut targets = Vec::new();
+            for id in ids {
+                let Some(id) = id.as_str() else { continue };
+                let profile = srv_profile(state, id)?;
+                let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+                targets.push((profile, credential));
+            }
+            let result =
+                crate::filetransfer::push_to_many(&targets, &local, &remote, incremental, mirror)
+                    .await?;
+            let succeeded = result.get("succeeded").and_then(|v| v.as_u64()).unwrap_or(0);
+            let failed = result.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+            if failed == 0 {
+                state.notify("success", format!("{succeeded} 台服务器已同步完毕"));
+            } else {
+                state.notify("error", format!("{succeeded} 台成功，{failed} 台失败"));
+            }
+            Ok(result)
+        }
+
         "saveSources" => {
             let patch = payload(&args, 0)?;
             for (key, slot) in [("clash", "Clash 7897"), ("v2ray", "v2ray 10808")] {
@@ -2022,6 +2366,89 @@ pub async fn dispatch(
             apply(state)
         }
         other => Err(format!("不支持的操作：{other}")),
+    }
+}
+
+/// 找出任意一个服务器档案（Linux、Windows 都要）—— 文件快传两侧都得用。
+///
+/// 与 `win_srv_profile` 分开：那个只认 Windows，是因为它后面执行的是 PowerShell。
+fn srv_profile(state: &AppState, profile_id: &str) -> Result<crate::models::SshServerProfile, String> {
+    state
+        .config
+        .ssh_servers
+        .iter()
+        .find(|profile| profile.profile_id == profile_id)
+        .cloned()
+        .ok_or_else(|| "找不到这台服务器".to_string())
+}
+
+/// 弹给用户的传输结果摘要。
+///
+/// 只写一句概览 —— 逐文件的明细已经在 `notes` 里，界面上自己铺开，
+/// 再塞进 toast 会让通知框比正文还长。
+fn filetransfer_summary(prefix: &str, stats: &crate::filetransfer::TransferStats) -> String {
+    let mut summary = format!(
+        "{}：{} 个文件，{}",
+        prefix,
+        stats.files,
+        crate::filetransfer::human_bytes(stats.bytes)
+    );
+    if stats.skipped > 0 {
+        summary.push_str(&format!("，跳过 {}", stats.skipped));
+    }
+    if stats.removed > 0 {
+        summary.push_str(&format!("，删除 {}", stats.removed));
+    }
+    summary
+}
+
+/// 找出一个 Windows 服务器档案并校验它是 Windows 类型。
+fn win_srv_profile(
+    state: &AppState,
+    profile_id: &str,
+) -> Result<crate::models::SshServerProfile, String> {
+    let profile = state
+        .config
+        .ssh_servers
+        .iter()
+        .find(|profile| profile.profile_id == profile_id)
+        .cloned()
+        .ok_or_else(|| "找不到这台服务器".to_string())?;
+    if profile.kind != "windows" {
+        return Err("这台服务器不是 Windows 类型".into());
+    }
+    Ok(profile)
+}
+
+/// 安装 / 重装环境条目的公共处理：置 busy、跑命令、立刻重扫、把首行结果弹成 toast。
+///
+/// 参数是函数指针而不是再传一个 bool —— 安装与重装的区别留在 envmgr 内部，
+/// 这里不该知道 winget 到底会 upgrade 还是会 force install。
+fn run_env_action(
+    state: &mut AppState,
+    id: &str,
+    version: &str,
+    action: fn(&str, &str) -> Result<String, String>,
+) -> Result<Value, String> {
+    // 执行期间置 busy：挡住其它会改配置的调用，也提示前端转圈
+    state.busy = true;
+    let result = action(id, version);
+    state.busy = false;
+    match result {
+        Ok(detail) => {
+            // 装完立刻重扫，界面上的状态当场变绿，不用用户手动刷新。
+            // 过期项还会顺带从 outdated 退回就绪。
+            let fresh = crate::envmgr::scan();
+            state.notify(
+                "success",
+                detail.lines().next().unwrap_or("安装完成").to_string(),
+            );
+            Ok(json!({ "detail": detail, "env": fresh }))
+        }
+        Err(error) => {
+            state.notify("error", error.lines().next().unwrap_or("安装失败").to_string());
+            Err(error)
+        }
     }
 }
 
