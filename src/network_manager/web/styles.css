@@ -1944,3 +1944,264 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
   .xfer-directions { grid-template-columns: 1fr; }
   .xfer-input-row { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* ==========================================================================
+   Visual polish
+   把后加的「环境管理 / Windows 服务器 / 文件快传」三块拉回主线视觉语言：
+   统一卡片圆角与阴影、统一说明文字的呈现、补齐缺失的区块容器样式。
+   只覆盖样式，不动任何 class 名与交互脚本。
+   ========================================================================== */
+
+/* --- 设计令牌补充（两套主题各自给值，避免硬编码颜色） --- */
+:root {
+  --radius-card: 12px;
+  --accent-grad: linear-gradient(135deg, #3b97ff 0%, #0871ee 100%);
+  --brand-grad: linear-gradient(135deg, #17a673 0%, #0b7f8c 100%);
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, .045), 0 8px 22px rgba(16, 24, 40, .04);
+  --shadow-card-hover: 0 3px 8px rgba(16, 24, 40, .07), 0 16px 34px rgba(16, 24, 40, .085);
+  --note-bg: #f5f9ff;
+  --note-line: #d5e5fb;
+  --note-text: #5b6b80;
+  --note-icon: #3b8bf0;
+}
+:root[data-theme="dark"] {
+  --accent-grad: linear-gradient(135deg, #4aa5ff 0%, #2b76e0 100%);
+  --brand-grad: linear-gradient(135deg, #1f9d74 0%, #13707c 100%);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, .28), 0 8px 22px rgba(0, 0, 0, .22);
+  --shadow-card-hover: 0 3px 8px rgba(0, 0, 0, .34), 0 16px 34px rgba(0, 0, 0, .4);
+  --note-bg: #182534;
+  --note-line: #2a4057;
+  --note-text: #a8b9cb;
+  --note-icon: #6cb6ff;
+}
+
+/* --- 全局容器：卡片层次更清楚，按钮/输入仍保持小圆角 --- */
+.panel, .table-surface, .subscription-import, .source-card, .node-card,
+.ssh-server-card, .subscription-card {
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+}
+.panel-heading h2 { letter-spacing: -.2px; }
+.heading-icon { border-radius: 11px; }
+.heading-icon .icon { width: 20px; height: 20px; }
+
+.button.primary { background: var(--accent-grad); box-shadow: 0 2px 6px rgba(8, 124, 255, .22); }
+.button.primary:hover { background: var(--accent-grad); filter: brightness(1.07); box-shadow: 0 5px 14px rgba(8, 124, 255, .3); }
+.button.secondary, .icon-button { border-radius: 9px; }
+.icon-button { transition: background-color 140ms, border-color 140ms, color 140ms, transform 140ms; }
+.icon-button:hover { color: var(--blue-text); border-color: var(--blue); }
+
+/* --- 侧栏：品牌、导航分组、运行时区 --- */
+.sidebar { background: linear-gradient(180deg, var(--surface) 0%, var(--surface-2) 100%); }
+.brand-mark {
+  border-radius: 13px;
+  color: #fff;
+  background: var(--brand-grad);
+  box-shadow: 0 6px 16px rgba(16, 163, 115, .22);
+}
+.brand-mark .icon { width: 23px; height: 23px; }
+.brand-copy strong { letter-spacing: -.2px; }
+.nav-item { border-radius: 10px; }
+.nav-item .icon { opacity: .8; transition: opacity 140ms, transform 140ms; }
+.nav-item:hover .icon { opacity: 1; transform: translateX(1px); }
+.nav-item.is-active { box-shadow: 0 1px 3px rgba(8, 124, 255, .12); }
+.nav-item.is-active .icon { opacity: 1; color: var(--blue-text); }
+.nav-item.is-active::before { width: 4px; height: 22px; border-radius: 0 4px 4px 0; }
+.nav-separator { height: 1px; margin: 9px 10px; background: var(--line); }
+.sidebar-runtime {
+  padding: 14px 12px 10px;
+  border: 1px solid var(--line-hairline);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-1);
+}
+.sidebar-version { letter-spacing: .02em; }
+
+/* --- 顶栏 --- */
+.topbar { padding-inline: 32px; }
+.topbar h1 { letter-spacing: -.4px; }
+.status-badge, .small-status { border: 1px solid transparent; }
+.status-badge { border-color: var(--line); }
+
+/* --- 标签栏：选中项给一个浅底，滚动时也能一眼定位 --- */
+.tab-bar { gap: 4px; }
+.tab { border-radius: 9px 9px 0 0; transition: color 140ms, background-color 140ms; }
+.tab:hover { background: var(--surface-2); }
+.tab.is-active { background: var(--blue-soft); }
+.tab.is-active::after { right: 14px; left: 14px; }
+
+/* --- 说明文字：从一堵灰字墙变成可读的提示卡 --- */
+.settings-note {
+  position: relative;
+  max-width: 84ch;
+  margin: 12px 0 0;
+  padding: 11px 14px 11px 36px;
+  border: 1px solid var(--note-line);
+  border-radius: var(--radius);
+  background: var(--note-bg);
+  color: var(--note-text);
+  font-size: 11.5px;
+  line-height: 1.7;
+}
+.settings-note::before {
+  content: "i";
+  position: absolute;
+  top: 13px;
+  left: 14px;
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--note-icon);
+  color: #fff;
+  font: 700 10px/1 "Segoe UI", sans-serif;
+  font-style: normal;
+}
+.settings-note strong { color: var(--text-2); }
+.settings-note code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--surface);
+  border: 1px solid var(--note-line);
+  font: 11px/1.5 Consolas, monospace;
+}
+
+/* 可折叠说明：长篇原理默认收起，页面只留操作区 */
+.info-note {
+  margin-top: 12px;
+  border: 1px solid var(--note-line);
+  border-radius: var(--radius);
+  background: var(--note-bg);
+  overflow: hidden;
+}
+.info-note > summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 14px;
+  color: var(--blue-text);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.info-note > summary::-webkit-details-marker { display: none; }
+.info-note > summary:hover { background: var(--surface-2); }
+.info-note > summary .icon { width: 15px; height: 15px; flex: 0 0 auto; }
+.info-note > summary::after {
+  content: "";
+  width: 7px;
+  height: 7px;
+  margin-left: auto;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg) translate(-2px, -2px);
+  transition: transform 160ms ease;
+}
+.info-note[open] > summary::after { transform: rotate(225deg) translate(-2px, -2px); }
+.info-note-body {
+  padding: 0 14px 13px;
+  color: var(--note-text);
+  font-size: 11.5px;
+  line-height: 1.75;
+}
+.info-note-body p { margin: 0 0 8px; }
+.info-note-body p:last-child { margin-bottom: 0; }
+.info-note-body strong { color: var(--text-2); }
+.info-note-body code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--surface);
+  border: 1px solid var(--note-line);
+  font: 11px/1.5 Consolas, monospace;
+}
+.info-note-list { display: grid; gap: 7px; margin: 0; padding-left: 18px; }
+.info-note-list li::marker { color: var(--note-icon); }
+.info-note.compact > summary { padding: 8px 10px; font-size: 11.5px; }
+.info-note.compact .info-note-body { padding-inline: 11px; }
+
+/* --- 服务器管理：补齐之前完全没样式的 .winserver-section --- */
+.winserver-main { display: flex; flex-direction: column; gap: 16px; }
+.winserver-section {
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+.winserver-section .panel-heading { margin-bottom: 16px; }
+.winserver-side, .xfer-side, .winserver-monitor, .winserver-detail,
+.env-card, .env-detail, .xfer-section, .winserver-shot-box,
+.winserver-hardware-item, .winserver-fixes, .winserver-command {
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+}
+.winserver-side, .xfer-side { padding: 14px; }
+/* 卡片里再套一层卡片时，内层退成浅底，别叠出双层投影 */
+.winserver-section .winserver-fixes,
+.winserver-section .winserver-shot-box,
+.winserver-section .winserver-hardware-item,
+.winserver-section .winserver-command {
+  border-radius: var(--radius);
+  box-shadow: none;
+  background: var(--surface-2);
+}
+.winserver-section .winserver-hardware-item { background: var(--surface-2); }
+.winserver-srv.is-active, .xfer-server.is-picked { box-shadow: var(--shadow-card-hover); }
+.winserver-srv.is-active { border-left: 3px solid var(--blue); padding-left: 9px; }
+.winserver-gauge-track { height: 7px; }
+.winserver-gauge-track span { background: var(--accent-grad); }
+.winserver-banner { border-radius: var(--radius-card); box-shadow: var(--shadow-card); }
+.winserver-shot-box { background: var(--surface-2); }
+.winserver-shot-frame { border: 1px solid var(--line); }
+.winserver-user-chip { border-radius: var(--radius-pill); }
+.winserver-command-head .text-button { font-size: 12px; }
+.env-versions-title { letter-spacing: .02em; }
+.env-versions-title .icon { width: 15px; height: 15px; color: var(--blue-text); }
+
+/* --- 文件快传：方向选择更明确，结果区不再是一堆裸文字 --- */
+.xfer-section { padding: 18px 20px; }
+.xfer-section .panel-heading { margin-bottom: 12px; }
+.xfer-direction.is-active {
+  border-color: transparent;
+  background: var(--accent-grad);
+  color: #fff;
+  box-shadow: 0 3px 10px rgba(8, 124, 255, .24);
+}
+.xfer-direction.is-active .icon { color: #fff; }
+.xfer-direction.is-active:hover { border-color: transparent; color: #fff; }
+.xfer-browse { border-radius: var(--radius); }
+.xfer-server.is-picked .xfer-server-kind { color: var(--blue-text); background: var(--blue-soft); }
+.xfer-result { padding-top: 2px; }
+
+/* --- 环境管理：状态一眼可辨，卡片可点感更强 --- */
+.env-grid { gap: 14px; }
+.env-card {
+  transition: box-shadow 160ms ease, transform 160ms ease, border-color 160ms ease;
+}
+.env-card:hover { box-shadow: var(--shadow-card-hover); transform: translateY(-2px); }
+.env-card.is-ready { border-left-color: var(--green); }
+.env-card.is-missing { border-left-color: var(--amber); }
+.env-card.is-outdated { border-left-color: var(--orange); }
+.env-badge { padding: 3px 10px; border: 1px solid transparent; }
+.env-badge.is-ready { border-color: var(--green-line); }
+.env-version-chip { transition: border-color 140ms, color 140ms, transform 140ms; }
+.env-version-chip:hover { transform: translateY(-1px); }
+.env-summary {
+  padding: 6px 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  box-shadow: var(--shadow-1);
+}
+.env-detail-body { border-radius: var(--radius); }
+.env-versions { border-radius: var(--radius); }
+
+/* --- 窄屏：新页面两栏收起后别把说明卡撑破 --- */
+@media (max-width: 860px) {
+  .winserver-section, .xfer-section { padding: 15px 14px; }
+  .settings-note, .info-note-body { font-size: 11.5px; }
+  .topbar { padding-inline: 18px; }
+}

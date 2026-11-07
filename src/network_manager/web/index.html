@@ -61,14 +61,16 @@
         <button class="nav-item" data-page="nodes" title="代理与节点">
           <span class="icon" style="--icon:url('./icons/server.svg')"></span><span>代理与节点</span>
         </button>
+        <div class="nav-separator" aria-hidden="true"></div>
         <button id="server-deployment-nav" class="nav-item" data-page="servers" title="服务器管理">
           <span class="icon" style="--icon:url('./icons/server.svg')"></span><span>服务器管理</span>
         </button>
-        <button class="nav-item" data-page="settings" title="设置">
-          <span class="icon" style="--icon:url('./icons/settings.svg')"></span><span>设置</span>
-        </button>
         <button class="nav-item" data-page="env" title="环境管理">
           <span class="icon" style="--icon:url('./icons/cpu.svg')"></span><span>环境管理</span>
+        </button>
+        <div class="nav-separator" aria-hidden="true"></div>
+        <button class="nav-item" data-page="settings" title="设置">
+          <span class="icon" style="--icon:url('./icons/settings.svg')"></span><span>设置</span>
         </button>
         <button class="nav-item" data-page="logs" title="运行日志">
           <span class="icon" style="--icon:url('./icons/file-text.svg')"></span><span>运行日志</span>
@@ -334,7 +336,10 @@
                   <button id="winserver-apply-selected" type="button" class="button primary" disabled><span class="icon" style="--icon:url('./icons/check.svg')"></span><span>在远端执行</span></button>
                 </div>
                 <div id="winserver-fixes" class="winserver-fixes"></div>
-                <p class="settings-note">这些命令<strong>在目标服务器上执行</strong>，不是在本机。改电源计划、注册表都需要管理员权限 —— 远端用普通账号登录时命令会失败，输出里会写明原因。<strong>「允许同一用户多个远程会话」改完要重启远程桌面服务</strong>才生效（会断掉当前所有 RDP 连接）。</p>
+                <details class="info-note">
+                  <summary><span class="icon" style="--icon:url('./icons/file-text.svg')"></span><span>执行前须知</span></summary>
+                  <div class="info-note-body">这些命令<strong>在目标服务器上执行</strong>，不是在本机。改电源计划、注册表都需要管理员权限 —— 远端用普通账号登录时命令会失败，输出里会写明原因。<strong>「允许同一用户多个远程会话」改完要重启远程桌面服务</strong>才生效（会断掉当前所有 RDP 连接）。</div>
+                </details>
               </div>
 
 
@@ -350,7 +355,10 @@
                 <div id="winserver-shot-box" class="winserver-shot-box">
                   <div class="winserver-item-reason">点「抓取屏幕」看看服务器现在的画面</div>
                 </div>
-                <p class="settings-note"><strong>Windows 上截图需要目标机有交互式桌面</strong>：SSH 登录的进程跑在 Session 0（没有桌面），所以程序会建一个「以交互方式运行」的计划任务，让它进到已登录用户的会话里再抓 —— 这也是为什么第一次用可能慢几秒。<strong>没人在本地登录过的机器是抓不到的</strong>（没有桌面可截），RDP 连上去之后会自动建一个会话，那时就能截了。Linux 上要有 X11 或 Wayland 会话，纯命令行的云镜像本来就没有桌面。</p>
+                <details class="info-note">
+                  <summary><span class="icon" style="--icon:url('./icons/file-text.svg')"></span><span>为什么有时抓不到画面</span></summary>
+                  <div class="info-note-body"><strong>Windows 上截图需要目标机有交互式桌面</strong>：SSH 登录的进程跑在 Session 0（没有桌面），所以程序会建一个「以交互方式运行」的计划任务，让它进到已登录用户的会话里再抓 —— 这也是为什么第一次用可能慢几秒。<strong>没人在本地登录过的机器是抓不到的</strong>（没有桌面可截），RDP 连上去之后会自动建一个会话，那时就能截了。Linux 上要有 X11 或 Wayland 会话，纯命令行的云镜像本来就没有桌面。</div>
+                </details>
               </div>
 
               <div class="winserver-section">
@@ -371,7 +379,10 @@
                   <div><h2>硬件层：软件管不了的部分</h2><p>这些必须去机房或云控制台配</p></div>
                 </div>
                 <div id="winserver-hardware" class="winserver-hardware"></div>
-                <p class="settings-note"><strong>系统一旦开始关机流程，任何软件都拦不住。</strong>上面那些措施能保证「不睡眠、不注销、会话保留」，但如果是真的被人按了关机键、或者机房断电了，只有 BIOS/UEFI 与云平台那层的设置能救 —— 下面列的就是要去哪儿开那个选项。</p>
+                <details class="info-note">
+                  <summary><span class="icon" style="--icon:url('./icons/file-text.svg')"></span><span>软件能做什么、不能做什么</span></summary>
+                  <div class="info-note-body"><strong>系统一旦开始关机流程，任何软件都拦不住。</strong>上面那些措施能保证「不睡眠、不注销、会话保留」，但如果是真的被人按了关机键、或者机房断电了，只有 BIOS/UEFI 与云平台那层的设置能救 —— 下面列的就是要去哪儿开那个选项。</div>
+                </details>
               </div>
               <div class="winserver-section">
                 <div class="panel-heading">
@@ -418,7 +429,10 @@
             <aside class="xfer-side">
               <div class="env-versions-title"><span class="icon" style="--icon:url('./icons/server.svg')"></span><span>服务器</span></div>
               <div id="xfer-server-list" class="xfer-server-list"></div>
-              <p class="settings-note">勾选要传的机器。<strong>「服务器之间」方向要正好勾两台</strong>：先勾的是源，后勾的是目标 —— 数据经本机中转，不要求两台机器能互相直连。</p>
+              <details class="info-note compact">
+                <summary><span class="icon" style="--icon:url('./icons/file-text.svg')"></span><span>选择规则</span></summary>
+                <div class="info-note-body">勾选要传的机器。<strong>「服务器之间」方向要正好勾两台</strong>：先勾的是源，后勾的是目标 —— 数据经本机中转，不要求两台机器能互相直连。</div>
+              </details>
             </aside>
 
             <div class="xfer-main">
@@ -458,6 +472,7 @@
               </div>
 
               <div class="xfer-section">
+                <div class="env-versions-title"><span class="icon" style="--icon:url('./icons/settings.svg')"></span><span>选项</span></div>
                 <div class="xfer-options">
                   <label class="xfer-check"><input id="xfer-sync" type="checkbox" checked><span>增量：只传变化的文件（大小和修改时间都比）</span></label>
                   <label class="xfer-check"><input id="xfer-mirror" type="checkbox"><span>镜像：连目标端多出来的文件一起删掉</span></label>
@@ -498,7 +513,10 @@
               <div class="form-grid two">
                 <label class="relay-node-field"><span>中转节点</span><select id="setting-relay-node"><option value="">未选择</option></select><small id="setting-relay-hint">未启用，节点全部直接连接。</small></label>
               </div>
-              <p class="settings-note">本地直连某些节点会被掐、被限或干脆连不上，但中转那台机器能连上 —— 中转通常就是自己买的服务器或 ISP。它<b>只有这一个</b>，不用逐个节点去配：开启后所有节点自动挂上<b>代理链</b>（内核的 <code>dialer-proxy</code>），中转自己除外，否则会无限套娃。<b>指向本机回环的节点（另一个客户端的端口）也不走中转</b> —— 那台远端机器去连的会是它自己身上的 127.0.0.1，必然连失败。本程序、浏览器、以及挂本地代理端口跑的代码，走的都是同一条链路，不会出现「测速通但用不了」这种两套结果。<b>中转节点本身仍然可以当普通节点用</b>，只是不再经过任何前置。</p>
+              <details class="info-note">
+                <summary><span class="icon" style="--icon:url('./icons/file-text.svg')"></span><span>统一中转是怎么串起来的</span></summary>
+                <div class="info-note-body">本地直连某些节点会被掐、被限或干脆连不上，但中转那台机器能连上 —— 中转通常就是自己买的服务器或 ISP。它<b>只有这一个</b>，不用逐个节点去配：开启后所有节点自动挂上<b>代理链</b>（内核的 <code>dialer-proxy</code>），中转自己除外，否则会无限套娃。<b>指向本机回环的节点（另一个客户端的端口）也不走中转</b> —— 那台远端机器去连的会是它自己身上的 127.0.0.1，必然连失败。本程序、浏览器、以及挂本地代理端口跑的代码，走的都是同一条链路，不会出现「测速通但用不了」这种两套结果。<b>中转节点本身仍然可以当普通节点用</b>，只是不再经过任何前置。</div>
+              </details>
             </section>
             <section class="panel settings-section">
               <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/database.svg')"></span></div><div><h2>本地 DNS</h2><p>DNS 应答模式与自定义域名映射</p></div></div>
@@ -506,7 +524,10 @@
                 <label class="switch-row"><span><strong>DNS 兼容模式（redir-host）</strong><small>默认关闭（fake-ip）：除内网、校时、连通性探测等少数域名外，其余域名都返回 198.18.x.x 假地址，由内核按域名分流，最快；开启后所有域名都返回真实 IP，域名匹配交给连接嗅探 —— 遇到「开着接管就有应用异常」时用它兜底，代价是每次连接多一次解析延迟。<b>改完要重新接管才生效。</b></small></span><input id="setting-dns-compat" type="checkbox"><i></i></label>
               </div>
               <label class="local-dns-field"><span>映射列表（一行一条，域名和 IP 顺序随意）</span><textarea id="setting-local-dns" rows="6" spellcheck="false" placeholder="nas.lan 192.168.1.10"></textarea><span class="rule-value-toolbar"><small id="setting-local-dns-summary">当前没有映射</small><span><button id="save-local-dns" type="button" class="text-button">保存映射</button></span></span></label>
-              <p class="settings-note">写进内核的 hosts 表，命中即返回，不会往外发查询 —— 局域网里的 NAS、路由器、自建站点因此能直接用域名访问。<strong>写成 <code>*.baidu.com</code> 就是通配</strong>：baidu.com 本身和它的所有子域都算，只写 <code>nas.lan</code> 则只匹配这一个名字；地址属于内网网段时会自动直连。要在局域网里跑 HTTPS，证书里的名字得和这里的域名一致 —— 下面的「本地证书」会按这张表自动签，不用自己去开 openssl。浏览器与系统的「安全 DNS / 私人 DNS」会绕过这张表，属于预期行为。</p>
+              <details class="info-note">
+                <summary><span class="icon" style="--icon:url('./icons/file-text.svg')"></span><span>本地 DNS 映射的作用范围</span></summary>
+                <div class="info-note-body">写进内核的 hosts 表，命中即返回，不会往外发查询 —— 局域网里的 NAS、路由器、自建站点因此能直接用域名访问。<strong>写成 <code>*.baidu.com</code> 就是通配</strong>：baidu.com 本身和它的所有子域都算，只写 <code>nas.lan</code> 则只匹配这一个名字；地址属于内网网段时会自动直连。要在局域网里跑 HTTPS，证书里的名字得和这里的域名一致 —— 下面的「本地证书」会按这张表自动签，不用自己去开 openssl。浏览器与系统的「安全 DNS / 私人 DNS」会绕过这张表，属于预期行为。</div>
+              </details>
             </section>
             <section class="panel settings-section">
               <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/key-round.svg')"></span></div><div><h2>本地证书</h2><p>按上面的映射自动签一套 CA 与叶证书</p></div></div>
@@ -522,7 +543,10 @@
                 <button id="uninstall-local-cert" type="button" class="text-button">取消信任</button>
                 <button id="open-local-cert-dir" type="button" class="text-button">打开目录</button>
               </div>
-              <p class="settings-note">映射一改，叶证书会自动重签（通配条目连裸域一起写进 SAN，映射里的 IP 也会写进去）。<strong>叶证书有效期固定 397 天</strong>：Chrome / Edge 对任何证书都执行 398 天上限，本机私有根签的也不例外，超一天就是 <code>ERR_CERT_VALIDITY_TOO_LONG</code>；根证书给 10 年，装一次信任库能一直用。<strong>信任 CA 只装进当前用户</strong>的证书库（<code>certutil -user</code>），不需要管理员，也不会影响别的账户 —— 装不装由你决定，不装的话浏览器依旧会报红。私钥不参与「跨设备配置」导出，只留在本机。</p>
+              <details class="info-note">
+                <summary><span class="icon" style="--icon:url('./icons/file-text.svg')"></span><span>证书有效期与信任范围</span></summary>
+                <div class="info-note-body">映射一改，叶证书会自动重签（通配条目连裸域一起写进 SAN，映射里的 IP 也会写进去）。<strong>叶证书有效期固定 397 天</strong>：Chrome / Edge 对任何证书都执行 398 天上限，本机私有根签的也不例外，超一天就是 <code>ERR_CERT_VALIDITY_TOO_LONG</code>；根证书给 10 年，装一次信任库能一直用。<strong>信任 CA 只装进当前用户</strong>的证书库（<code>certutil -user</code>），不需要管理员，也不会影响别的账户 —— 装不装由你决定，不装的话浏览器依旧会报红。私钥不参与「跨设备配置」导出，只留在本机。</div>
+              </details>
             </section>
             <section class="panel settings-section">
               <div class="panel-heading"><div class="heading-icon"><span class="icon" style="--icon:url('./icons/settings.svg')"></span></div><div><h2>运行行为</h2><p>启动、路由与托盘设置</p></div></div>
@@ -574,7 +598,17 @@
             </div>
             <pre id="env-detail-body" class="env-detail-body"></pre>
           </div>
-          <p class="settings-note">体检只做只读检查：直接问各工具自己的 <code>--version</code>，问不到再查注册表和默认安装目录。<strong>不下载安装包、不改注册表、不动 PATH</strong>。缺什么就交给官方包管理器 winget 去装，命令与输出原样显示在这里 —— 出了问题你能自己判断是哪一步的事。<br><strong>「版本过旧」和「缺失」是两回事</strong>：过旧的项已经装上了，只是低于本项目实际需要的版本（比如 Node.js 要 20、JDK 要 17、WebView2 要 90），<strong>重装会先尝试 winget 升级，升级不可用才退回强制重装</strong>，所以它只出现在单张卡片的「重装升级」按钮里，不进「一键部署」的批量流程 —— 那个按钮只管真正缺的东西。<br><strong>Node.js 走 nvm 管版本</strong>：能同时并存多个版本，点已装版本的徽章即可切换，互不影响。切换后<strong>新开的终端才生效</strong> —— nvm 是靠改软链接实现的，已经开着的窗口里跑的还是旧版本。<br><strong>Python 只认原生安装</strong>（python.org 官方包或 Microsoft Store），<strong>不使用 conda 环境里的解释器</strong> —— 那个解释器依赖 activate 才生效，直接查它拿到的版本不代表你命令行里实际在跑的那个，而且我们只体检单个解释器、管不了 conda 的依赖包。其它工具同样不能并存，装指定版本会先卸载现有的，所以点了会先问一次。</p>
+          <details class="info-note">
+            <summary><span class="icon" style="--icon:url('./icons/file-text.svg')"></span><span>体检与部署规则</span></summary>
+            <div class="info-note-body">
+              <p>体检只做只读检查：直接问各工具自己的 <code>--version</code>，问不到再查注册表和默认安装目录。<strong>不下载安装包、不改注册表、不动 PATH</strong>。缺什么就交给官方包管理器 winget 去装，命令与输出原样显示在这里 —— 出了问题你能自己判断是哪一步的事。</p>
+              <ul class="info-note-list">
+                <li><strong>「版本过旧」和「缺失」是两回事</strong>：过旧的项已经装上了，只是低于本项目实际需要的版本（比如 Node.js 要 20、JDK 要 17、WebView2 要 90），<strong>重装会先尝试 winget 升级，升级不可用才退回强制重装</strong>，所以它只出现在单张卡片的「重装升级」按钮里，不进「一键部署」的批量流程 —— 那个按钮只管真正缺的东西。</li>
+                <li><strong>Node.js 走 nvm 管版本</strong>：能同时并存多个版本，点已装版本的徽章即可切换，互不影响。切换后<strong>新开的终端才生效</strong> —— nvm 是靠改软链接实现的，已经开着的窗口里跑的还是旧版本。</li>
+                <li><strong>Python 只认原生安装</strong>（python.org 官方包或 Microsoft Store），<strong>不使用 conda 环境里的解释器</strong> —— 那个解释器依赖 activate 才生效，直接查它拿到的版本不代表你命令行里实际在跑的那个，而且我们只体检单个解释器、管不了 conda 的依赖包。其它工具同样不能并存，装指定版本会先卸载现有的，所以点了会先问一次。</li>
+              </ul>
+            </div>
+          </details>
         </section>
 
       </div>
