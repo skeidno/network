@@ -1913,4 +1913,32 @@ mod tests {
             assert!(ids.contains(&expected), "体检漏了 {expected}");
         }
     }
+
+    /// 本机自证：PATH 里没有 WindowsApps 时，winget 依旧能通过应用执行别名
+    /// 被找到并真的跑起来（不只是「文件存在」）。依赖机器装了 App Installer，
+    /// 所以标 #[ignore]，不进 CI；手工跑：
+    /// `cargo test --release winget别名 -- --ignored`
+    #[test]
+    #[ignore = "依赖本机安装 winget"]
+    fn winget别名能被找到并执行() {
+        #[cfg(windows)]
+        {
+            let exe = winget_exe().expect("应当通过应用执行别名找到 winget.exe");
+            let output = winget_command()
+                .expect("winget_command 应当构造成功")
+                .arg("--version")
+                .output()
+                .expect("winget --version 应当能执行");
+            assert!(
+                output.status.success(),
+                "winget --version 失败：{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            println!("winget path = {}", exe.display());
+            println!(
+                "winget version = {}",
+                String::from_utf8_lossy(&output.stdout).trim()
+            );
+        }
+    }
 }
