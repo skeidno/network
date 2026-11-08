@@ -278,6 +278,15 @@ async fn call_api(
         }
     }
 
+    // 最新稳定版查询要并发请求多个外部数据源，耗时几秒。必须在 state 锁外跑：
+    // dispatch 是在持锁状态下 await 的，放进去会把状态轮询和所有其它 API 一起卡住。
+    // 与 deploySshServer 同一套路，鉴权上面的代码块已经做过了。
+    if method == "envLatestVersions" {
+        let force = args.first().and_then(|value| value.as_bool()).unwrap_or(false);
+        let result = crate::envmgr::latest_versions(force).await;
+        return security_headers(Json(json!({ "ok": true, "result": result })).into_response());
+    }
+
     let mut state = shared.lock().await;
     match crate::methods::dispatch(&shared, &mut state, &method, args).await {
         Ok(result) => security_headers(Json(json!({"ok": true, "result": result})).into_response()),

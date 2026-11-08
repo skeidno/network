@@ -1393,6 +1393,17 @@ pub async fn dispatch(
             let version = text(&args, 1).to_string();
             run_env_action(state, &id, &version, crate::envmgr::reinstall)
         }
+        // 「更新」：非破坏性升级，绝不回退到强制安装。Rust 走 rustup，其余走 winget upgrade。
+        "updateEnv" => {
+            let id = text(&args, 0).to_string();
+            if id.is_empty() {
+                return Err("缺少环境条目 id".into());
+            }
+            run_env_action(state, &id, "", crate::envmgr::update)
+        }
+        // 最新版本查询会联网，已在 server.rs 的锁外分支处理；留个明确报错，
+        // 免得以后有人从别的路径调进来，还以为是「未知方法」。
+        "envLatestVersions" => Err("最新版本查询须走锁外通道".into()),
         // Node 的版本与 nvm 状态（已装哪些、可装哪些、当前用哪个）
         "nvmStatus" => Ok(crate::nvm::status()),
         // 装 / 切 / 卸指定的 Node 版本
