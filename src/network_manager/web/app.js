@@ -160,6 +160,24 @@ async function invoke(method, ...args) {
   }
 }
 
+/**
+ * 长动作专用：invoke 把错误吞成 null，安装失败时调用方照样会走「成功」分支，
+ * 界面显示「安装完成」但卡片还是缺失。环境安装必须拿到真实错误。
+ * 这里只保留 invoke 的状态刷新逻辑，错误一律往上抛。
+ */
+async function invokeStrict(method, ...args) {
+  const response = await apiRequest("/api/call", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ method, args }),
+  });
+  const payload = await response.json();
+  if (!payload.ok) throw new Error(payload.error || "操作失败");
+  await refreshState();
+  scheduleStateRefresh(statePollDelay());
+  return payload.result;
+}
+
 async function performWindowAction(action) {
   return invoke("windowAction", action);
 }
@@ -1117,7 +1135,14 @@ function renderEnv(data) {
   if (missing.length) parts.push(`${missing.length} 项缺失（${escapeHtml(missing.map((i) => i.name).join("、"))}）`);
   // 「一键部署缺失项」是灰的时候把原因写在摘要里，别让人以为功能没打进这个版本。
   const coreMissing = missing.filter((item) => (item.group || "core") === "core");
-  if (!coreMissing.length) parts.push(`<span class="env-summary-idle">运行环境已齐，无需部署</span>`);
+  // 批量按钮只管 core 组。语言组有缺失时把「去哪儿点」直接写在摘要里，
+  // 别让人对着灰掉的批量按钮以为一键部署功能丢了。
+  const langMissing = missing.filter((item) => item.group === "language" && item.canInstall);
+  if (!coreMissing.length) {
+    parts.push(langMissing.length
+      ? `<span class="env-summary-idle">运行环境已齐；${escapeHtml(langMissing.map((i) => i.name).join("、"))} 请点各自卡片里的「一键部署」</span>`
+      : `<span class="env-summary-idle">运行环境已齐，无需部署</span>`);
+  }
   if (!data.winget) parts.push(`<span class="env-summary-warn">未找到 winget，自动安装不可用</span>`);
   summary.innerHTML = parts.join(" · ");
 
@@ -1383,20 +1408,22 @@ async function runNvmAction(method, version, verb) {
   // 一个说没切。
   let freshEnv = null;
   try {
-    const result = await invoke(method, version);
+    const result = await invokeStrict(method, version);
     if (result && result.nvm) nvmState = result.nvm;
     freshEnv = result?.env || null;
     showEnvDetail(`${verb}输出`, result?.detail || `${verb}完成`);
   } catch (error) {
-    showEnvDetail(`${verb}失败`, error.message || String(error));
+    const message = error.message || String(error);
+    showEnvDetail(`${verb}失败`, message);
+    showToast("error", `${verb}失败：${message.split("\n")[0]}`);
   } finally {
     setEnvBusy(false);
   }
   // 必须在 setEnvBusy(false) 之后重画：refreshEnv 开头有 `if (envBusy) return`，
   // 在 busy 状态下调它会被直接跳过。
-  // 失败时后端不返回 env，退回重扫（比如卸载的正好是当前版本）。
+  // 失败时后端不返回 env，退回强制重扫（比如卸载的正好是当前版本）。
   if (freshEnv) renderEnv(freshEnv);
-  else await refreshEnv();
+  else await refreshEnv(true);
 }
 
 async function refreshEnv(force = false) {
@@ -1444,15 +1471,19 @@ async function runEnvAction(id, method, verb, version = "") {
   setEnvBusy(true);
   try {
     // 版本为空 = 装最新版；后端对 Node 会转给 nvm，其它走 winget 的 --version
-    const result = await invoke(method, id, version);
+    const result = await invokeStrict(method, id, version);
     if (result && result.env) renderEnv(result.env);
     showEnvDetail(`${verb}输出`, result?.detail || `${verb}完成`);
   } catch (error) {
     // 失败时把后端带来的详细输出也摊开，别只留一句「安装失败」
-    showEnvDetail(`${verb}失败`, error.message || String(error));
+    const message = error.message || String(error);
+    showEnvDetail(`${verb}失败`, message);
+    showToast("error", `${verb}失败：${message.split("\n")[0]}`);
   } finally {
     setEnvBusy(false);
-    if (byId("env-detail").hidden) refreshEnv();
+    // 不管成败都强制重扫：winget 可能装完了但前端没拿到 env 快照，
+    // 或者装到一半退出了，卡片必须跟磁盘上的真实状态一致。
+    refreshEnv(true);
   }
 }
 
@@ -1477,26 +1508,42 @@ async function installAllEnv() {
       return Boolean(button);
     });
   if (!cards.length) {
-    showToast("success", "没有可自动安装的缺失项");
+    // 最常见的一头雾水：core 全齐但 Go 等语言组缺着，批量按钮按设计是灰的。
+    // 把该点哪里直接写出来，别让人以为功能没生效。
+    const langMissing = [...document.querySelectorAll('[data-env-group="language"] .env-card.is-missing')]
+      .filter((card) => card.querySelector("[data-env-install]"))
+      .map((card) => card.dataset.envCard);
+    showEnvDetail("批量部署说明", langMissing.length
+      ? `「一键部署缺失项」只负责「运行环境与工具」。语言工具链体积大且可选，请在各自卡片里点「一键部署」。\n\n待单项部署：${langMissing.join("、")}`
+      : "没有可自动安装的缺失项。");
+    showToast("info", langMissing.length
+      ? "语言工具链请在卡片里单项部署"
+      : "没有可自动安装的缺失项");
     return;
   }
   setEnvBusy(true);
   const chunks = [];
+  let failed = 0;
   try {
     for (const id of cards) {
       // 逐个装而不是并发：winget 有全局安装锁，并发只会互相抢
-      const result = await invoke("installEnv", id);
-      if (result && result.detail) chunks.push(`### ${id}\n${result.detail}`);
-      if (result && result.env) renderEnv(result.env);
+      try {
+        const result = await invokeStrict("installEnv", id);
+        if (result && result.detail) chunks.push(`### ${id}\n${result.detail}`);
+        if (result && result.env) renderEnv(result.env);
+      } catch (error) {
+        // 单项失败不中断整批，但要如实计数、把错误留在输出里
+        failed += 1;
+        chunks.push(`### ${id} 失败\n${error.message || error}`);
+      }
     }
-    showEnvDetail("批量部署输出", chunks.join("\n\n"));
-    showToast("success", `已依次尝试部署 ${cards.length} 项`);
-  } catch (error) {
-    chunks.push(`### 失败\n${error.message || error}`);
-    showEnvDetail("批量部署中断", chunks.join("\n\n"));
+    showEnvDetail(failed ? `批量部署输出（${failed} 项失败）` : "批量部署输出", chunks.join("\n\n"));
+    showToast(failed ? "error" : "success", failed
+      ? `${cards.length} 项中 ${failed} 项失败，详见输出`
+      : `已依次部署 ${cards.length} 项`);
   } finally {
     setEnvBusy(false);
-    refreshEnv();
+    refreshEnv(true);
   }
 }
 
@@ -1558,23 +1605,27 @@ async function updateAllEnv() {
   }
   setEnvBusy(true);
   const chunks = [];
+  let failed = 0;
   try {
     for (const id of ids) {
       const info = envLatest && envLatest.items ? envLatest.items[id] : null;
       const latest = info && info.latest ? info.latest : "";
-      const result = await invoke("updateEnv", id, latest);
-      if (result && result.detail) chunks.push(`### ${id}\n${result.detail}`);
-      if (result && result.env) {
-        envData = result.env;
-        renderEnv(result.env);
+      try {
+        const result = await invokeStrict("updateEnv", id, latest);
+        if (result && result.detail) chunks.push(`### ${id}\n${result.detail}`);
+        if (result && result.env) {
+          envData = result.env;
+          renderEnv(result.env);
+        }
+      } catch (error) {
+        failed += 1;
+        chunks.push(`### ${id} 失败\n${error.message || error}`);
       }
     }
-    showEnvDetail("批量更新输出", chunks.join("\n\n"));
-    showToast("success", `已依次更新 ${ids.length} 项`);
-  } catch (error) {
-    chunks.push(`### 失败\n${error.message || error}`);
-    showEnvDetail("批量更新中断", chunks.join("\n\n"));
-    showToast("error", error.message || "批量更新中断");
+    showEnvDetail(failed ? `批量更新输出（${failed} 项失败）` : "批量更新输出", chunks.join("\n\n"));
+    showToast(failed ? "error" : "success", failed
+      ? `${ids.length} 项中 ${failed} 项失败，详见输出`
+      : `已依次更新 ${ids.length} 项`);
   } finally {
     setEnvBusy(false);
     await refreshEnv(true);
