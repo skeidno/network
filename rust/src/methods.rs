@@ -1364,9 +1364,14 @@ pub async fn dispatch(
             Ok(json!(true))
         }
         // 开发环境体检与一键部署。
-        // 体检是纯只读，跑起来不慢但也别塞进每轮状态里（要起好几个子进程问版本号），
-        // 所以由前端进页面时主动调一次。
-        "scanEnv" => Ok(crate::envmgr::scan()),
+        // 体检是纯只读，但要起十几个子进程问版本号，绝不能塞进每轮状态轮询里。
+        // 前端只在切进页面时调一次；后端另有 15 秒缓存兜底。
+        // 用户手动点「重新体检」会传 true，绕过缓存立刻重扫。
+        "scanEnv" => Ok(if flag(&args, 0) {
+            crate::envmgr::scan_fresh()
+        } else {
+            crate::envmgr::scan()
+        }),
         // 版本参数可选：不给就是装最新版，给了就是装那个版本。
         // Node 在 envmgr 里会被转给 nvm 处理，别的走 winget 的 --version。
         "installEnv" => {
@@ -1399,7 +1404,7 @@ pub async fn dispatch(
             let fresh = crate::nvm::status();
             // env 一起返回：前端重画时就不用再发一次 scanEnv，
             // 命令输出与界面状态来自同一份快照
-            let env = crate::envmgr::scan();
+            let env = crate::envmgr::scan_fresh();
             match result {
                 Ok(detail) => {
                     state.notify("success", format!("已安装并切换到 Node {version}"));
@@ -1415,7 +1420,7 @@ pub async fn dispatch(
             let version = text(&args, 0).to_string();
             let result = crate::nvm::use_version(&version);
             let fresh = crate::nvm::status();
-            let env = crate::envmgr::scan();
+            let env = crate::envmgr::scan_fresh();
             match result {
                 Ok(detail) => {
                     state.notify("success", format!("已切换到 Node {version}"));
@@ -1433,7 +1438,7 @@ pub async fn dispatch(
             let result = crate::nvm::uninstall_version(&version);
             state.busy = false;
             let fresh = crate::nvm::status();
-            let env = crate::envmgr::scan();
+            let env = crate::envmgr::scan_fresh();
             match result {
                 Ok(detail) => {
                     state.notify("success", format!("已卸载 Node {version}"));
@@ -2438,7 +2443,7 @@ fn run_env_action(
         Ok(detail) => {
             // 装完立刻重扫，界面上的状态当场变绿，不用用户手动刷新。
             // 过期项还会顺带从 outdated 退回就绪。
-            let fresh = crate::envmgr::scan();
+            let fresh = crate::envmgr::scan_fresh();
             state.notify(
                 "success",
                 detail.lines().next().unwrap_or("安装完成").to_string(),

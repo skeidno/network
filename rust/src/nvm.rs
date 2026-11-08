@@ -14,6 +14,20 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::Command;
 
+/// nvm.exe 是控制台程序。GUI 进程直接起它时，Windows 会给子进程新建一个
+/// 控制台窗口 —— 屏幕上一闪而过的黑框就是这么来的。体检每问一次版本就闪一次，
+/// 所以所有 nvm 调用统一从这里走，带上 CREATE_NO_WINDOW。
+fn nvm_command() -> Command {
+    let mut cmd = Command::new("nvm");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// nvm-windows 本体对应的 winget 包。只装最新版，不参与版本管理 ——
 /// nvm 自己升级用 `nvm upgrade` 就够了，给它开版本选择反而添乱。
 pub const NVM_WINGET_ID: &str = "CoreyButler.NVMforWindows";
@@ -24,7 +38,7 @@ pub const NVM_WINGET_ID: &str = "CoreyButler.NVMforWindows";
 /// 不设的话它会去读一个可能不存在的全局配置并直接报错退出。
 fn run_nvm(args: &[&str]) -> String {
     let bindir = PathBuf::from(r"C:\Program Files\nodejs");
-    let result = Command::new("nvm")
+    let result = nvm_command()
         .args(args)
         .env("NVM_SYMLINK", bindir)
         .env("NVM_HOME", nvm_home())
@@ -48,14 +62,6 @@ fn run_nvm(args: &[&str]) -> String {
 /// 直接问环境变量更稳，`NVM_HOME` 是 nvm 自己装的时候写进用户环境的。
 pub fn nvm_home_pub() -> String {
     nvm_home().to_string_lossy().to_string()
-}
-
-/// 已经装了几个 Node 版本。查不到返回 0。
-pub fn installed_count() -> usize {
-    if !installed() {
-        return 0;
-    }
-    parse_list(&run_nvm(&["list"])).len()
 }
 
 fn nvm_home() -> PathBuf {
@@ -221,8 +227,22 @@ fn parse_available(output: &str) -> Vec<(String, &'static str)> {
     rows
 }
 
-/// nvm 的完整状态，给前端下拉框用。
+/// nvm 的完整状态，给前端下拉框用：含可安装版本列表（要联网）。
+///
+/// 只在前端显式要版本下拉时调（nvmStatus），不要塞进环境体检。
 pub fn status() -> Value {
+    status_impl(true)
+}
+
+/// 体检用的本地状态：只问已装版本和当前版本，不联网。
+///
+/// `nvm list available` 会去 nodejs.org 拉全量版本表，几秒起步还可能超时。
+/// 环境体检会被反复调用，顺手做这件事既慢又让人以为程序卡死。
+pub fn status_local() -> Value {
+    status_impl(false)
+}
+
+fn status_impl(include_available: bool) -> Value {
     let has_nvm = installed();
     if !has_nvm {
         return json!({
@@ -241,8 +261,13 @@ pub fn status() -> Value {
     let installed_versions = parse_list(&list_out);
     let current = parse_current(&list_out);
 
-    // available 要联网拉，几秒延迟。查不到不该影响已装版本的使用，所以失败即空列表
-    let available = parse_available(&run_nvm(&["list", "available"]));
+    // available 要联网拉，几秒延迟。查不到不该影响已装版本的使用，所以失败即空列表。
+    // 体检走 status_local，这里根本不发起这次请求。
+    let available = if include_available {
+        parse_available(&run_nvm(&["list", "available"]))
+    } else {
+        Vec::new()
+    };
 
     json!({
         "installed": true,

@@ -15,7 +15,25 @@
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// 起一条不弹控制台窗口的后台命令。
+///
+/// 本程序是 GUI 子系统（`windows_subsystem = "windows"`），没有自己的控制台。
+/// Windows 给控制台子进程（nvm / node --version / git / cmd / winget …）默认
+/// 新建一个窗口，于是每次体检都闪一串黑框。CREATE_NO_WINDOW 只隐藏窗口，
+/// stdout/stderr 照常能捕获，不影响探测结果。非 Windows 平台原样返回。
+fn command(program: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
 
 /// 单个环境的探测结果。前端只认这些字段，别的一律塞进 `note`。
 #[derive(Debug, Clone)]
@@ -131,7 +149,7 @@ impl EnvItem {
 /// 刻意不隐藏输出错误：这里拿到的就是我们要转述给用户的东西，
 /// 吞掉错误只会让「为什么探测不到」变成玄学。
 fn run_capture(program: &str, args: &[&str]) -> String {
-    let out = Command::new(program)
+    let out = command(program)
         .args(args)
         .output();
     match out {
@@ -440,9 +458,14 @@ fn is_conda_python(exe: &Path) -> bool {
 /// 安装（比如编辑器自带的），PATH 里的 node.exe 未必是用户实际在用的那个。
 /// 这时报「PATH 里那个的版本」会给出误导性的结论 —— 用户以为自己用的是
 /// 22.17.1，其实 nvm 已经切到别的版本去了。
-fn probe_node(item: &mut EnvItem) {
-    if crate::nvm::installed() {
-        let nvm_state = crate::nvm::status();
+/// `nvm_state` 由 scan_items 统一取一次传进来（status_local，不联网）。
+/// 早先这里自己调 `nvm::status()`，每体检一遍就顺手联网拉一次全量版本表。
+fn probe_node(item: &mut EnvItem, nvm_state: &Value) {
+    if nvm_state
+        .get("installed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         let installed = nvm_state
             .get("installedVersions")
             .and_then(|v| v.as_array())
@@ -530,7 +553,7 @@ fn probe_jdk(item: &mut EnvItem) {
 
 #[cfg(windows)]
 fn java_home() -> Option<String> {
-    let out = Command::new("cmd")
+    let out = command("cmd")
         .args(["/C", "echo", "%JAVA_HOME%"])
         .output()
         .ok()?;
@@ -738,7 +761,40 @@ fn probe_vcredist(item: &mut EnvItem) {
 /// 体检全部条目。
 ///
 /// 顺序保持目录序：用户扫一眼卡片列表时，位置稳定比排序更有用。
+/// 体检结果的短期缓存。
+///
+/// 前端曾经把「进环境页」写成每轮状态轮询都调一次，结果每 2.5 秒就全量
+/// 重扫十几个工具、起一堆控制台子进程。前端已改成只在切页时拉一次，
+/// 这里再兜一层：即便调用方以后又写错，同一进程内 15 秒内也只真扫一次，
+/// 不会把整机 CPU 和一堆黑窗口拖起来。装完 / 切完版本走 scan_fresh 强制重扫。
+static SCAN_CACHE: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
+const SCAN_MIN_INTERVAL: Duration = Duration::from_secs(15);
+
+/// 常规体检：命中短期缓存就直接复用上次的快照。
 pub fn scan() -> Value {
+    scan_cached(false)
+}
+
+/// 安装 / 切换 / 卸载之后强制重扫：这时环境真的变了，缓存必须失效。
+pub fn scan_fresh() -> Value {
+    scan_cached(true)
+}
+
+fn scan_cached(force: bool) -> Value {
+    let mut cache = SCAN_CACHE.lock().unwrap_or_else(|err| err.into_inner());
+    if !force {
+        if let Some((at, ref value)) = *cache {
+            if at.elapsed() < SCAN_MIN_INTERVAL {
+                return value.clone();
+            }
+        }
+    }
+    let value = build_scan();
+    *cache = Some((Instant::now(), value.clone()));
+    value
+}
+
+fn build_scan() -> Value {
     let items = scan_items();
     let installed = items.iter().filter(|item| item.ready).count();
     let outdated = items.iter().filter(|item| item.outdated).count();
@@ -777,13 +833,21 @@ const MIN_ADB: &str = "30.0.0";
 fn scan_items() -> Vec<EnvItem> {
     let mut items = Vec::new();
 
+    // nvm 状态只取一次，Node 卡片和 nvm 卡片共用：纯本地、不联网。
+    // 复用同一份快照，也免得两处各起一遍 nvm 子进程。
+    let nvm_state = crate::nvm::status_local();
+    let nvm_installed = nvm_state
+        .get("installed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let mut python = EnvItem::new("python", "Python", MIN_PYTHON);
     probe_python(&mut python);
     python.finalize();
     items.push(python);
 
     let mut node = EnvItem::new("node", "Node.js", MIN_NODE);
-    probe_node(&mut node);
+    probe_node(&mut node, &nvm_state);
     node.finalize();
     items.push(node);
 
@@ -791,11 +855,19 @@ fn scan_items() -> Vec<EnvItem> {
     // 它只在「要装指定版本 Node」时才必需，所以不设最低版本 —— 老 nvm 也能用。
     // 只装最新版：nvm 自己有 `nvm upgrade`，给它开版本选择纯属添乱。
     let mut nvm = EnvItem::new("nvm", "nvm（Node 版本管理）", "");
-    if crate::nvm::installed() {
+    if nvm_installed {
         nvm.ready = true;
-        nvm.version = crate::nvm::version();
+        nvm.version = nvm_state
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         nvm.path = crate::nvm::nvm_home_pub();
-        let count = crate::nvm::installed_count();
+        let count = nvm_state
+            .get("installedVersions")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
         nvm.note = if count > 0 {
             format!("已托管 {count} 个 Node 版本")
         } else {
@@ -983,7 +1055,7 @@ fn run_winget_command(
         }
     }
 
-    let output = Command::new("winget")
+    let output = command("winget")
         .args(&args)
         .output()
         .map_err(|error| format!("调用 winget 失败：{error}"))?;
@@ -1020,13 +1092,13 @@ pub fn open_download(id: &str) -> Result<(), String> {
 /// 用系统默认浏览器打开一个链接。
 fn open_url(url: &str) -> Result<(), String> {
     #[cfg(windows)]
-    let result = Command::new("cmd")
+    let result = command("cmd")
         .args(["/C", "start", "", url])
         .spawn();
     #[cfg(target_os = "macos")]
-    let result = Command::new("open").arg(url).spawn();
+    let result = command("open").arg(url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
-    let result = Command::new("xdg-open").arg(url).spawn();
+    let result = command("xdg-open").arg(url).spawn();
     result
         .map(|_| ())
         .map_err(|err| format!("打开链接失败：{err}"))
@@ -1055,7 +1127,7 @@ pub fn available_versions(id: &str) -> Result<Value, String> {
     if !winget_available() {
         return Err("本机没有 winget，无法查询可安装版本。".to_string());
     }
-    let output = Command::new("winget")
+    let output = command("winget")
         .args([
             "show",
             "--id",

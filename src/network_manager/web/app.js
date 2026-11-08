@@ -185,9 +185,9 @@ function renderActivePage() {
     }
   }
   else if (currentPage === "settings") renderSettings();
-  // 环境页不在每轮状态里渲染：体检要起子进程问版本号，塞进状态轮询会拖慢整页刷新。
-  // 改成切进页面时按需拉一次。
-  else if (currentPage === "env") refreshEnv();
+  // 环境页绝不能挂在每轮状态轮询上：体检要起十几个子进程问版本号，
+  // 停在这个页面就会每 2.5 秒全量重扫一次，无限循环地弹控制台黑框。
+  // 改成只在切进页面时拉一次，见 commitPageSwitch()。
   else if (currentPage === "logs") refreshLogs();
 }
 
@@ -204,6 +204,8 @@ function commitPageSwitch() {
   });
   byId("page-title").textContent = PAGE_TITLES[page];
   renderActivePage();
+  // 体检只在真正切进环境页时跑一次，不跟随状态轮询。
+  if (page === "env") refreshEnv();
   scheduleStateRefresh(0);
 }
 
@@ -1297,7 +1299,7 @@ async function runNvmAction(method, version, verb) {
   else await refreshEnv();
 }
 
-async function refreshEnv() {
+async function refreshEnv(force = false) {
   if (envScanning || envBusy) return;
   envScanning = true;
   const summary = byId("env-summary");
@@ -1306,7 +1308,9 @@ async function refreshEnv() {
     // nvm 状态先拉：Node 卡片要靠它画版本管理区。
     // 放在 scanEnv 之前，两个都是子进程调用，顺序不影响耗时。
     if (!nvmState) await refreshNvm();
-    const data = await invoke("scanEnv");
+    // 后端对体检结果有 15 秒缓存，防止意外的高频轮询把整机拖起来；
+    // 用户手动点「重新体检」要绕过缓存，否则点了像没反应。
+    const data = await invoke("scanEnv", force);
     renderEnv(data);
   } catch (error) {
     summary.textContent = `体检失败：${error.message || error}`;
@@ -3200,7 +3204,7 @@ function bindEvents() {
   byId("open-logs").addEventListener("click", () => invoke("openLogs"));
 
   // 环境管理页
-  byId("env-refresh").addEventListener("click", () => refreshEnv());
+  byId("env-refresh").addEventListener("click", () => refreshEnv(true));
   byId("env-install-all").addEventListener("click", () => installAllEnv());
   byId("env-detail-close").addEventListener("click", () => { byId("env-detail").hidden = true; });
   // 卡片里的按钮是渲染出来的，用事件委托绑一次就够，不用每张卡重绑
