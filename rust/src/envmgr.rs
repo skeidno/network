@@ -1367,12 +1367,32 @@ fn run_winget_command(
 
     if output.status.success() {
         Ok(combined)
+    } else if winget_no_op(&combined) {
+        // winget 对「已经装了、又没有可用升级」也返回非零（0x8A15002B）。
+        // 这不是安装失败：卡片还没刷新时用户会再点一次「一键部署」，
+        // 第二次不能因为「其实早就装好了」而报错。
+        Ok(format!("{package} 已是最新，无需重复安装。\n{combined}"))
     } else {
         Err(format!(
             "winget {action} 退出码 {:?}：\n{combined}",
             output.status.code()
         ))
     }
+}
+
+/// 识别 winget 的「无需操作」输出。必须同时出现「已安装」和「没有可用升级」两层意思，
+/// 免得把下载失败、哈希校验失败这类真错误也当成成功。
+fn winget_no_op(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    let says_installed = output.contains("已安装")
+        || lower.contains("already installed")
+        || lower.contains("existing package");
+    let says_nothing_to_do = output.contains("找不到可用的升级")
+        || output.contains("没有可用的较新的包版本")
+        || lower.contains("no applicable upgrade")
+        || lower.contains("no newer package versions")
+        || lower.contains("no available upgrade");
+    says_installed && says_nothing_to_do
 }
 
 /// 打开某个工具的下载页。winget 不覆盖的版本走这里。
@@ -1940,5 +1960,19 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout).trim()
             );
         }
+    }
+
+    #[test]
+    fn winget_已装且无可用升级不算失败() {
+        // 实测 Go 已装 1.27.3 后再点「一键部署」，winget 返回 -1978335189
+        // 和这段中文输出；以前被当成安装失败。
+        let zh = "找到已安装的现有包。正在尝试升级已安装的包...\r\n\
+                  找不到可用的升级。\r\n配置的源中没有可用的较新的包版本。";
+        assert!(winget_no_op(zh), "中文 no-op 输出应当识别为成功");
+        let en = "Found an existing package already installed. No applicable upgrade found.";
+        assert!(winget_no_op(en), "英文 no-op 输出应当识别为成功");
+        assert!(!winget_no_op("已安装程序哈希校验失败；下载被中断"));
+        assert!(!winget_no_op("已安装"), "只说装了、没说没得升，不能判成功");
+        assert!(!winget_no_op(""));
     }
 }
