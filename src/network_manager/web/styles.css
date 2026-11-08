@@ -2207,6 +2207,19 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
 }
 
 /* --- 环境管理：分组、最新稳定版与「有新版」状态 --- */
+/* 环境页有两组长卡片，一滚到底部工具栏就没影了 —— 用户会以为
+   「一键部署 / 检查最新版本」根本没打进这个版本。让按钮区常驻。 */
+.env-page > .page-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  padding: 8px 0;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line-hairline);
+}
+.env-summary-idle { color: var(--text-3); }
+.env-summary-warn { color: var(--amber-text); }
+
 .env-groups { display: flex; flex-direction: column; gap: 20px; margin-bottom: 18px; }
 .env-group { min-width: 0; }
 .env-group-head {

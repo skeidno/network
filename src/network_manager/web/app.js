@@ -1115,6 +1115,10 @@ function renderEnv(data) {
   const parts = [`<strong>${data.ready}/${data.total}</strong> 已就绪`];
   if (outdated.length) parts.push(`${outdated.length} 项版本过旧（${escapeHtml(outdated.map((i) => i.name).join("、"))}）`);
   if (missing.length) parts.push(`${missing.length} 项缺失（${escapeHtml(missing.map((i) => i.name).join("、"))}）`);
+  // 「一键部署缺失项」是灰的时候把原因写在摘要里，别让人以为功能没打进这个版本。
+  const coreMissing = missing.filter((item) => (item.group || "core") === "core");
+  if (!coreMissing.length) parts.push(`<span class="env-summary-idle">运行环境已齐，无需部署</span>`);
+  if (!data.winget) parts.push(`<span class="env-summary-warn">未找到 winget，自动安装不可用</span>`);
   summary.innerHTML = parts.join(" · ");
 
   // 分两栏：core 是程序依赖，language 是可选工具链。分组还有个实际作用 ——
