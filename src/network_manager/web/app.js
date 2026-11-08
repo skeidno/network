@@ -1206,7 +1206,7 @@ function renderEnvCard(item) {
       <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">查看官网版本</button>`;
   } else if (item.ready) {
     actions = `${updatable
-        ? `<button type="button" class="button primary" data-env-update="${escapeHtml(item.id)}" title="升到 winget 源里当前系列的最新版；Rust 走 rustup update stable">${icon("arrow-up")}<span>更新</span></button>`
+        ? `<button type="button" class="button primary" data-env-update="${escapeHtml(item.id)}" title="自动更新到官方最新稳定版：跨大版本会装最新版对应的 winget 包（旧版本保留）；Rust 走 rustup，Node 走 nvm">${icon("arrow-up")}<span>更新</span></button>`
         : ""}
       <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">打开官网</button>`;
   } else {
@@ -1518,7 +1518,7 @@ async function checkEnvLatest(force = false) {
     const bits = [`已查 ${Number(data.ok || 0)} 项`];
     if (data.failed) bits.push(`${data.failed} 项查询失败（对应卡片上有提示）`);
     if (data.checkedAt) bits.push(`检查于 ${data.checkedAt}`);
-    bits.push("winget 按大版本分包，更新只升当前系列");
+    bits.push("点「更新」会自动跨大版本装最新版（旧版本保留）");
     bar.textContent = bits.join(" · ");
     showToast("success", "最新版本已更新");
   } catch (error) {
@@ -1535,7 +1535,11 @@ async function checkEnvLatest(force = false) {
 }
 
 function updateEnvById(id) {
-  return runEnvAction(id, "updateEnv", "更新");
+  // 把查到的官方最新稳定版一起传下去：后端据此判断是否跨大版本、该装哪个 winget 包。
+  // 没查过最新版本时传空串，后端会保守地走同系列升级。
+  const info = envLatest && envLatest.items ? envLatest.items[id] : null;
+  const latest = info && info.latest ? info.latest : "";
+  return runEnvAction(id, "updateEnv", "更新", latest);
 }
 
 /** 依次更新所有「查到新版且本机能更新」的项。逐条跑，winget 有全局安装锁。 */
@@ -1552,7 +1556,9 @@ async function updateAllEnv() {
   const chunks = [];
   try {
     for (const id of ids) {
-      const result = await invoke("updateEnv", id);
+      const info = envLatest && envLatest.items ? envLatest.items[id] : null;
+      const latest = info && info.latest ? info.latest : "";
+      const result = await invoke("updateEnv", id, latest);
       if (result && result.detail) chunks.push(`### ${id}\n${result.detail}`);
       if (result && result.env) {
         envData = result.env;

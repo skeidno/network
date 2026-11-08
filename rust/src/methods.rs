@@ -1399,7 +1399,9 @@ pub async fn dispatch(
             if id.is_empty() {
                 return Err("缺少环境条目 id".into());
             }
-            run_env_action(state, &id, "", crate::envmgr::update)
+            // 第二个参数是前端查到的官方最新稳定版：跨大版本时据此推导 winget 包 id
+            let latest = text(&args, 1).to_string();
+            run_env_action(state, &id, &latest, crate::envmgr::update)
         }
         // 最新版本查询会联网，已在 server.rs 的锁外分支处理；留个明确报错，
         // 免得以后有人从别的路径调进来，还以为是「未知方法」。

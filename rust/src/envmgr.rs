@@ -266,17 +266,15 @@ const EXTRA_EXE_DIRS: &[&str] = &[
     r"C:\Program Files\Go\bin",
     r"C:\Program Files\dotnet",
     r"C:\Program Files\PHP",
-    r"C:\Program Files\Bun\bin",
 ];
 
-/// 用户目录下的工具链 bin（rustup / bun / go 默认都装在这里）。
+/// 用户目录下的工具链 bin（rustup / go 默认都装在这里）。
 /// PATH 里通常有，但有些机器是手动配的，补一层兜底能少报几个假的「缺失」。
 fn home_exe_dirs() -> Vec<PathBuf> {
     let mut dirs_out = Vec::new();
     if let Some(home) = dirs::home_dir() {
         for rel in [
             r".cargo\bin",
-            r".bun\bin",
             r"go\bin",
             r"AppData\Local\Programs\Go\bin",
             r"AppData\Local\Programs\PHP",
@@ -627,14 +625,6 @@ fn probe_ruby(item: &mut EnvItem) {
         return;
     }
     item.note = "未找到 ruby.exe；Windows 上通常用 RubyInstaller 安装".to_string();
-}
-
-/// Bun：`bun --version` 是很干净的一行版本号。
-fn probe_bun(item: &mut EnvItem) {
-    if probe_by_version(item, &["bun.exe", "bun"], &["--version"]) {
-        return;
-    }
-    item.note = "未找到 bun.exe；默认装在用户目录的 .bun\\bin".to_string();
 }
 
 /// JDK：javac -version 输出 javac 21.0.11；
@@ -1033,11 +1023,6 @@ fn scan_items() -> Vec<EnvItem> {
     ruby.finalize();
     items.push(ruby);
 
-    let mut bun = EnvItem::new_lang("bun", "Bun");
-    probe_bun(&mut bun);
-    bun.finalize();
-    items.push(bun);
-
     items
 }
 
@@ -1073,7 +1058,6 @@ fn winget_id(id: &str) -> Option<&'static str> {
         "dotnet" => Some("Microsoft.DotNet.SDK.10"),
         "php" => Some("PHP.PHP.8.5"),
         "ruby" => Some("RubyInstallerTeam.Ruby.4.0"),
-        "bun" => Some("Oven-sh.Bun"),
         _ => None,
     }
 }
@@ -1120,22 +1104,73 @@ pub fn reinstall(id: &str, version: &str) -> Result<String, String> {
 pub fn can_update(id: &str) -> bool {
     match id {
         "rust" => find_exe(&["rustup.exe", "rustup"]).is_some(),
-        "node" => false,
+        // Node 有 nvm 就能装并切到最新版；没 nvm 时仍走卡片里的「版本管理」。
+        // installed() 只查文件、不起子进程，逐项放进 to_json 也不拖慢体检。
+        "node" => crate::nvm::installed(),
         _ => winget_id(id).is_some() && winget_available(),
     }
 }
 
-/// 把已装的工具升到最新。
+/// 按大版本分包的 winget 项，从「最新稳定版」推出它对应的包 id。
 ///
-/// 与 `reinstall` 的关键差别：**绝不回退到 `--force` 强制安装**。
-/// 重装允许「升级失败就卸了重装」，那是用户明知过期、主动点重装的场景；
-/// 「更新」只是想顺手升一下，不能因为源里没这个包就把用户环境卸掉。
+/// winget 把 Python 3.13 / 3.14、PHP 8.4 / 8.5 这类大版本拆成不同的包，
+/// `winget upgrade` 只会在同一个包里升补丁号。要装到官方最新版，
+/// 就得拼出最新大版本的那个包 id。拼出来的串只可能是固定前缀 + 数字点，
+/// 这里再过一道字符白名单才允许进命令行。
 ///
-/// 签名带一个用不上的 `version`，是为了跟 install/reinstall 共用
-/// methods.rs 里 `run_env_action` 的函数指针类型。
-pub fn update(id: &str, _version: &str) -> Result<String, String> {
+/// 不覆盖的项返回 None：GoLang.Go / Rustlang.Rustup 本来就只有一个包，
+/// nvm 与 rustup 各有自己的更新通道。
+fn cross_major_package(id: &str, latest: &str) -> Option<String> {
+    let series = |count: usize| -> Option<String> {
+        let parts: Vec<&str> = latest
+            .trim()
+            .trim_start_matches(['v', 'V'])
+            .split('.')
+            .take(count)
+            .collect();
+        if parts.len() != count
+            || parts
+                .iter()
+                .any(|part| part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()))
+        {
+            return None;
+        }
+        Some(parts.join("."))
+    };
+    let candidate = match id {
+        "python" => format!("Python.Python.{}", series(2)?),
+        "php" => format!("PHP.PHP.{}", series(2)?),
+        "ruby" => format!("RubyInstallerTeam.Ruby.{}", series(2)?),
+        "dotnet" => format!("Microsoft.DotNet.SDK.{}", series(1)?),
+        _ => return None,
+    };
+    if candidate
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// 把已装的工具更新到官方最新稳定版。
+///
+/// 三条路径，按 id 选：
+/// - Node → `nvm install <latest>` + 切换（nvm 自己管多版本，不碰 winget）
+/// - Rust → `rustup update stable`（一次把 rustc / cargo / std 全升到 stable）
+/// - 其余 → winget。若最新版属于另一个大版本包（Python 3.13 → 3.15），
+///   直接 `winget install` 那个新包，**旧包保留、不卸载**；新系列还没进
+///   winget 源（实测 Python 3.15 就还没有）就退回同系列 upgrade 并如实说明。
+///
+/// 全程不碰 `--force`：更新不该有「卸了旧的却没装回来」的风险。
+/// `latest` 由前端把查到的最新稳定版传进来，空串表示没查到，走保守的同系列升级。
+pub fn update(id: &str, latest: &str) -> Result<String, String> {
     if id == "node" {
-        return Err("Node.js 请用卡片里的「版本管理」安装并切换新版本".into());
+        if latest.is_empty() {
+            return Err("没拿到 Node 最新版本号，请先点「检查最新版本」".into());
+        }
+        return crate::nvm::install_version(latest);
     }
 
     // Rust 走官方工具链：rustup 能一次把 rustc / cargo / std 全部升到 stable，
@@ -1171,19 +1206,44 @@ pub fn update(id: &str, _version: &str) -> Result<String, String> {
     if !winget_available() {
         return Err("本机没有 winget，无法自动更新".into());
     }
+
+    // 跨大版本：装最新版对应的那个 winget 包，旧版本保留。
+    if let Some(target) = cross_major_package(id, latest) {
+        if target != package {
+            match run_winget_command("install", &target, &WINGET_COMMON, None, None) {
+                Ok(detail) => {
+                    return Ok(format!(
+                        "官方最新稳定版 {latest} 属于 {target}，与当前 {package} 不是同一个 winget 包。\n\
+                         已自动安装新系列（旧版本保留、没有卸载）；PATH / 版本选择器指向哪个由安装器决定。\n{detail}"
+                    ));
+                }
+                Err(install_error) => {
+                    // 官方发了新版但 winget 源还没跟上，很常见。退回同系列升级，
+                    // 并把「这次没到官方最新」说清楚，别假装成功。
+                    let upgrade =
+                        run_winget_command("upgrade", package, &WINGET_COMMON, None, None)
+                            .map_err(|upgrade_error| {
+                                format!(
+                                    "安装最新系列 {target} 失败：{install_error}\n\
+                                     同系列升级也失败：{upgrade_error}"
+                                )
+                            })?;
+                    return Ok(format!(
+                        "winget 源里暂时还没有 {target}（官方最新 {latest}），已改为升级当前系列 {package}；\
+                         这次可能达不到官方最新版。\n{upgrade}"
+                    ));
+                }
+            }
+        }
+    }
+
     let detail = run_winget_command("upgrade", package, &WINGET_COMMON, None, None)?;
     if detail.contains("No applicable upgrade") || detail.contains("没有可用的升级") {
         return Ok(format!(
-            "{package} 已是 winget 源里当前系列的最新版。\n\
-             注意：winget 按大版本分包，官方最新稳定版可能属于另一个系列，\
-             需要到官网或用「查看可安装版本」手动安装。\n{detail}"
+            "{package} 已是 winget 源里的最新版，无需重复更新。\n{detail}"
         ));
     }
-    Ok(format!(
-        "{package} 已更新。\n\
-         注意：winget 按大版本分包，本次只升到当前系列最新版；\
-         跨大版本请到官网或用「查看可安装版本」。\n{detail}"
-    ))
+    Ok(format!("{package} 已更新。\n{detail}"))
 }
 
 /// 组装并执行 winget 命令。
@@ -1304,7 +1364,6 @@ pub fn open_download(id: &str) -> Result<(), String> {
         "dotnet" => "https://dotnet.microsoft.com/download",
         "php" => "https://www.php.net/downloads.php",
         "ruby" => "https://rubyinstaller.org/",
-        "bun" => "https://bun.sh/",
         _ => return Err(format!("未知的环境条目：{id}")),
     };
     open_url(url)
@@ -1400,7 +1459,7 @@ static LATEST_CACHE: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
 const LATEST_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// id →（数据源 URL，来源名）。endoflife.date 的 API 返回「最新周期在前」的数组，
-/// 第一项的 `latest` 就是该系列最新稳定补丁版；Bun 没有该产品，改查 npm registry。
+/// 第一项的 `latest` 就是该系列最新稳定补丁版。
 const LATEST_SOURCES: &[(&'static str, &'static str, &'static str)] = &[
     ("python", "https://endoflife.date/api/python.json", "endoflife.date"),
     ("node", "https://endoflife.date/api/nodejs.json", "endoflife.date"),
@@ -1409,7 +1468,6 @@ const LATEST_SOURCES: &[(&'static str, &'static str, &'static str)] = &[
     ("dotnet", "https://endoflife.date/api/dotnet.json", "endoflife.date"),
     ("php", "https://endoflife.date/api/php.json", "endoflife.date"),
     ("ruby", "https://endoflife.date/api/ruby.json", "endoflife.date"),
-    ("bun", "https://registry.npmjs.org/bun/latest", "npm registry"),
 ];
 
 /// 从各数据源的 JSON 里挑出版本号。数组取首项的 latest / cycle，对象取 version。
@@ -1555,7 +1613,6 @@ mod tests {
             extract_version("ruby 4.0.9 (2026-03-14) [x64-mingw-ucrt]"),
             "4.0.9"
         );
-        assert_eq!(extract_version("1.4.4"), "1.4.4");
     }
 
     #[test]
@@ -1567,10 +1624,10 @@ mod tests {
         );
         // 没有 latest 就退回 cycle，别把整项丢掉
         assert_eq!(parse_latest(r#"[{"cycle":"1.99"}]"#), Some("1.99".to_string()));
-        // npm registry 是对象
+        // 防御性兼容：以后若接回对象形数据源也能解析
         assert_eq!(
-            parse_latest(r#"{"version":"1.4.4","name":"bun"}"#),
-            Some("1.4.4".to_string())
+            parse_latest(r#"{"version":"2.0.1"}"#),
+            Some("2.0.1".to_string())
         );
         assert_eq!(parse_latest(r#"{"version":"v26.13.0"}"#), Some("26.13.0".to_string()));
         assert_eq!(parse_latest(r#"{"version":"unknown"}"#), None);
@@ -1580,26 +1637,51 @@ mod tests {
 
     #[test]
     fn 新增语言项都有安装源与官网链接() {
-        for id in ["rust", "go", "dotnet", "php", "ruby", "bun"] {
+        for id in ["rust", "go", "dotnet", "php", "ruby"] {
             assert!(winget_id(id).is_some(), "{id} 缺 winget 包 id");
         }
-        assert_eq!(can_update("node"), false);
+    }
+
+    #[test]
+    fn 跨大版本包id从最新稳定版推导() {
+        assert_eq!(
+            cross_major_package("python", "3.15.2").as_deref(),
+            Some("Python.Python.3.15")
+        );
+        assert_eq!(
+            cross_major_package("php", "8.5.12").as_deref(),
+            Some("PHP.PHP.8.5")
+        );
+        assert_eq!(
+            cross_major_package("ruby", "4.0.9").as_deref(),
+            Some("RubyInstallerTeam.Ruby.4.0")
+        );
+        assert_eq!(
+            cross_major_package("dotnet", "10.0.13").as_deref(),
+            Some("Microsoft.DotNet.SDK.10")
+        );
+        // 只有一个包的项不需要推导；脏版本号不能拼出命令参数
+        assert_eq!(cross_major_package("go", "1.27.3"), None);
+        assert_eq!(cross_major_package("rust", "1.99.1"), None);
+        assert_eq!(cross_major_package("python", "garbage"), None);
+        assert_eq!(cross_major_package("python", ""), None);
     }
 
     #[test]
     fn 语言工具链单列一组且不设最低版本() {
         let items = scan_items();
         let langs: Vec<&EnvItem> = items.iter().filter(|item| item.group == "language").collect();
-        assert_eq!(langs.len(), 6, "语言工具链应有 6 项");
+        assert_eq!(langs.len(), 5, "语言工具链应有 5 项");
         assert!(
             langs
                 .iter()
                 .all(|item| item.min_version.is_empty() && !item.outdated),
             "语言项不该被判「版本过旧」，新旧交给最新稳定版查询"
         );
-        for id in ["rust", "go", "dotnet", "php", "ruby", "bun"] {
+        for id in ["rust", "go", "dotnet", "php", "ruby"] {
             assert!(items.iter().any(|item| item.id == id), "体检结果缺 {id}");
         }
+        assert!(!items.iter().any(|item| item.id == "bun"), "Bun 已按要求移除");
         assert_eq!(items.iter().filter(|item| item.group == "core").count(), 8);
     }
 
@@ -1614,8 +1696,8 @@ mod tests {
             .and_then(Value::as_object)
             .expect("返回里要有 items");
         assert!(
-            value.get("ok").and_then(Value::as_u64).unwrap_or(0) >= 6,
-            "至少 6 个数据源要成功：{value}"
+            value.get("ok").and_then(Value::as_u64).unwrap_or(0) >= 5,
+            "至少 5 个数据源要成功：{value}"
         );
         for (id, entry) in items {
             assert!(
@@ -1623,7 +1705,7 @@ mod tests {
                 "{id} 既没版本也没错误"
             );
         }
-        for id in ["rust", "go", "python", "node", "dotnet", "php", "ruby", "bun"] {
+        for id in ["rust", "go", "python", "node", "dotnet", "php", "ruby"] {
             let latest = items
                 .get(id)
                 .and_then(|entry| entry.get("latest"))
