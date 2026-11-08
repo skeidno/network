@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 
 use crate::core::{AppState, NodeDelay};
 use crate::importers::{parse_import_content, unique_node_name};
@@ -1372,63 +1373,19 @@ pub async fn dispatch(
         } else {
             crate::envmgr::scan()
         }),
-        // 版本参数可选：不给就是装最新版，给了就是装那个版本。
-        // Node 在 envmgr 里会被转给 nvm 处理，别的走 winget 的 --version。
-        "installEnv" => {
-            let id = text(&args, 0).to_string();
-            if id.is_empty() {
-                return Err("缺少环境条目 id".into());
-            }
-            let version = text(&args, 1).to_string();
-            run_env_action(state, &id, &version, crate::envmgr::install)
-        }
-        // 「装了但版本太老」走重装：先试 winget upgrade，不行再退回强制安装。
-        // 与 install 分开是因为语义不同 —— 强制安装会先卸载，失败的话用户环境就没了，
-        // 不能让前端在「一键部署缺失项」里顺手触发。
-        "reinstallEnv" => {
-            let id = text(&args, 0).to_string();
-            if id.is_empty() {
-                return Err("缺少环境条目 id".into());
-            }
-            let version = text(&args, 1).to_string();
-            run_env_action(state, &id, &version, crate::envmgr::reinstall)
-        }
-        // 「更新」：非破坏性升级，绝不回退到强制安装。Rust 走 rustup，其余走 winget upgrade。
-        "updateEnv" => {
-            let id = text(&args, 0).to_string();
-            if id.is_empty() {
-                return Err("缺少环境条目 id".into());
-            }
-            // 第二个参数是前端查到的官方最新稳定版：跨大版本时据此推导 winget 包 id
-            let latest = text(&args, 1).to_string();
-            run_env_action(state, &id, &latest, crate::envmgr::update)
+        // install / reinstall / update 会同步跑 winget 几十秒到几分钟，
+        // 必须走 server.rs 的锁外通道（run_env_long_action）。dispatch 是持锁调用的，
+        // 留在这里会把状态轮询一起卡死。保留明确报错，免得以后有人从别的路径调进来。
+        "installEnv" | "reinstallEnv" | "updateEnv" => {
+            Err("环境安装须走锁外通道".into())
         }
         // 最新版本查询会联网，已在 server.rs 的锁外分支处理；留个明确报错，
         // 免得以后有人从别的路径调进来，还以为是「未知方法」。
         "envLatestVersions" => Err("最新版本查询须走锁外通道".into()),
         // Node 的版本与 nvm 状态（已装哪些、可装哪些、当前用哪个）
         "nvmStatus" => Ok(crate::nvm::status()),
-        // 装 / 切 / 卸指定的 Node 版本
-        "nvmInstallVersion" => {
-            let version = text(&args, 0).to_string();
-            state.busy = true;
-            let result = crate::nvm::install_version(&version);
-            state.busy = false;
-            let fresh = crate::nvm::status();
-            // env 一起返回：前端重画时就不用再发一次 scanEnv，
-            // 命令输出与界面状态来自同一份快照
-            let env = crate::envmgr::scan_fresh();
-            match result {
-                Ok(detail) => {
-                    state.notify("success", format!("已安装并切换到 Node {version}"));
-                    Ok(json!({ "detail": detail, "nvm": fresh, "env": env }))
-                }
-                Err(error) => {
-                    state.notify("error", error.lines().next().unwrap_or("安装失败").to_string());
-                    Err(error)
-                }
-            }
-        }
+        // nvm install 要下载整个 Node 包，同样走锁外通道。
+        "nvmInstallVersion" => Err("Node 版本安装须走锁外通道".into()),
         "nvmUseVersion" => {
             let version = text(&args, 0).to_string();
             let result = crate::nvm::use_version(&version);
@@ -2442,31 +2399,98 @@ fn win_srv_profile(
 ///
 /// 参数是函数指针而不是再传一个 bool —— 安装与重装的区别留在 envmgr 内部，
 /// 这里不该知道 winget 到底会 upgrade 还是会 force install。
-fn run_env_action(
-    state: &mut AppState,
-    id: &str,
-    version: &str,
-    action: fn(&str, &str) -> Result<String, String>,
+/// 耗时的环境动作（winget / nvm 安装与更新）在 state 锁外执行。
+///
+/// dispatch 是持 `shared.lock()` 调用的；winget 下载并安装一个 MSI 要几十秒到
+/// 几分钟，放在里面会让 `/api/state`、静态资源一起排队，界面就是「点了没反应」。
+/// 这里只在首尾短暂取锁改 busy 和发通知，中间用 spawn_blocking 跑同步动作，
+/// 既不占锁也不阻塞 tokio 的 worker。
+pub async fn run_env_long_action(
+    shared: &Shared,
+    method: &str,
+    args: Vec<Value>,
 ) -> Result<Value, String> {
-    // 执行期间置 busy：挡住其它会改配置的调用，也提示前端转圈
-    state.busy = true;
-    let result = action(id, version);
-    state.busy = false;
-    match result {
-        Ok(detail) => {
-            // 装完立刻重扫，界面上的状态当场变绿，不用用户手动刷新。
-            // 过期项还会顺带从 outdated 退回就绪。
-            let fresh = crate::envmgr::scan_fresh();
-            state.notify(
-                "success",
-                detail.lines().next().unwrap_or("安装完成").to_string(),
-            );
-            Ok(json!({ "detail": detail, "env": fresh }))
+    let owned_method = method.to_string();
+    run_env_long_action_with(
+        shared,
+        move || env_long_action_body(&owned_method, &args),
+        mark_app_state,
+    )
+    .await
+}
+
+/// busy 与通知的落地方式。抽成回调是为了让锁外流程可以用一个极简状态做单测，
+/// 不必在测试里构造会读写用户配置的 AppState::new()。
+fn mark_app_state(state: &mut AppState, busy: bool, note: Option<(&str, String)>) {
+    state.busy = busy;
+    if let Some((kind, message)) = note {
+        state.notify(kind, message);
+    }
+}
+
+/// 只做「首尾短暂取锁 + 中间 spawn_blocking」这一件事。
+/// `T` 泛型让单测能注入一个慢动作，验证执行期间 try_lock 确实拿得到锁。
+async fn run_env_long_action_with<T, F, Mark>(
+    shared: &Arc<Mutex<T>>,
+    action: F,
+    mark: Mark,
+) -> Result<Value, String>
+where
+    F: FnOnce() -> Result<Value, String> + Send + 'static,
+    Mark: Fn(&mut T, bool, Option<(&str, String)>),
+{
+    {
+        let mut state = shared.lock().await;
+        mark(&mut state, true, None);
+    }
+    let outcome = tokio::task::spawn_blocking(action)
+        .await
+        .unwrap_or_else(|error| Err(format!("环境操作线程异常：{error}")));
+    let note = match &outcome {
+        Ok(_) => Some(("success", "环境操作完成".to_string())),
+        Err(error) => Some((
+            "error",
+            error
+                .lines()
+                .next()
+                .unwrap_or("环境操作失败")
+                .to_string(),
+        )),
+    };
+    {
+        let mut state = shared.lock().await;
+        mark(&mut state, false, note);
+    }
+    outcome
+}
+
+/// 真正干活的部分，全程不碰 state。返回值里带上重扫后的 env / nvm 快照，
+/// 前端据此当场重画卡片，不用再发一次请求。
+fn env_long_action_body(method: &str, args: &[Value]) -> Result<Value, String> {
+    match method {
+        "installEnv" | "reinstallEnv" | "updateEnv" => {
+            let id = text(args, 0);
+            if id.is_empty() {
+                return Err("缺少环境条目 id".into());
+            }
+            let version = text(args, 1);
+            let action: fn(&str, &str) -> Result<String, String> = match method {
+                "installEnv" => crate::envmgr::install,
+                "reinstallEnv" => crate::envmgr::reinstall,
+                _ => crate::envmgr::update,
+            };
+            let detail = action(&id, &version)?;
+            let env = crate::envmgr::scan_fresh();
+            Ok(json!({ "detail": detail, "env": env }))
         }
-        Err(error) => {
-            state.notify("error", error.lines().next().unwrap_or("安装失败").to_string());
-            Err(error)
+        "nvmInstallVersion" => {
+            let version = text(args, 0);
+            let detail = crate::nvm::install_version(&version)?;
+            let nvm = crate::nvm::status();
+            let env = crate::envmgr::scan_fresh();
+            Ok(json!({ "detail": detail, "nvm": nvm, "env": env }))
         }
+        _ => Err(format!("未知的环境动作：{method}")),
     }
 }
 
@@ -2534,5 +2558,43 @@ mod tests {
             ..Default::default()
         }
         .is_complete());
+    }
+
+    /// 对照修复前的行为：installEnv 走 dispatch 是持锁跑 winget 的，
+    /// 实测 67.6 秒里 /api/state 连续两次 30 秒超时。这里注入一个「卡住」的动作，
+    /// 断言执行期间 try_lock 仍拿得到锁，锁外通道才算真的生效。
+    #[tokio::test]
+    async fn 环境长动作执行期间状态锁仍可用() {
+        let shared: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let marker = |flag: &mut bool, busy: bool, _: Option<(&str, String)>| *flag = busy;
+
+        let task_shared = shared.clone();
+        let handle = tokio::spawn(async move {
+            run_env_long_action_with(
+                &task_shared,
+                move || {
+                    started_tx.send(()).ok();
+                    release_rx.blocking_recv().ok();
+                    Ok(json!({ "ok": true }))
+                },
+                marker,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("动作没能启动")
+            .expect("启动信号丢失");
+        tokio::task::yield_now().await;
+        assert!(
+            shared.try_lock().is_ok(),
+            "winget 执行期间不应持有 state 锁，否则 /api/state 会全部排队超时"
+        );
+        release_tx.send(()).ok();
+        handle.await.expect("任务异常").expect("动作应成功");
+        assert!(!*shared.lock().await, "结束后 busy 必须复位");
     }
 }

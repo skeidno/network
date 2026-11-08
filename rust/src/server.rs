@@ -287,6 +287,28 @@ async fn call_api(
         return security_headers(Json(json!({ "ok": true, "result": result })).into_response());
     }
 
+    // 环境安装 / 更新会同步跑 winget（下载 MSI + 安装，几十秒到几分钟）。
+    // 放进 dispatch 等于把 state 锁占满整段时间：下面 read_api 也要取同一把锁，
+    // 状态轮询、静态资源全会排队，界面表现就是「点了一键部署没反应」。
+    // 实测一次 Go 安装 67.6 秒，期间 /api/state 连续两次 30 秒超时（基线 0.1 秒）。
+    // 与 deploySshServer / envLatestVersions 同构：只在首尾短暂取锁改 busy / 发通知。
+    if matches!(
+        method.as_str(),
+        "installEnv" | "reinstallEnv" | "updateEnv" | "nvmInstallVersion"
+    ) {
+        let result = crate::methods::run_env_long_action(&shared, &method, args.clone()).await;
+        return match result {
+            Ok(value) => {
+                security_headers(Json(json!({ "ok": true, "result": value })).into_response())
+            }
+            Err(message) => security_headers((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": message })),
+            )
+                .into_response()),
+        };
+    }
+
     let mut state = shared.lock().await;
     match crate::methods::dispatch(&shared, &mut state, &method, args).await {
         Ok(result) => security_headers(Json(json!({"ok": true, "result": result})).into_response()),
