@@ -1026,16 +1026,42 @@ fn scan_items() -> Vec<EnvItem> {
     items
 }
 
-/// winget 在不在。在的话一键部署才有意义。
-pub fn winget_available() -> bool {
+/// winget 的完整路径。
+///
+/// winget 是「应用执行别名」：真实入口在
+/// `%LOCALAPPDATA%\Microsoft\WindowsApps\winget.exe`（一个 0 字节重解析点），
+/// 不少机器不会把这个目录写进 PATH。只靠 `find_exe` 会误判成「本机没有 winget」，
+/// 界面上所有「一键部署 / 更新」按钮被整列灰掉，用户只能看到「去官网下载」。
+/// 所以先按常规路径找，再补应用别名目录。
+fn winget_exe() -> Option<PathBuf> {
+    if let Some(path) = find_exe(&["winget.exe"]) {
+        return Some(path);
+    }
     #[cfg(windows)]
     {
-        find_exe(&["winget.exe"]).is_some()
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join("AppData").join("Local")))?;
+        let alias = base.join("Microsoft").join("WindowsApps").join("winget.exe");
+        if alias.is_file() {
+            return Some(alias);
+        }
     }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    None
+}
+
+/// winget 在不在。在的话一键部署才有意义。
+pub fn winget_available() -> bool {
+    winget_exe().is_some()
+}
+
+/// 用绝对路径起 winget，别让 PATH 决定功能在不在。
+///
+/// 光修检测不够：调用写成 `command("winget")` 时，CreateProcess 依然按 PATH 找，
+/// 检测通过、按钮亮了，一点下去还是「调用 winget 失败」。
+fn winget_command() -> Result<std::process::Command, String> {
+    let exe = winget_exe().ok_or_else(|| "本机没有 winget，无法自动安装。".to_string())?;
+    Ok(command(&exe.to_string_lossy().to_string()))
 }
 
 /// 每个条目对应的 winget 包 id。
@@ -1330,7 +1356,7 @@ fn run_winget_command(
         }
     }
 
-    let output = command("winget")
+    let output = winget_command()?
         .args(&args)
         .output()
         .map_err(|error| format!("调用 winget 失败：{error}"))?;
@@ -1407,7 +1433,7 @@ pub fn available_versions(id: &str) -> Result<Value, String> {
     if !winget_available() {
         return Err("本机没有 winget，无法查询可安装版本。".to_string());
     }
-    let output = command("winget")
+    let output = winget_command()?
         .args([
             "show",
             "--id",
