@@ -1840,6 +1840,7 @@ async function repairWinget() {
   if (envBusy) return;
   const ok = window.confirm(
     "本机没有 winget。将从 winget-cli 官方 release 下载并注册 App Installer（约 315 MB，逐个校验 SHA256）。\n\n" +
+    "连不上 GitHub 时会自动尝试国内镜像；若已导入节点配置并开启接管，还会自动走本机代理重试。\n" +
     "这会向当前用户注册一个系统组件，可能需要几分钟。\n" +
     "不修复也不影响使用：安装与版本管理已自动走官方直连通道。\n\n继续吗？"
   );
@@ -1854,7 +1855,11 @@ async function repairWinget() {
   } catch (error) {
     const message = error.message || String(error);
     showEnvDetail("winget 修复失败（不影响官方直连安装）", message);
-    showToast("error", `修复未完成：${message.split("\n")[0]}`);
+    // 第一行往往是「诊断：state=...」，下载失败时真正有用的是后面那句指引。
+    const head = message.includes("所有下载源均失败")
+      ? "下载源不可达，可先导入配置并开启接管后重试"
+      : message.split("\n")[0];
+    showToast("error", `修复未完成：${head}`);
   } finally {
     await finishEnvTask();
     setEnvBusy(false);
@@ -3610,17 +3615,32 @@ function bindEvents() {
       openBrowserTextFile(".yaml,.yml,.txt,.conf,.json", (file, content) => invoke("importFileText", file.name, content));
     } else invoke("importFile");
   });
-  byId("portable-config-import").addEventListener("click", () => {
+  byId("portable-config-import").addEventListener("click", async () => {
     if (appState?.capabilities?.browserFiles) {
       openBrowserTextFile(".json", (_file, content) => invoke("importPortableConfigText", content));
-    } else invoke("importPortableConfig");
+      return;
+    }
+    // Windows 走原生「打开」对话框。invoke 会把错误吞成 null，这里要如实提示。
+    try {
+      await invokeStrict("importPortableConfig");
+    } catch (error) {
+      showToast("error", `导入失败：${error.message || error}`);
+    }
   });
   byId("quit-application")?.addEventListener("click", () => performWindowAction("quit"));
   byId("portable-config-export").addEventListener("click", async () => {
     if (appState?.capabilities?.browserFiles) {
       const content = await invoke("exportPortableConfigText");
       if (content) downloadTextFile("network-manager-config.json", content);
-    } else invoke("exportPortableConfig");
+      return;
+    }
+    // WebView2 没有默认的 <a download> 处理，Windows 端由后端弹「另存为」写盘。
+    try {
+      const result = await invokeStrict("exportPortableConfig");
+      if (result?.path) showToast("success", `配置已导出到 ${result.path}`);
+    } catch (error) {
+      showToast("error", `导出失败：${error.message || error}`);
+    }
   });
   byId("test-all-nodes").addEventListener("click", () => invoke("testAllNodes"));
   byId("manage-node-groups").addEventListener("click", openNodeGroupManager);

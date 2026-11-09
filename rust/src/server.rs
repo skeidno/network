@@ -337,6 +337,26 @@ async fn call_api(
         };
     }
 
+    // Windows 端的导出 / 导入要弹原生文件对话框，用户可能几分钟不点确定。
+    // 放进 dispatch 等于把 state 锁占满整段时间，/api/state 与静态资源全部排队。
+    // 与 deploySshServer / envLatestVersions 同构：只在首尾短暂取锁。
+    if matches!(
+        method.as_str(),
+        "exportPortableConfig" | "importPortableConfig" | "importFile"
+    ) {
+        let result = crate::methods::run_file_dialog_action(&shared, &method).await;
+        return match result {
+            Ok(value) => security_headers(
+                Json(json!({ "ok": true, "result": value })).into_response(),
+            ),
+            Err(message) => security_headers((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": message })),
+            )
+                .into_response()),
+        };
+    }
+
     let mut state = shared.lock().await;
     match crate::methods::dispatch(&shared, &mut state, &method, args).await {
         Ok(result) => security_headers(Json(json!({"ok": true, "result": result})).into_response()),

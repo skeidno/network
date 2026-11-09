@@ -558,6 +558,58 @@ pub fn pick_ssh_key_blocking() -> Option<String> {
     }
 }
 
+/// 「导出跨设备配置」的另存为对话框。
+///
+/// WebView2 里 `<a download>` 默认没有下载处理，点了会静默什么都不做，所以
+/// Windows 端必须由后端弹原生对话框并自己写文件。返回用户选的绝对路径；
+/// 用户取消返回 Ok(None)（取消不是错误，不要弹红字）。
+#[cfg(windows)]
+pub fn save_text_file_blocking(
+    default_name: &str,
+    content: &str,
+) -> Result<Option<String>, String> {
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetSaveFileNameW, OPEN_FILENAME_FLAGS, OPENFILENAMEW,
+    };
+
+    unsafe {
+        let mut buffer = vec![0u16; 4096];
+        let initial: Vec<u16> = default_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        if initial.len() <= buffer.len() {
+            buffer[..initial.len()].copy_from_slice(&initial);
+        }
+        let mut filter: Vec<u16> = Vec::new();
+        filter.extend("JSON 配置\0*.json\0所有文件\0*.*\0".encode_utf16());
+        filter.push(0);
+        let def_ext: Vec<u16> = "json\0".encode_utf16().collect();
+        let title: Vec<u16> = "导出跨设备配置\0".encode_utf16().collect();
+        let mut info: OPENFILENAMEW = std::mem::zeroed();
+        info.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+        info.lpstrFilter = PCWSTR::from_raw(filter.as_ptr());
+        info.lpstrFile = PWSTR::from_raw(buffer.as_mut_ptr());
+        info.nMaxFile = buffer.len() as u32;
+        info.lpstrDefExt = PCWSTR::from_raw(def_ext.as_ptr());
+        info.lpstrTitle = PCWSTR::from_raw(title.as_ptr());
+        // OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST
+        info.Flags = OPEN_FILENAME_FLAGS(0x0000_0004 | 0x0000_0002 | 0x0000_0008 | 0x0000_0800);
+        if !GetSaveFileNameW(&mut info).as_bool() {
+            return Ok(None);
+        }
+        let length = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+        let mut path = String::from_utf16_lossy(&buffer[..length]);
+        if !path.to_ascii_lowercase().ends_with(".json") {
+            path.push_str(".json");
+        }
+        std::fs::write(&path, content.as_bytes())
+            .map_err(|error| format!("写入 {path} 失败：{error}"))?;
+        Ok(Some(path))
+    }
+}
+
 #[cfg(not(windows))]
 pub fn pick_ssh_key_blocking() -> Option<String> {
     None

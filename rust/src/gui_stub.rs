@@ -18,3 +18,11 @@ pub fn pick_ssh_key_blocking() -> Option<String> {
 pub fn pick_local_path_blocking(_select_directory: bool) -> Option<String> {
     None
 }
+
+/// 浏览器访问管理页时，下载由前端的 `<a download>` 完成，服务端没有对话框。
+pub fn save_text_file_blocking(
+    _default_name: &str,
+    _content: &str,
+) -> Result<Option<String>, String> {
+    Err("服务器场景没有「另存为」对话框，请改用页面的浏览器下载".into())
+}

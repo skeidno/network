@@ -2332,7 +2332,134 @@ pub async fn dispatch(
             }
             apply(state)
         }
+        // Windows 上 browserFiles=false，前端会调这三个不带 Text 后缀的名字。
+        // 它们要弹原生文件对话框，必须在 server.rs 的锁外通道处理；落到这里
+        // 说明接线漏了，宁可报错也不要在持锁状态下卡死整个界面。
+        "exportPortableConfig" | "importPortableConfig" | "importFile" => {
+            Err("文件对话框操作须走锁外通道".into())
+        }
         other => Err(format!("不支持的操作：{other}")),
+    }
+}
+
+/// Windows 端原生文件对话框动作。
+///
+/// Rust 侧只实现了 `importFileText` / `*PortableConfigText`（浏览器把文件内容
+/// 发回来），但 `capabilities.browserFiles` 在 Windows 上是 false —— WebView2 没有
+/// 默认的 `<a download>` 处理，前端因此走 `exportPortableConfig` / `importFile`
+/// 这些名字，结果全部落到「不支持的操作」。这里补上缺失的那一半。
+///
+/// 模态对话框会一直等到用户选完文件，绝不能在 `dispatch` 里持 `shared` 锁：
+/// 那会连 `/api/state` 一起堵住，左下角流量曲线停摆。所以内容生成与最终写回
+/// 只在首尾短暂取锁，选文件 / 读写盘全在 `spawn_blocking` 里。
+pub async fn run_file_dialog_action(shared: &Shared, method: &str) -> Result<Value, String> {
+    // 导出内容只需要短暂取锁，生成完立刻释放。
+    let export_content = if method == "exportPortableConfig" {
+        let state = shared.lock().await;
+        Some(
+            serde_json::to_string_pretty(&crate::portable::export_portable_config(&state.config))
+                .unwrap_or_default(),
+        )
+    } else {
+        None
+    };
+
+    let action = method.to_string();
+    let outcome = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        dialog_test_delay();
+        match action.as_str() {
+            "exportPortableConfig" => {
+                let content = export_content.unwrap_or_default();
+                let path = if let Some(path) = dialog_test_path() {
+                    std::fs::write(&path, content.as_bytes())
+                        .map_err(|error| format!("写入 {path} 失败：{error}"))?;
+                    path
+                } else {
+                    match crate::gui::save_text_file_blocking("network-manager-config.json", &content)?
+                    {
+                        Some(path) => path,
+                        None => return Ok(Value::Null),
+                    }
+                };
+                Ok(json!({ "path": path }))
+            }
+            "importPortableConfig" | "importFile" => {
+                let path = match dialog_test_path() {
+                    Some(path) => path,
+                    None => match crate::gui::pick_local_path_blocking(false) {
+                        Some(path) => path,
+                        None => return Ok(Value::Null),
+                    },
+                };
+                let bytes = std::fs::read(&path)
+                    .map_err(|error| format!("读取 {path} 失败：{error}"))?;
+                if bytes.len() > 10 * 1024 * 1024 {
+                    return Err("配置文件不能超过 10 MB".into());
+                }
+                let decoded = String::from_utf8_lossy(&bytes);
+                let content = decoded
+                    .strip_prefix('\u{feff}')
+                    .unwrap_or(&decoded)
+                    .to_string();
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .map(|part| part.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "import.txt".into());
+                Ok(json!({ "name": name, "content": content }))
+            }
+            other => Err(format!("不支持的文件对话框操作：{other}")),
+        }
+    })
+    .await
+    .map_err(|error| format!("文件对话框任务异常：{error}"))??;
+
+    if outcome.is_null() {
+        return Ok(Value::Null);
+    }
+    if method == "exportPortableConfig" {
+        // 成功提示交给前端（invoke 已经会刷新状态），后端不重复弹 toast。
+        return Ok(outcome);
+    }
+
+    // 拿到文件内容后复用现有的 Text 分支，避免两套导入逻辑各写一遍。
+    let content = outcome
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let name = outcome
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let (inner, args) = if method == "importPortableConfig" {
+        ("importPortableConfigText", vec![json!(content)])
+    } else {
+        ("importFileText", vec![json!(name), json!(content)])
+    };
+    let mut state = shared.lock().await;
+    dispatch(shared, &mut state, inner, args).await
+}
+
+/// 内部自证钩子：显式设置时跳过模态对话框，直接读写这个路径，便于端到端验证。
+/// 名字带 TEST，正常用户环境不会命中；UAC 提权重启不继承环境变量，
+/// 所以自动化脚本要配 `--no-elevate` 使用。
+fn dialog_test_path() -> Option<String> {
+    std::env::var("NETWORK_MANAGER_FILE_DIALOG_TEST_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// 自证用：模拟「用户把文件对话框开着不动」，验证这段时间 /api/state 不被堵。
+/// 上限 10 秒，避免误设后真的把测试拖很久。
+fn dialog_test_delay() {
+    if let Ok(value) = std::env::var("NETWORK_MANAGER_FILE_DIALOG_TEST_DELAY_MS") {
+        if let Ok(ms) = value.parse::<u64>() {
+            if (1..=10_000).contains(&ms) {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
     }
 }
 
