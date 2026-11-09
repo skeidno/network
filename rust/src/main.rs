@@ -33,6 +33,8 @@ mod gui;
 mod gui;
 mod gui_common;
 mod importers;
+// 跨端口单实例锁：按进程判重，避免两个实例共用同一份配置与内核
+mod instance;
 mod localca;
 mod methods;
 mod mihomo;
@@ -66,6 +68,8 @@ struct Options {
     open_browser: bool,
     headless: bool,
     start_hidden: bool,
+    allow_multi_instance: bool,
+    skip_elevation: bool,
 }
 
 impl Options {
@@ -83,6 +87,8 @@ impl Options {
             open_browser: true,
             headless: false,
             start_hidden: false,
+            allow_multi_instance: false,
+            skip_elevation: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -100,6 +106,11 @@ impl Options {
                 "--no-browser" => options.open_browser = false,
                 "--headless" => options.headless = true,
                 "--startup" => options.start_hidden = true,
+                // 自证 / 调试显式豁免：正常用户永远用不到，缺省就是单实例。
+                "--allow-multi-instance" => options.allow_multi_instance = true,
+                // 自证开关：跳过自动提权。UAC 重启会换进程、丢临时环境变量，
+                // 本机端到端验证需要 Popen 拿到的就是真正在跑的那个进程。
+                "--no-elevate" => options.skip_elevation = true,
                 // 内部自证开关：本机有 winget，没法真把 App Installer 卸了验证
                 // 「全新系统」分支。它必须走命令行而不是环境变量 —— UAC 提权重启
                 // 由 ShellExecuteExW("runas") 交给 AppInfo 服务拉起新进程，新进程
@@ -137,32 +148,43 @@ fn print_help() {
          \x20 --headless          仅运行 HTTP 服务，不创建原生窗口（Windows）\n\
          \x20 --startup           随系统启动：隐藏窗口，仅驻留托盘（Windows）\n\
          \x20 --force-direct       内部自证：强制按「本机没有 winget」走官方直连分支\n\
+         \x20 --allow-multi-instance  自证用：跳过单实例锁，允许同目录并行起多个进程\n\
+         \x20 --no-elevate         自证用：跳过自动提权（普通权限下 TUN 接管不可用）\n\
          \n\
          Linux 上没有原生界面，程序始终以常驻服务方式运行，管理页面用浏览器打开\n\
          上面打印的地址；用 SIGTERM（systemctl stop）结束。\n"
     );
 }
 
-/// 端口上已经有服务在响应，说明另一个实例正在运行。
+/// 端口兜底：只认「确实是我们自己的服务」，避免用户把 9091 让给别的程序
+/// 之后，我们误以为已有实例在跑而静默退出。/health 不需要鉴权，且只有
+/// 本程序会返回 `{"ok":true}`。主判据已经是 instance.lock，这里只用于老版本
+/// 实例（没写过锁）或锁文件被手动删掉的情况。
 async fn existing_instance_running(options: &Options) -> bool {
     let Ok(client) = reqwest::Client::builder().no_proxy().build() else {
         return false;
     };
     let Ok(response) = client
-        .get(format!("http://{}:{}/", options.host, options.port))
+        .get(format!("http://{}:{}/health", options.host, options.port))
+        .timeout(std::time::Duration::from_secs(2))
         .send()
         .await
     else {
         return false;
     };
-    // 200/401/403 都说明有服务在监听；连接被拒才是没有。
-    response.status().as_u16() != 404
+    if !response.status().is_success() {
+        return false;
+    }
+    let body = response.text().await.unwrap_or_default();
+    body.contains("\"ok\"") && body.contains("true")
 }
 
 /// 唤醒已经在运行的实例：先让它自己走一遍显示逻辑（会按需重建 WebView），
-/// 失败再退回到直接显示它的窗口。
-async fn wake_existing_instance(options: &Options) -> bool {
-    let base = format!("http://{}:{}", options.host, options.port);
+/// 顺便往它的 toast 队列里塞一条「已经在运行」的提示；失败再退回到
+/// 直接显示它的窗口。host/port 来自单实例锁，不是本次启动的端口 —— 两个
+/// 实例的端口可以不一样。
+async fn wake_existing_instance_at(host: &str, port: u16) -> bool {
+    let base = format!("http://{host}:{port}");
     if let Ok(client) = reqwest::Client::builder().no_proxy().build() {
         if let Ok(response) = client.get(format!("{base}/")).send().await {
             let html = response.text().await.unwrap_or_default();
@@ -176,12 +198,25 @@ async fn wake_existing_instance(options: &Options) -> bool {
                 let body = serde_json::json!({"method": "windowAction", "args": ["show"]});
                 let sent = client
                     .post(format!("{base}/api/call"))
-                    .header("X-Network-Session", token)
+                    .header("X-Network-Session", token.as_str())
                     .header("Content-Type", "application/json")
                     .body(serde_json::to_string(&body).unwrap_or_default())
                     .send()
                     .await;
                 if matches!(sent, Ok(response) if response.status().is_success()) {
+                    // 第二次启动要给一句人话：已有实例的 WebGUI 下一次状态轮询
+                    // （最多 2.5 秒）会把它弹成 toast，不用再开一个提示窗口。
+                    let notice = serde_json::json!({
+                        "method": "instanceNotice",
+                        "args": ["程序已经在运行，已为你切换到现有窗口"]
+                    });
+                    let _ = client
+                        .post(format!("{base}/api/call"))
+                        .header("X-Network-Session", token.as_str())
+                        .header("Content-Type", "application/json")
+                        .body(serde_json::to_string(&notice).unwrap_or_default())
+                        .send()
+                        .await;
                     return true;
                 }
             }
@@ -341,7 +376,10 @@ fn ensure_elevated() {}
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = Options::parse();
     // 必须在 attach_console() 之前：提权重启会换一个进程，挂了控制台也没意义。
-    ensure_elevated();
+    // --no-elevate 只给本机自证 / 无管理员权限的环境用，缺省照常提权。
+    if !options.skip_elevation {
+        ensure_elevated();
+    }
     install_panic_hook();
     if options.headless {
         attach_console();
@@ -350,6 +388,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("远程监听必须设置 WebGUI 管理密码（--password）".into());
     }
 
+    // 跨端口单实例：判重按「进程 + 共享数据目录」，不是按端口。必须放在
+    // AppState::new() 之前 —— 第二个实例连配置都不该去读，更不能碰内核。
+    // Guard 活到 main 结束，正常退出时自动摘锁；被强杀留下的死锁靠 pid 校验清理。
+    let _instance_guard = match crate::instance::claim(
+        &options.host,
+        options.port,
+        options.allow_multi_instance,
+    ) {
+        crate::instance::Claim::Acquired(guard) => guard,
+        crate::instance::Claim::Existing(owner) => {
+            // pid 只用于排查「为什么双击没反应」；headless / 挂载控制台时可见。
+            println!(
+                "已有实例 pid={} 在 {}:{} 运行，本次启动让位",
+                owner.pid, owner.host, owner.port
+            );
+            let mut woken = wake_existing_instance_at(&owner.host, owner.port).await;
+            // 锁里记的端口可能已经失效（比如旧实例换了端口），再试自己的端口。
+            if !woken && (owner.host != options.host || owner.port != options.port) {
+                woken = wake_existing_instance_at(&options.host, options.port).await;
+            }
+            if !woken && !options.headless {
+                crate::instance::notify_second_launch();
+            }
+            return Ok(());
+        }
+    };
+
     let mut app = AppState::new();
     app.access_username = options.username.clone();
     app.access_password = options.password.clone();
@@ -357,10 +422,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Linux 上永远是常驻服务，没有界面可谈，等价于 headless。
     app.headless = options.headless || !cfg!(windows);
 
-    // 先确认没有别的实例在跑：否则这一趟也会去启动/清理内核，
-    // 把已经在跑的那个实例的内核打掉（表现为代理突然失效）。
+    // 锁之外再留一层端口探测兜底：老版本实例没写过锁、或用户手动删了锁文件，
+    // 仍能靠端口认出来，不至于双开去抢内核。
     if existing_instance_running(&options).await {
-        wake_existing_instance(&options).await;
+        let woken = wake_existing_instance_at(&options.host, options.port).await;
+        if !woken && !options.headless {
+            crate::instance::notify_second_launch();
+        }
         return Ok(());
     }
 
@@ -394,7 +462,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 端口被占用 = 已经有一个实例在跑（通常是关到托盘了）。
             // 托盘里可能还混着旧实例被强杀后留下的死图标，点了没反应会让人误以为
             // 程序坏了，所以这里给一条不依赖托盘的唤醒通道：再启动一次就唤起窗口。
-            if wake_existing_instance(&options).await {
+            if wake_existing_instance_at(&options.host, options.port).await {
                 return Ok(());
             }
             return Err(err.into());

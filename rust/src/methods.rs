@@ -2210,6 +2210,13 @@ pub async fn dispatch(
             }
             Ok(json!(true))
         }
+        // 第二次启动程序时，由新进程把「已经在运行」塞进已有实例的 toast 队列；
+        // 前端下一次状态轮询就会弹出来。文案固定在后端，不接受请求里的任意
+        // 文本，避免这个内部接口变成往界面里塞内容的通道。
+        "instanceNotice" => {
+            state.notify("success", "程序已经在运行，已为你切换到现有窗口");
+            Ok(json!(true))
+        }
         "deploySshServer" => Err("部署任务已转入后台执行".into()),
         "copyServerNode" => {
             let profile_id = text(&args, 0);
