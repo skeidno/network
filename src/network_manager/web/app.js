@@ -1087,6 +1087,11 @@ const ENV_GROUPS = [
   { id: "language", title: "开发语言工具链", hint: "只做体检与单项更新，不进批量部署" },
 ];
 
+/** 全新系统没有 winget：安装/更新/版本查询全部走官方直连通道。 */
+function envIsDirect() {
+  return Boolean(envData && envData.installMode === "direct");
+}
+
 /**
  * 逐段比数字的版本比较。返回 1 / -1 / 0；格式怪到比不了就返回 0
  * （宁可少提示一个「有新版」，也不要让用户去更新一个看不懂的版本号）。
@@ -1156,7 +1161,17 @@ function renderEnv(data) {
       ? `<span class="env-summary-idle">运行环境已齐；${escapeHtml(langMissing.map((i) => i.name).join("、"))} 请点各自卡片里的「一键部署」</span>`
       : `<span class="env-summary-idle">运行环境已齐，无需部署</span>`);
   }
-  if (!data.winget) parts.push(`<span class="env-summary-warn">未找到 winget，自动安装不可用</span>`);
+  // 全新系统没有 App Installer（winget 是随商店下发的）。以前这里写「自动安装不可用」，
+  // 整列按钮灰掉，用户只能去官网。现在安装自动走官方直连，摘要要把当前通道说清，
+  // 并把「修复 winget」作为可选入口摆出来，而不是冒充已经修好。
+  const repairButton = byId("env-repair-winget");
+  if (repairButton) {
+    repairButton.hidden = Boolean(data.winget);
+    repairButton.disabled = envBusy;
+  }
+  if (!data.winget) {
+    parts.push(`<span class="env-summary-warn">未找到 winget，已自动切换官方直连安装；点「修复 winget」可恢复完整能力</span>`);
+  }
   summary.innerHTML = parts.join(" · ");
 
   // 分两栏：core 是程序依赖，language 是可选工具链。分组还有个实际作用 ——
@@ -1186,8 +1201,8 @@ function renderEnv(data) {
   );
   installAll.disabled = !installable.length || envBusy;
   const hints = ["只部署「运行环境与工具」，语言工具链请单项安装"];
-  if (!data.winget) hints.push("本机没有 winget，无法自动安装");
-  else if (installable.length) hints.push(`将依次安装：${installable.map((item) => item.name).join("、")}`);
+  if (!data.winget) hints.push("本机没有 winget，将走官方安装包直连，不依赖 winget");
+  if (installable.length) hints.push(`将依次安装：${installable.map((item) => item.name).join("、")}`);
   else hints.push("没有缺失项");
   if (outdated.length) hints.push(`过期项请单独点「重装升级」`);
   installAll.title = hints.join("；");
@@ -1213,6 +1228,10 @@ function renderEnvCard(item) {
   // winget 不可用时不给「一键部署」，只留「去官网」，并在卡片上说明原因
   const canInstall = Boolean(item.canInstall);
   const canReinstall = Boolean(item.canReinstall) && item.outdated;
+  // 全新系统走官方直连，按钮悬浮说明不能还写着「winget 包」。
+  const updateHint = envIsDirect()
+    ? "自动更新到官方最新稳定版：从官方发布源直接下载安装包，不依赖 winget；Rust 走 rustup，Node 走官方 MSI"
+    : "自动更新到官方最新稳定版：跨大版本会装最新版对应的 winget 包（旧版本保留）；Rust 走 rustup，Node 走 nvm";
   // 三态决定徽章与卡片配色：就绪 / 缺失 / 版本过旧
   const state = item.outdated ? "outdated" : (item.ready ? "ready" : "missing");
   const badgeText = item.outdated ? "版本过旧" : (item.ready ? "已就绪" : "缺失");
@@ -1262,14 +1281,14 @@ function renderEnvCard(item) {
       <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">查看官网版本</button>`;
   } else if (item.ready) {
     actions = `${updatable
-        ? `<button type="button" class="button primary" data-env-update="${escapeHtml(item.id)}" title="自动更新到官方最新稳定版：跨大版本会装最新版对应的 winget 包（旧版本保留）；Rust 走 rustup，Node 走 nvm">${icon("arrow-up")}<span>更新</span></button>`
+        ? `<button type="button" class="button primary" data-env-update="${escapeHtml(item.id)}" title="${escapeHtml(updateHint)}">${icon("arrow-up")}<span>更新</span></button>`
         : ""}
       <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">打开官网</button>`;
   } else {
     actions = `${canInstall
         ? `<button type="button" class="button primary" data-env-install="${escapeHtml(item.id)}">${icon("download")}<span>一键部署</span></button>`
         : ""}
-      <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">去官网下载</button>`;
+      <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}" title="${escapeHtml(envIsDirect() && !canInstall ? "这一项没有稳定的官方直连安装包；可点工具栏「修复 winget」恢复完整安装能力，或前往官网手动下载" : "打开该项目官方下载页")}">去官网下载</button>`;
   }
 
   return `
@@ -1386,9 +1405,11 @@ function renderWingetVersionManager(item) {
         <div class="env-versions-actions">
           <button type="button" class="text-button" data-env-query-versions="${escapeHtml(item.id)}">${seriesItem ? "选择要安装的大版本" : "查看可安装版本"}</button>
         </div>
-        <div class="env-versions-hint">${seriesItem
-          ? "winget 里各系列是独立包，装 3.10 / 3.11 / 3.12 可与现有版本并存；命令行默认用哪个由 PATH / 版本选择器决定。"
-          : "<strong>这一项不能多版本并存</strong>：装指定版本会先卸载现有版本。要并存请用 Node 的 nvm。"}</div>
+        <div class="env-versions-hint">${envIsDirect()
+          ? "本机没有 winget，版本列表来自官方发布源；安装会直接下载官方安装包。"
+          : (seriesItem
+            ? "winget 里各系列是独立包，装 3.10 / 3.11 / 3.12 可与现有版本并存；命令行默认用哪个由 PATH / 版本选择器决定。"
+            : "<strong>这一项不能多版本并存</strong>：装指定版本会先卸载现有版本。要并存请用 Node 的 nvm。")}</div>
       </div>`;
   }
   const versions = Array.isArray(envVersionTarget.versions) ? envVersionTarget.versions : [];
@@ -1396,7 +1417,7 @@ function renderWingetVersionManager(item) {
     return `
       <div class="env-versions">
         <div class="env-versions-title">${icon("download")}<span>版本管理</span></div>
-        <div class="env-versions-hint">没有查到可安装的版本，请检查 winget 源或网络连接。</div>
+        <div class="env-versions-hint">${escapeHtml(envVersionTarget.note || "没有查到可安装的版本，请检查 winget 源或网络连接。")}</div>
       </div>`;
   }
   const isSeries = envVersionTarget.versionKind === "series";
@@ -1414,9 +1435,13 @@ function renderWingetVersionManager(item) {
           <button type="button" class="button primary" data-env-install-version="${escapeHtml(item.id)}">${icon("download")}<span>安装该版本</span></button>
         </div>
       </div>
-      <div class="env-versions-hint">${isSeries
-        ? "<strong>各系列可并存</strong>：winget 里每个大版本是独立包，安装不会卸载现有版本；命令行默认指向哪个由 PATH / 版本选择器决定。"
-        : "<strong>不能多版本并存</strong>：装指定版本会先卸载现在的版本（用 winget --version --force）。"}</div>
+      <div class="env-versions-hint">${envIsDirect()
+        ? (isSeries
+          ? "<strong>官方直连</strong>：将从官方发布源下载该系列最新补丁的安装包，不卸载现有版本。"
+          : "<strong>官方直连</strong>：将从官方发布源下载安装包，安装行为以官方安装器为准。")
+        : (isSeries
+          ? "<strong>各系列可并存</strong>：winget 里每个大版本是独立包，安装不会卸载现有版本；命令行默认指向哪个由 PATH / 版本选择器决定。"
+          : "<strong>不能多版本并存</strong>：装指定版本会先卸载现在的版本（用 winget --version --force）。")}</div>
     </div>`;
 }
 
@@ -1429,8 +1454,12 @@ async function queryEnvVersions(id) {
       id,
       versions: Array.isArray(data?.versions) ? data.versions : [],
       versionKind: data?.versionKind || "patch",
+      source: data?.source || "winget",
+      note: data?.note || "",
     };
-    if (!envVersionTarget.versions.length) {
+    // 固定「最新稳定版」的项（WebView2 / VC++ / ADB）本来就没有版本列表，
+    // 后端给了说明文案，这种情况不是失败，别弹错误 toast。
+    if (!envVersionTarget.versions.length && !envVersionTarget.note) {
       showToast("error", "没查到可安装的版本");
     }
   } catch (error) {
@@ -1545,7 +1574,7 @@ function setEnvBusy(busy) {
   // 安装期间把所有按钮禁掉：winget 独占安装锁，连点两次只会得到一段乱序输出
   document.querySelectorAll(
     "[data-env-install], [data-env-reinstall], [data-env-update], [data-env-uninstall], [data-env-install-version], [data-env-query-versions]," +
-    "[data-nvm-use], [data-nvm-install], [data-nvm-query-versions], #env-install-all, #env-uninstall-all, #env-refresh, #env-check-latest, #env-update-all"
+    "[data-nvm-use], [data-nvm-install], [data-nvm-query-versions], #env-install-all, #env-uninstall-all, #env-refresh, #env-check-latest, #env-update-all, #env-repair-winget"
   )
     .forEach((button) => { button.disabled = busy; });
   // 摘要交给 renderEnv 画真实体检数据；任务提示由下方的进度卡负责。
@@ -1800,6 +1829,39 @@ async function installEnv(id) {
   return runEnvAction(id, "installEnv", "安装");
 }
 
+/**
+ * 全新系统缺 App Installer：可选地把 winget 装回来。
+ *
+ * 这条动作要下约 315 MB 并注册系统组件，必须由用户明确点一次；安装、更新、
+ * 版本查询本来就已自动走官方直连，所以修不成也不阻塞主流程。后端会先尝试
+ * 零下载重注册，只有包确实不在时才下载官方 msixbundle（逐个校验 SHA256）。
+ */
+async function repairWinget() {
+  if (envBusy) return;
+  const ok = window.confirm(
+    "本机没有 winget。将从 winget-cli 官方 release 下载并注册 App Installer（约 315 MB，逐个校验 SHA256）。\n\n" +
+    "这会向当前用户注册一个系统组件，可能需要几分钟。\n" +
+    "不修复也不影响使用：安装与版本管理已自动走官方直连通道。\n\n继续吗？"
+  );
+  if (!ok) return;
+  setEnvBusy(true);
+  await beginEnvTask("修复 winget", ["winget"]);
+  try {
+    const result = await invokeStrict("repairWinget");
+    if (result && result.env) renderEnv(result.env);
+    showEnvDetail("winget 修复输出", result?.detail || "修复完成");
+    showToast("success", "winget 已可用，环境页恢复完整安装能力");
+  } catch (error) {
+    const message = error.message || String(error);
+    showEnvDetail("winget 修复失败（不影响官方直连安装）", message);
+    showToast("error", `修复未完成：${message.split("\n")[0]}`);
+  } finally {
+    await finishEnvTask();
+    setEnvBusy(false);
+    refreshEnv(true);
+  }
+}
+
 async function reinstallEnv(id) {
   return runEnvAction(id, "reinstallEnv", "重装");
 }
@@ -1837,7 +1899,8 @@ async function installAllEnv() {
   let failed = 0;
   try {
     for (const id of cards) {
-      // 逐个装而不是并发：winget 有全局安装锁，并发只会互相抢
+      // 逐个装而不是并发：winget 有全局安装锁，官方安装器也会抢 MSI 安装事务，
+      // 并发只会互相踩。全新系统走直连时同样串行，进度卡才对得上真实项数。
       try {
         const result = await invokeStrict("installEnv", id);
         if (result && result.detail) chunks.push(`### ${id}\n${result.detail}`);
@@ -3758,6 +3821,7 @@ function bindEvents() {
   byId("env-check-latest").addEventListener("click", () => checkEnvLatest(true));
   byId("env-update-all").addEventListener("click", () => updateAllEnv());
   byId("env-install-all").addEventListener("click", () => installAllEnv());
+  byId("env-repair-winget").addEventListener("click", () => repairWinget());
   byId("env-uninstall-all").addEventListener("click", () => uninstallAllEnv());
   byId("env-task-close").addEventListener("click", () => {
     byId("env-task").hidden = true;
@@ -3800,9 +3864,11 @@ function bindEvents() {
       // 大版本系列是独立包、可并存；补丁版本才要覆盖现有安装，确认文案要分开讲。
       const card = document.querySelector(`.env-card[data-env-card="${id}"] .env-card-version`);
       const current = card ? card.textContent.trim() : "当前版本";
-      const warning = SERIES_ENV_IDS.includes(id)
-        ? `${id} 目前是 ${current}。\n将安装 ${version} 系列的最新补丁（winget 独立包，与现有版本并存，不会卸载）。\n\n继续吗？`
-        : `${id} 目前是 ${current}。\n安装 ${version} 会先卸载现有版本（不能多版本并存）。\n\n继续吗？`;
+      const warning = envIsDirect()
+        ? `${id} 目前是 ${current}。\n本机没有 winget，将从官方发布源下载 ${version} 对应的官方安装包并安装（不依赖 winget）。\n\n继续吗？`
+        : (SERIES_ENV_IDS.includes(id)
+          ? `${id} 目前是 ${current}。\n将安装 ${version} 系列的最新补丁（winget 独立包，与现有版本并存，不会卸载）。\n\n继续吗？`
+          : `${id} 目前是 ${current}。\n安装 ${version} 会先卸载现有版本（不能多版本并存）。\n\n继续吗？`);
       if (!window.confirm(warning)) return;
       runEnvAction(id, "installEnv", "安装", version);
       return;

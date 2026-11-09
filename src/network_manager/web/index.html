@@ -590,9 +590,10 @@
             <button id="env-check-latest" type="button" class="button secondary"><span class="icon" style="--icon:url('./icons/arrow-up.svg')"></span><span>检查最新版本</span></button>
             <button id="env-update-all" type="button" class="button secondary" disabled><span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span><span>一键更新</span></button>
             <button id="env-install-all" type="button" class="button primary" disabled><span class="icon" style="--icon:url('./icons/download.svg')"></span><span>一键部署缺失项</span></button>
+            <button id="env-repair-winget" type="button" class="button secondary" hidden title="全新系统常缺 App Installer。将从 winget-cli 官方 release 下载并注册（约 315 MB，校验 SHA256）；失败也不影响官方直连安装。"><span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span><span>修复 winget</span></button>
             <button id="env-uninstall-all" type="button" class="button danger" disabled><span class="icon" style="--icon:url('./icons/trash-2.svg')"></span><span>一键卸载</span></button>
           </div>
-          <div class="env-latest-bar" id="env-latest-bar">点「检查最新版本」查看各语言官方最新稳定版；这一步按需联网，不随体检自动执行</div>
+          <div class="env-latest-bar" id="env-latest-bar">点「检查最新版本」查看各语言官方最新稳定版；展开卡片的「版本管理」也会按需联网查可安装版本，二者都不随体检自动执行</div>
           <div id="env-task" class="env-task" hidden>
             <div class="env-task-head">
               <span class="env-task-label" id="env-task-label">环境任务</span>
