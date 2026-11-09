@@ -725,7 +725,7 @@ pub async fn run_node_tests(shared: Shared, indices: Vec<usize>) {
 
     // 内核在跑的话，测速交给内核：它的延迟测试走完整链路，本机只能握到握手。
     let core: Option<Arc<CoreProbe>> = {
-        let mut state = shared.lock().await;
+        let state = shared.lock().await;
         if state.core.is_running() {
             Some(Arc::new(CoreProbe {
                 port: state.config.controller_port as u16,
@@ -1154,22 +1154,10 @@ pub async fn dispatch(
             }
             Ok(json!(true))
         }
-        "toggleCore" => {
-            if state.core.is_running() {
-                state.core.stop()?;
-                // 手动关闭：意图置 false，自愈守护不会再把内核拉起来。
-                state.core_desired_running = false;
-                Ok(json!(false))
-            } else {
-                state.busy = true;
-                let result = state.core.start(&state.config);
-                state.busy = false;
-                result?;
-                // 手动开启：意图置 true，内核若日后崩溃会被自愈守护自动救回。
-                state.core_desired_running = true;
-                Ok(json!(true))
-            }
-        }
+        // 接管开关在 server.rs 走锁外通道：这里同步执行会把 state 锁占满整个
+        // 内核启动过程，/api/state 全排队，界面上的「处理中」还永远等不到
+        // busy 由 true 变 false（前端旧状态机就卡在这里）。
+        "toggleCore" => Err("接管开关须走锁外通道".into()),
         "setMode" => {
             let mode = text(&args, 0).to_uppercase();
             if !crate::state::MODE_LABELS
@@ -2339,6 +2327,123 @@ pub async fn dispatch(
             Err("文件对话框操作须走锁外通道".into())
         }
         other => Err(format!("不支持的操作：{other}")),
+    }
+}
+
+/// 启动 / 停止接管：全程不占 `shared` 锁。
+///
+/// `CoreProcess` 现在是可共享的，写配置、清残留内核、spawn 子进程、回收 TUN
+/// 这些动作只握它自己的锁。首尾各短暂取一次 `shared` 锁改 `busy` 与意图，
+/// 中间 `/api/state` 照常返回，因此：
+/// 1. 前端能真的看到 `busy=true → false`，按钮不会永远停在「处理中」；
+/// 2. 左下角流量曲线不会在接管过程中停摆；
+/// 3. 动作卡住时用户还能操作界面、看到后台状态。
+pub async fn run_core_toggle_action(shared: &Shared) -> Result<Value, String> {
+    let (core, config, start) = {
+        let mut state = shared.lock().await;
+        if state.busy {
+            return Err("接管动作正在进行，请稍候".into());
+        }
+        state.busy = true;
+        let start = !state.core.is_running();
+        (state.core.clone(), state.config.clone(), start)
+    };
+
+    let outcome = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        core_action_test_delay();
+        if start {
+            core.start(&config)?;
+        } else {
+            core.stop()?;
+        }
+        Ok(start)
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("接管动作线程异常：{error}")));
+
+    {
+        let mut state = shared.lock().await;
+        state.busy = false;
+        match &outcome {
+            Ok(started) => {
+                state.core_desired_running = *started;
+                state.notify(
+                    "success",
+                    if *started {
+                        "接管已开启".to_string()
+                    } else {
+                        "接管已停止".to_string()
+                    },
+                );
+            }
+            Err(error) => {
+                // 失败不动用户意图：原来想开着就留给自愈守护继续兜底。
+                state.notify(
+                    "error",
+                    format!(
+                        "接管操作失败：{}",
+                        error.lines().next().unwrap_or("未知错误")
+                    ),
+                );
+            }
+        }
+    }
+    outcome.map(|started| json!(started))
+}
+
+/// 消费 `pending_core_apply`：切模式 / 改规则 / 换节点之后，把热重载或重启
+/// 内核搬到 state 锁外。
+///
+/// 实测旧实现里一次 setMode 要占锁 1853ms，期间第一个 `/api/state` 等了
+/// 2079ms —— 用户看到的「总是卡一下」多数来自这里。现在配置写盘仍在锁内
+/// （毫秒级），慢动作只在 `CoreProcess` 自己的锁上跑。
+pub async fn run_core_apply_action(shared: &Shared) -> Result<Value, String> {
+    let (core, config) = {
+        let mut state = shared.lock().await;
+        if !state.pending_core_apply {
+            return Ok(json!(false));
+        }
+        state.pending_core_apply = false;
+        // 用户刚把接管关了：配置已经写盘，等下次启动自然生效，别把内核拉回来。
+        if !state.core_desired_running {
+            return Ok(json!(false));
+        }
+        state.busy = true;
+        (state.core.clone(), state.config.clone())
+    };
+
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::core::apply_core_changes(&core, &config)
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("套用配置线程异常：{error}")));
+
+    {
+        let mut state = shared.lock().await;
+        state.busy = false;
+        if let Err(error) = &outcome {
+            state.notify(
+                "error",
+                format!(
+                    "配置已保存，但套用到内核失败：{}",
+                    error.lines().next().unwrap_or("未知错误")
+                ),
+            );
+        }
+    }
+    outcome.map(|_| json!(true))
+}
+
+/// 自证钩子：模拟内核启动慢（TUN 重建、清残留进程），用来验证动作期间
+/// `/api/state` 仍能正常返回、`busy` 也能被界面看到。名字带 TEST，
+/// 正常用户环境不会命中；UAC 提权重启不继承环境变量，脚本要配 `--no-elevate`。
+fn core_action_test_delay() {
+    let Ok(value) = std::env::var("NETWORK_MANAGER_CORE_ACTION_DELAY_MS") else {
+        return;
+    };
+    let ms = value.parse::<u64>().unwrap_or(0).min(10_000);
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
     }
 }
 

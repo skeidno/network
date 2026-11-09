@@ -400,7 +400,7 @@ pub fn run(shell: Shell, shared: Shared) -> Result<(), String> {
         let handle = runtime.clone();
         let _ = std::thread::spawn(move || {
             handle.block_on(async move {
-                let mut guard = state.lock().await;
+                let guard = state.lock().await;
                 let _ = guard.core.stop();
             });
             std::process::exit(0);

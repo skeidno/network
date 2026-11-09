@@ -2,10 +2,11 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -98,26 +99,152 @@ pub struct DeployTask {
 }
 
 
+/// 内核句柄本身自带细粒度锁。
+///
+/// 以前整个 `CoreProcess` 靠 `AppState` 的大锁串行动作：点「启动接管」时
+/// `dispatch` 会一直握着 `shared.lock()` 跑完写配置、清残留进程、拉起子进程，
+/// 期间 `/api/state` 与静态资源全部排队，界面就是「卡住」。现在改由
+/// `server.rs` 在锁外拿 `Arc<CoreProcess>` 执行动作，只有这里面的锁被占；
+/// 状态读取用 `try_lock()` 拿不到就返回缓存值，绝不跟着一起等。
+#[derive(Default)]
 pub struct CoreProcess {
-    child: Option<Child>,
+    child: Mutex<Option<Child>>,
     /// 本次内核启动时日志文件的字节长度。之后的日志才算「这次启动产生的」——
     /// 日志是追加写的，不记这个位置就分不清一条报错是这次的还是上次的。
-    log_mark: Option<u64>,
+    log_mark: Mutex<Option<u64>>,
+    /// `is_running()` 在动作进行中拿不到 child 锁时用它返回上一次的状态，
+    /// 避免界面在「启动中」突然闪一下「已停止」。
+    running: AtomicBool,
     /// Windows 作业对象句柄：把内核进程挂进来，父进程无论正常退出、崩溃还是被
     /// 强杀，系统都会连同作业里的内核一起终止（JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE）。
     // 存原始句柄值而不是 HANDLE：HANDLE 内含裸指针，不满足 Send，
     // 会让整个 AppState 无法跨线程共享。
     #[cfg(windows)]
-    job: Option<isize>,
+    job: Mutex<Option<isize>>,
 }
 
-impl Default for CoreProcess {
-    fn default() -> Self {
-        Self {
-            child: None,
-            log_mark: None,
-            #[cfg(windows)]
-            job: None,
+/// 内核控制接口的连接超时。本地回环连不上必须立刻失败，不能让状态轮询陪着等。
+const CONTROLLER_CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
+/// 流量查询的读写超时：状态页每秒拉一次，单次查询绝不能拖满一整秒以上。
+const TRAFFIC_IO_TIMEOUT: Duration = Duration::from_millis(700);
+
+fn controller_address(port: i32) -> Result<SocketAddr, String> {
+    format!("127.0.0.1:{port}")
+        .parse::<SocketAddr>()
+        .map_err(|err| format!("内核控制端口无效（{port}）：{err}"))
+}
+
+fn connect_controller(port: i32, io_timeout: Duration) -> Result<TcpStream, String> {
+    let address = controller_address(port)?;
+    let stream = TcpStream::connect_timeout(&address, CONTROLLER_CONNECT_TIMEOUT)
+        .map_err(|err| format!("连不上内核控制接口 {address}：{err}"))?;
+    let _ = stream.set_read_timeout(Some(io_timeout));
+    let _ = stream.set_write_timeout(Some(io_timeout));
+    Ok(stream)
+}
+
+fn port_open(port: i32) -> bool {
+    let Ok(address) = controller_address(port) else {
+        return false;
+    };
+    TcpStream::connect_timeout(&address, CONTROLLER_CONNECT_TIMEOUT).is_ok()
+}
+
+/// 向内核控制接口发一个 GET，返回响应体。不碰 CoreProcess 的任何锁：流量采样
+/// 因此能完全脱离 state 锁，放到后台任务里跑。
+fn controller_get(
+    port: i32,
+    secret: &str,
+    path: &str,
+    io_timeout: Duration,
+) -> Result<String, String> {
+    let address = controller_address(port)?;
+    let mut stream = connect_controller(port, io_timeout)?;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {address}\r\n\
+         Authorization: Bearer {secret}\r\n\
+         Accept: application/json\r\n\
+         Connection: close\r\n\r\n",
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("发送内核请求失败：{err}"))?;
+    read_http_body(stream)
+}
+
+/// 取一次内核累计流量。状态接口不再直接调它，只由后台采样器调用。
+pub fn fetch_traffic(port: i32, secret: &str) -> Result<TrafficSnapshot, String> {
+    let body = controller_get(port, secret, "/connections", TRAFFIC_IO_TIMEOUT)?;
+    let value: Value =
+        serde_json::from_str(&body).map_err(|err| format!("内核流量数据无法解析：{err}"))?;
+    Ok(TrafficSnapshot {
+        download: value.get("downloadTotal").and_then(Value::as_u64).unwrap_or(0),
+        upload: value.get("uploadTotal").and_then(Value::as_u64).unwrap_or(0),
+        connections: value
+            .get("connections")
+            .and_then(Value::as_array)
+            .map(|list| list.len() as u32)
+            .unwrap_or(0),
+    })
+}
+
+/// 后台采样器写、状态接口读的流量快照。
+///
+/// 以前 `build()` 每次都会同步去问内核 controller：内核刚启动或热重载时接口
+/// 可能挂住 3 秒，而这次请求是在 `shared` 锁里做的 —— 整个界面连同流量曲线
+/// 一起停摆，就是用户看到的「接管中卡住」。现在网络 I/O 只发生在后台任务，
+/// `/api/state` 永远只读这个缓存，耗时恒定。
+static TRAFFIC_CACHE: OnceLock<Mutex<TrafficSnapshot>> = OnceLock::new();
+
+fn traffic_cache() -> &'static Mutex<TrafficSnapshot> {
+    TRAFFIC_CACHE.get_or_init(|| Mutex::new(TrafficSnapshot::default()))
+}
+
+fn cached_traffic() -> TrafficSnapshot {
+    *traffic_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn store_traffic(snapshot: TrafficSnapshot) {
+    *traffic_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = snapshot;
+}
+
+/// 后台流量采样：每 900ms 问一次内核，全程不持 `shared` 锁。
+/// 内核 controller 卡住时只有这个任务等，界面照常刷新。
+pub async fn traffic_sampler(shared: crate::server::Shared, shutdown: Arc<AtomicBool>) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let endpoint = {
+            let state = shared.lock().await;
+            if state.core.is_running() {
+                Some((
+                    state.config.controller_port,
+                    state.config.controller_secret.clone(),
+                ))
+            } else {
+                None
+            }
+        };
+        match endpoint {
+            Some((port, secret)) => {
+                let sampled = tokio::task::spawn_blocking(move || fetch_traffic(port, &secret))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("流量采样线程异常：{error}")));
+                // 失败时保留上一帧，曲线只是暂缓推进，不清空、不抖成 0。
+                if let Ok(snapshot) = sampled {
+                    store_traffic(snapshot);
+                }
+            }
+            None => store_traffic(TrafficSnapshot::default()),
+        }
+        if sleep_watch(&shutdown, TRAFFIC_STEP).await {
+            return;
         }
     }
 }
@@ -164,11 +291,18 @@ pub fn kill_orphan_cores(exclude_pid: Option<u32>) {
 }
 
 impl CoreProcess {
-    pub fn is_running(&mut self) -> bool {
-        match self.child.as_mut() {
+    /// 只读判活。接管动作进行中 `child` 锁被占时直接返回上次结果，**绝不阻塞**
+    /// `/api/state`：以前 `start()` 在 state 大锁里跑，内核启动多久界面就卡多久。
+    pub fn is_running(&self) -> bool {
+        let Ok(mut guard) = self.child.try_lock() else {
+            return self.running.load(Ordering::Relaxed);
+        };
+        let alive = match guard.as_mut() {
             Some(child) => matches!(child.try_wait(), Ok(None)),
             None => false,
-        }
+        };
+        self.running.store(alive, Ordering::Relaxed);
+        alive
     }
 
     pub fn write_config(&self, config: &AppConfig) -> Result<(), String> {
@@ -177,10 +311,22 @@ impl CoreProcess {
         std::fs::write(&path, yaml).map_err(|err| format!("写入核心配置失败：{err}"))
     }
 
-    pub fn start(&mut self, config: &AppConfig) -> Result<(), String> {
-        if self.is_running() {
-            self.write_config(config)?;
-            return Ok(());
+    pub fn start(&self, config: &AppConfig) -> Result<(), String> {
+        // child 锁从判活一直握到新句柄落地：两个动作同时点也不会拉起两个内核。
+        // 这把锁只属于 CoreProcess，不碰 AppState / shared，状态轮询照常返回。
+        let mut child_guard = self
+            .child
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(child) = child_guard.as_mut() {
+            if matches!(child.try_wait(), Ok(None)) {
+                self.write_config(config)?;
+                return Ok(());
+            }
+            // 句柄还在但进程已经退了：先收干净，否则下面的作业对象会叠上去。
+            if let Some(mut dead) = child_guard.take() {
+                let _ = dead.wait();
+            }
         }
         self.write_config(config)?;
         // 先把上一次异常退出留下的内核清掉：多个内核实例会同时抢 TUN 设备与路由表。
@@ -230,13 +376,17 @@ impl CoreProcess {
                 if !assign_to_job(job, &child) {
                     eprintln!("内核未能加入作业对象，退出时可能需要手动清理");
                 }
-                self.job = Some(job);
+                *self.job.lock().unwrap_or_else(|error| error.into_inner()) = Some(job);
             } else {
                 eprintln!("创建作业对象失败，内核将不随程序退出");
             }
         }
-        self.child = Some(child);
-        self.log_mark = Some(log_mark);
+        *child_guard = Some(child);
+        *self
+            .log_mark
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(log_mark);
+        self.running.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -248,14 +398,11 @@ impl CoreProcess {
     /// 比重启内核轻，也不会断流。
     pub fn reload(&self, config: &AppConfig) -> Result<(), String> {
         use std::io::Write;
-        use std::net::TcpStream;
 
-        let address = format!("127.0.0.1:{}", config.controller_port);
-        let mut stream = TcpStream::connect(&address)
-            .map_err(|err| format!("连不上内核控制接口 {address}：{err}"))?;
-        // 重载要重建全部出站，节点多时可能要几秒；不能让调用方无限等。
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(8)));
+        let address = controller_address(config.controller_port)?;
+        // 重载要重建全部出站，节点多时可能要几秒；但这里是在 state 锁里调用的，
+        // 无限等会把状态轮询一起拖死。3 秒不回就交给调用方重启内核。
+        let mut stream = connect_controller(config.controller_port, Duration::from_secs(3))?;
 
         let body = json!({ "path": generated_config_path().to_string_lossy() }).to_string();
         let request = format!(
@@ -291,10 +438,10 @@ impl CoreProcess {
     /// 重载完 TUN 还在转发、日志也照常打，但 mixed-port 和 external-controller
     /// 全没了——本地代理用不了，控制接口也调不动。必须真的连一下才知道。
     pub fn listeners_alive(&self, config: &AppConfig) -> bool {
-        use std::net::TcpStream;
-        self.child.is_some()
-            && TcpStream::connect(format!("127.0.0.1:{}", config.mixed_port)).is_ok()
-            && TcpStream::connect(format!("127.0.0.1:{}", config.controller_port)).is_ok()
+        // 原来的裸 TcpStream::connect 没有连接超时，端口半开时能挂很久。
+        self.running.load(Ordering::Relaxed)
+            && port_open(config.mixed_port)
+            && port_open(config.controller_port)
     }
 
     /// 读内核的累计流量与连接数。
@@ -302,59 +449,19 @@ impl CoreProcess {
     /// 流量只有内核自己知道：它按连接记 uploads / downloads 累计，我们在外面
     /// 既看不到每条连接，也不该自己去抓包，只能问它。之前界面上的速率和曲线
     /// 是写死的 0，看着就像「图表没了」。
-    pub fn traffic(&self, config: &AppConfig) -> Result<TrafficSnapshot, String> {
-        let body = self.controller_get(config, "/connections")?;
-        let value: Value =
-            serde_json::from_str(&body).map_err(|err| format!("内核流量数据无法解析：{err}"))?;
-        Ok(TrafficSnapshot {
-            download: value
-                .get("downloadTotal")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            upload: value.get("uploadTotal").and_then(Value::as_u64).unwrap_or(0),
-            connections: value
-                .get("connections")
-                .and_then(Value::as_array)
-                .map(|list| list.len() as u32)
-                .unwrap_or(0),
-        })
-    }
-
-    /// 向内核控制接口发一个 GET，返回响应体。
-    fn controller_get(&self, config: &AppConfig, path: &str) -> Result<String, String> {
-        use std::io::Write;
-        use std::net::TcpStream;
-
-        if self.child.is_none() {
-            return Err("内核没在运行".into());
-        }
-        let address = format!("127.0.0.1:{}", config.controller_port);
-        let mut stream = TcpStream::connect(&address)
-            .map_err(|err| format!("连不上内核控制接口 {address}：{err}"))?;
-        // 状态页每秒都会问一次，问不通就得赶紧返回，不能把整页渲染拖住。
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
-        let request = format!(
-            "GET {path} HTTP/1.1\r\n\
-             Host: {address}\r\n\
-             Authorization: Bearer {secret}\r\n\
-             Accept: application/json\r\n\
-             Connection: close\r\n\r\n",
-            secret = config.controller_secret,
-        );
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|err| format!("发送内核请求失败：{err}"))?;
-        read_http_body(stream)
-    }
-
     /// 本次内核启动之后写进日志的新内容。
     fn log_since_start(&self) -> String {
         let path = core_log_path();
         let Ok(meta) = std::fs::metadata(&path) else {
             return String::new();
         };
-        let mark = self.log_mark.unwrap_or(0).min(meta.len());
+        // 只读一下偏移量就放开锁：日志可能几 MB，不能握着锁读文件。
+        let mark = self
+            .log_mark
+            .lock()
+            .map(|guard| guard.unwrap_or(0))
+            .unwrap_or(0)
+            .min(meta.len());
         let Ok(mut file) = std::fs::File::open(&path) else {
             return String::new();
         };
@@ -386,14 +493,27 @@ impl CoreProcess {
             .filter(|message| !message.is_empty())
     }
 
-    pub fn stop(&mut self) -> Result<(), String> {
-        if let Some(mut child) = self.child.take() {
+    pub fn stop(&self) -> Result<(), String> {
+        let mut child_guard = self
+            .child
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(mut child) = child_guard.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        self.log_mark = None;
+        self.running.store(false, Ordering::Relaxed);
+        *self
+            .log_mark
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
         #[cfg(windows)]
-        if let Some(job) = self.job.take() {
+        if let Some(job) = self
+            .job
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
             unsafe {
                 let _ = windows::Win32::Foundation::CloseHandle(
                     windows::Win32::Foundation::HANDLE(job as *mut std::ffi::c_void),
@@ -468,7 +588,9 @@ fn assign_to_job(job: isize, child: &Child) -> bool {
 
 pub struct AppState {
     pub config: AppConfig,
-    pub core: CoreProcess,
+    /// 用 Arc 是为了让「启动/停止接管」能在 state 锁外持有同一个内核句柄，
+    /// 由 CoreProcess 自己的锁串行化，而不是把整个 AppState 锁住几分钟。
+    pub core: Arc<CoreProcess>,
     /// 用户「想要内核跑着」的意图：无论是开机自启、界面里手动开启，还是托盘
     /// 切换开启，都置为 true；手动关闭置为 false。自愈守护用它来区分「内核该跑却
     /// 崩了」和「用户故意关掉」，只在前一种情况下自动拉起，绝不跟用户的停止操作打架。
@@ -481,6 +603,9 @@ pub struct AppState {
     pub access_password: String,
     pub busy: bool,
     pub importing: bool,
+    /// 配置已经写盘但内核还没套用。`server.rs` 在 dispatch 返回、state 锁释放后
+    /// 会消费这个标志，走锁外的热重载/重启通道。
+    pub pending_core_apply: bool,
     pub headless: bool,
     /// 上次套用到内核的配置快照，用来判断这次是不是真的变了。
     pub applied_snapshot: String,
@@ -505,7 +630,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             config: crate::store::load(),
-            core: CoreProcess::default(),
+            core: Arc::new(CoreProcess::default()),
             core_desired_running: false,
             node_delays: HashMap::new(),
             deployments: HashMap::new(),
@@ -514,6 +639,7 @@ impl AppState {
             access_password: std::env::var("NETWORK_MANAGER_WEB_PASSWORD").unwrap_or_default(),
             busy: false,
             importing: false,
+            pending_core_apply: false,
             headless: false,
             applied_snapshot: String::new(),
             traffic_mark: None,
@@ -541,8 +667,10 @@ impl AppState {
 
     /// 采一次内核流量，顺便推进那一格曲线。
     ///
-    /// 计数只有内核知道，所以每次都是问它要累计值，再由我们两次差分出速率：
-    /// 这样即使某次状态没拉到，下一格也只是变长一点，不会凭空少一段流量。
+    /// 计数只有内核知道，由后台 `traffic_sampler` 每秒问一次写进缓存，这里只读
+    /// 缓存、绝不做网络 I/O。以前每次 `/api/state` 都同步连内核 controller，
+    /// 内核刚起来或热重载时接口一挂就是 3 秒，而调用方还握着 state 锁——
+    /// 整个界面连带流量曲线一起停摆。
     pub fn sample_traffic(&mut self) {
         if !self.core.is_running() {
             self.traffic_mark = None;
@@ -551,9 +679,7 @@ impl AppState {
             self.traffic_connections = 0;
             return;
         }
-        let Ok(snapshot) = self.core.traffic(&self.config) else {
-            return;
-        };
+        let snapshot = cached_traffic();
         self.traffic_download_total = snapshot.download;
         self.traffic_upload_total = snapshot.upload;
         self.traffic_connections = snapshot.connections;
@@ -588,23 +714,32 @@ impl AppState {
         self.applied_snapshot = snapshot;
         if self.core.is_running() && !unchanged {
             self.core.write_config(&self.config)?;
-            // 光把新配置写到磁盘，内核是不知道的：它只在启动时读一次，之后
-            // 并不监听文件变化。少了这一步，「切换节点」就变成只有界面和配置
-            // 文件变了，实际跑的还是旧节点——换到日本、出口还是美国。
-            let reloaded = self.core.reload(&self.config).is_ok();
-            // 重载完还要确认监听端口没丢：mihomo 的 listeners 不支持热重载，
-            // 重载后 TUN 照常转发、日志照常打，但两个端口都没了。这时候只剩
-            // 重启能把它们带回来。
-            if !reloaded || !self.core.listeners_alive(&self.config) {
-                eprintln!("内核热重载不可用，改为重启内核以套用新配置");
-                let _ = self.core.stop();
-                // 立刻重启会撞上还没释放干净的端口和网卡。
-                std::thread::sleep(Duration::from_millis(1200));
-                self.core.start(&self.config)?;
-            }
+            // 光把新配置写到磁盘，内核是不知道的：它只在启动时读一次。热重载、
+            // 端口检查、必要时停内核 + 等端口释放 + 重启，整套下来实测 1.85 秒，
+            // 以前全在 `dispatch` 持着的 state 锁里做 —— 改一条规则 / 切一次节点
+            // 界面就卡两秒，流量曲线跟着停。这里只挂个待办，由 server.rs 在锁外
+            // 执行（run_core_apply_action），状态轮询全程不受影响。
+            self.pending_core_apply = true;
         }
         Ok(())
     }
+}
+
+/// 把新配置套到正在跑的内核上。只碰 `CoreProcess` 自己的锁，
+/// 由 `methods::run_core_apply_action` 在 `spawn_blocking` 里调用。
+pub fn apply_core_changes(core: &CoreProcess, config: &AppConfig) -> Result<(), String> {
+    let reloaded = core.reload(config).is_ok();
+    // 重载完还要确认监听端口没丢：mihomo 的 listeners 不支持热重载，
+    // 重载后 TUN 照常转发、日志照常打，但两个端口都没了。这时候只剩
+    // 重启能把它们带回来。
+    if !reloaded || !core.listeners_alive(config) {
+        eprintln!("内核热重载不可用，改为重启内核以套用新配置");
+        let _ = core.stop();
+        // 立刻重启会撞上还没释放干净的端口和网卡。
+        std::thread::sleep(Duration::from_millis(1200));
+        core.start(config)?;
+    }
+    Ok(())
 }
 
 /// 本地内核日志的体积上限（3 MB）。超过后只保留最新的一段，旧内容直接丢弃，
@@ -760,8 +895,11 @@ pub async fn supervise_core(shared: crate::server::Shared, shutdown: Arc<AtomicB
 
         // 先短促持锁判断，再在锁外等待，避免长期占着状态锁挡住界面操作。
         let needs_restart = {
-            let mut state = shared.lock().await;
-            state.core_desired_running
+            let state = shared.lock().await;
+            // 手动开关接管期间 busy=true，此时 child 锁被动作线程占着，
+            // is_running() 返回的是缓存值。守护必须让开，不能抢着拉起第二个内核。
+            !state.busy
+                && state.core_desired_running
                 && !state.core.is_running()
                 && !shutdown.load(Ordering::SeqCst)
         };
@@ -774,7 +912,7 @@ pub async fn supervise_core(shared: crate::server::Shared, shutdown: Arc<AtomicB
             // 的就是「节点都挂着，出口 IP 还是本地的」。这是唯一能发现它的地方。
             let tun_error = {
                 let state = shared.lock().await;
-                if state.core_desired_running {
+                if state.core_desired_running && !state.busy {
                     state.core.tun_start_error()
                 } else {
                     None
@@ -785,22 +923,30 @@ pub async fn supervise_core(shared: crate::server::Shared, shutdown: Arc<AtomicB
                 // 残留的 wintun 网卡不先清掉，重启内核只会原样再失败一次。
                 #[cfg(windows)]
                 clear_stale_tun_adapter();
+                // stop / start 都在锁外跑：以前握着 state 锁重启内核，
+                // 界面会跟着一起卡住好几秒。
                 let pending = {
-                    let mut state = shared.lock().await;
-                    if state.core_desired_running && !shutdown.load(Ordering::SeqCst) {
-                        let _ = state.core.stop();
-                        Some(state.config.clone())
+                    let state = shared.lock().await;
+                    if state.core_desired_running
+                        && !state.busy
+                        && !shutdown.load(Ordering::SeqCst)
+                    {
+                        Some((state.core.clone(), state.config.clone()))
                     } else {
                         None
                     }
                 };
-                if let Some(config) = pending {
+                if let Some((core, config)) = pending {
+                    let stop_core = core.clone();
+                    let _ = tokio::task::spawn_blocking(move || stop_core.stop()).await;
                     // 立刻重启会撞上还没释放干净的网卡，等一下再拉起来。
                     if sleep_watch(&shutdown, TUN_RETRY_DELAY).await {
                         return;
                     }
-                    let mut state = shared.lock().await;
-                    if let Err(err) = state.core.start(&config) {
+                    let restarted = tokio::task::spawn_blocking(move || core.start(&config))
+                        .await
+                        .unwrap_or_else(|error| Err(format!("重启内核线程异常：{error}")));
+                    if let Err(err) = restarted {
                         eprintln!("重启内核失败：{err}");
                     }
                 }
@@ -827,19 +973,22 @@ pub async fn supervise_core(shared: crate::server::Shared, shutdown: Arc<AtomicB
             continue;
         }
 
-        let started = {
-            let mut state = shared.lock().await;
-            if !state.core_desired_running || shutdown.load(Ordering::SeqCst) {
+        // 自动恢复也走锁外：内核崩溃后重建 TUN 可能要几秒，
+        // 不能让这段时间把状态轮询和界面一起堵住。
+        let pending = {
+            let state = shared.lock().await;
+            if state.busy || !state.core_desired_running || shutdown.load(Ordering::SeqCst) {
                 None
             } else {
-                let config = state.config.clone();
-                Some(state.core.start(&config))
+                Some((state.core.clone(), state.config.clone()))
             }
         };
-        let started = match started {
-            Some(result) => result,
-            None => continue,
+        let Some((core, config)) = pending else {
+            continue;
         };
+        let started = tokio::task::spawn_blocking(move || core.start(&config))
+            .await
+            .unwrap_or_else(|error| Err(format!("自动恢复线程异常：{error}")));
 
         if let Err(err) = started {
             failures += 1;
@@ -860,7 +1009,7 @@ pub async fn supervise_core(shared: crate::server::Shared, shutdown: Arc<AtomicB
             return;
         }
         let alive = {
-            let mut state = shared.lock().await;
+            let state = shared.lock().await;
             state.core.is_running()
         };
         if alive {

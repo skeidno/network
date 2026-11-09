@@ -482,6 +482,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             crate::core::supervise_core(shared_for_supervisor, shutdown_for_supervisor).await;
         });
     }
+    // 流量采样独立成后台任务：状态接口只读缓存，内核 controller 卡住时不会
+    // 连累左下角曲线和整个界面（详见 core.rs::traffic_sampler）。
+    {
+        let shared_for_traffic = shared.clone();
+        let shutdown_for_traffic = supervisor_shutdown.clone();
+        tokio::spawn(async move {
+            crate::core::traffic_sampler(shared_for_traffic, shutdown_for_traffic).await;
+        });
+    }
 
     #[cfg(windows)]
     {
@@ -504,7 +513,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // 事件循环崩了：收掉内核再退出，不要挂着一个没有界面的进程。
                     // 先让自愈守护退场，免得它把刚停掉的内核又拉起来。
                     supervisor_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
-                    let mut state = shared.lock().await;
+                    let state = shared.lock().await;
                     let _ = state.core.stop();
                     return Err(err.into());
                 }
@@ -524,7 +533,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         wait_for_exit_signal().await?;
     }
 
-    let mut state = shared.lock().await;
+    let state = shared.lock().await;
     crate::gui::trace("main: 拿到 state 锁，准备停内核");
     // 让自愈守护先退场，否则它可能在我们停掉内核后又把它拉起来。
     supervisor_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);

@@ -357,8 +357,39 @@ async fn call_api(
         };
     }
 
-    let mut state = shared.lock().await;
-    match crate::methods::dispatch(&shared, &mut state, &method, args).await {
+    // 开关接管要写配置、清残留进程、拉起或回收内核。放进 dispatch 会把 state
+    // 锁占满整段动作，/api/state 与静态资源全部排队；更糟的是 busy 只在锁内
+    // 短暂为 true，前端一次都看不到，按钮就永远停在「处理中」。
+    // 与环境长动作同构：首尾短暂取锁，中间在 CoreProcess 自己的锁上跑。
+    if method == "toggleCore" {
+        let result = crate::methods::run_core_toggle_action(&shared).await;
+        return match result {
+            Ok(value) => {
+                security_headers(Json(json!({ "ok": true, "result": value })).into_response())
+            }
+            Err(message) => security_headers((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": message })),
+            )
+                .into_response()),
+        };
+    }
+
+    let (outcome, needs_apply) = {
+        let mut state = shared.lock().await;
+        let outcome = crate::methods::dispatch(&shared, &mut state, &method, args).await;
+        // 配置类 API 只负责写盘并挂待办，锁一放就走锁外的内核重载通道。
+        // 标志由 run_core_apply_action 自己消费，这里只读不写。
+        (outcome, state.pending_core_apply)
+    };
+    if needs_apply {
+        // 失败只记日志：配置已经保存，不能因为热重载失败就把整个 API 判成失败，
+        // 界面会误以为「保存没成功」。错误 toast 由方法内部发。
+        if let Err(message) = crate::methods::run_core_apply_action(&shared).await {
+            eprintln!("套用配置失败：{message}");
+        }
+    }
+    match outcome {
         Ok(result) => security_headers(Json(json!({"ok": true, "result": result})).into_response()),
         Err(message) => security_headers((
             StatusCode::BAD_REQUEST,
