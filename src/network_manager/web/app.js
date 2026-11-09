@@ -1071,7 +1071,11 @@ let envTaskAutoBusy = false;
 // nvm 状态单独缓存一份：体检结果里只有「装了哪些」，没有「能装哪些」。
 // 可装版本要调 nvm（要联网拉 available 列表），单独按需拉一次就好。
 let nvmState = null;
-let envVersionTarget = { id: "", version: "" };
+// 「可安装版本」要联网拉 nvm list available，只在用户点开时查一次，别跟着体检跑。
+let nvmAvailableChecked = false;
+// winget 按大版本分包的项目：下拉给 3.10 / 3.11 / 3.12 这类系列，可并存。
+const SERIES_ENV_IDS = ["python", "php", "ruby", "dotnet"];
+let envVersionTarget = { id: "", versions: [], versionKind: "patch" };
 // 最近一次体检结果。查完最新版本要用它重画卡片，不重发 scanEnv。
 let envData = null;
 // 最新稳定版查询结果：只有用户点「检查最新版本」才会有值，切页绝不自动联网。
@@ -1331,16 +1335,26 @@ function renderVersionManager(item) {
       </div>`
     : "";
 
-  const picker = candidates.length
-    ? `<div class="env-versions-row">
+  // 可安装版本要联网（nvm list available 实测 2.66 秒），不能挂在进页面这条路径上。
+  // 已装版本的徽章是本地数据，先画出来让用户能立刻切换；可装列表点按钮才查。
+  let picker;
+  if (candidates.length) {
+    picker = `<div class="env-versions-row">
         <select class="env-versions-select" id="env-nvm-pick">
           ${candidates.map((entry) => `<option value="${escapeHtml(entry.version)}">${escapeHtml(entry.version)}${entry.channel === "LTS" ? "（LTS）" : ""}</option>`).join("")}
         </select>
         <div class="env-versions-actions">
           <button type="button" class="button primary" data-nvm-install>${icon("download")}<span>安装并切换</span></button>
         </div>
-      </div>`
-    : `<div class="env-versions-hint">没有更多可安装的版本（已列出 nvm 提供的当前与 LTS 通道）。要装其它版本请到 <a href="https://nodejs.org/dist/" target="_blank" rel="noreferrer">nodejs.org/dist</a> 查。</div>`;
+      </div>`;
+  } else if (nvmAvailableChecked) {
+    picker = `<div class="env-versions-hint">没查到更多可安装版本（nvm 只列 CURRENT / LTS 两列）。要装指定版本可用 <code>nvm install &lt;版本号&gt;</code>，或到 <a href="https://nodejs.org/dist/" target="_blank" rel="noreferrer">nodejs.org/dist</a> 查。</div>`;
+  } else {
+    picker = `<div class="env-versions-row">
+        <button type="button" class="button secondary" data-nvm-query-versions>${icon("download")}<span>查看可安装版本（联网）</span></button>
+        <div class="env-versions-hint" style="margin:0">已装版本点上面的徽章就能切换；这一步只查还能装哪些，不会跟着体检自动跑。</div>
+      </div>`;
+  }
 
   return `
     <div class="env-versions" data-nvm-for="node">
@@ -1360,15 +1374,21 @@ function renderVersionManager(item) {
  * 不能让用户以为点一下就多出一个并存版本。
  */
 function renderWingetVersionManager(item) {
+  // python / php / ruby / dotnet 在 winget 里按大版本拆成不同的包 id，
+  // 下拉给的是「3.10 / 3.11 / 3.12」这类系列；装不同系列可以并存。
+  // git / jdk / go 只有一个包，下拉给补丁号，换版本会覆盖现有安装。
+  const seriesItem = SERIES_ENV_IDS.includes(item.id);
   // 没展开就不画这个区 —— 版本列表要调 winget 源，不该一进页面就拉
   if (!envVersionTarget || envVersionTarget.id !== item.id) {
     return `
       <div class="env-versions">
         <div class="env-versions-title">${icon("download")}<span>版本管理</span></div>
         <div class="env-versions-actions">
-          <button type="button" class="text-button" data-env-query-versions="${escapeHtml(item.id)}">查看可安装版本</button>
+          <button type="button" class="text-button" data-env-query-versions="${escapeHtml(item.id)}">${seriesItem ? "选择要安装的大版本" : "查看可安装版本"}</button>
         </div>
-        <div class="env-versions-hint"><strong>这一项不能多版本并存</strong>：装指定版本会先卸载现有版本。要并存请用 Node 的 nvm。</div>
+        <div class="env-versions-hint">${seriesItem
+          ? "winget 里各系列是独立包，装 3.10 / 3.11 / 3.12 可与现有版本并存；命令行默认用哪个由 PATH / 版本选择器决定。"
+          : "<strong>这一项不能多版本并存</strong>：装指定版本会先卸载现有版本。要并存请用 Node 的 nvm。"}</div>
       </div>`;
   }
   const versions = Array.isArray(envVersionTarget.versions) ? envVersionTarget.versions : [];
@@ -1376,22 +1396,27 @@ function renderWingetVersionManager(item) {
     return `
       <div class="env-versions">
         <div class="env-versions-title">${icon("download")}<span>版本管理</span></div>
-        <div class="env-versions-hint">正在查询可安装版本…</div>
+        <div class="env-versions-hint">没有查到可安装的版本，请检查 winget 源或网络连接。</div>
       </div>`;
   }
+  const isSeries = envVersionTarget.versionKind === "series";
   return `
     <div class="env-versions">
-      <div class="env-versions-title">${icon("download")}<span>版本管理</span></div>
+      <div class="env-versions-title">${icon("download")}<span>版本管理</span>
+        ${isSeries ? `<span class="env-versions-tag">大版本系列</span>` : ""}
+      </div>
       <div class="env-versions-row">
         <select class="env-versions-select" data-env-version-pick="${escapeHtml(item.id)}">
           <option value="">保持 ${escapeHtml(item.version || "当前版本")}</option>
-          ${versions.map((version) => `<option value="${escapeHtml(version)}">${escapeHtml(version)}</option>`).join("")}
+          ${versions.map((version) => `<option value="${escapeHtml(version)}">${isSeries ? `${escapeHtml(item.name)} ${escapeHtml(version)}` : escapeHtml(version)}</option>`).join("")}
         </select>
         <div class="env-versions-actions">
           <button type="button" class="button primary" data-env-install-version="${escapeHtml(item.id)}">${icon("download")}<span>安装该版本</span></button>
         </div>
       </div>
-      <div class="env-versions-hint"><strong>与 Node 不同，这一项不能多版本并存</strong>：装指定版本会先卸载现在的版本。</div>
+      <div class="env-versions-hint">${isSeries
+        ? "<strong>各系列可并存</strong>：winget 里每个大版本是独立包，安装不会卸载现有版本；命令行默认指向哪个由 PATH / 版本选择器决定。"
+        : "<strong>不能多版本并存</strong>：装指定版本会先卸载现在的版本（用 winget --version --force）。"}</div>
     </div>`;
 }
 
@@ -1399,8 +1424,12 @@ async function queryEnvVersions(id) {
   if (envBusy) return;
   setEnvBusy(true);
   try {
-    const data = await invoke("envAvailableVersions", id);
-    envVersionTarget = { id, versions: Array.isArray(data?.versions) ? data.versions : [] };
+    const data = await invokeStrict("envAvailableVersions", id);
+    envVersionTarget = {
+      id,
+      versions: Array.isArray(data?.versions) ? data.versions : [],
+      versionKind: data?.versionKind || "patch",
+    };
     if (!envVersionTarget.versions.length) {
       showToast("error", "没查到可安装的版本");
     }
@@ -1410,9 +1439,27 @@ async function queryEnvVersions(id) {
   } finally {
     setEnvBusy(false);
   }
-  // 重画整页：版本区是 renderEnv 的一部分
-  const data = await invoke("scanEnv");
-  renderEnv(data);
+  // 用缓存的体检结果重画，不再多发一次 scanEnv（版本区是卡片的一部分）。
+  if (envData) renderEnv(envData);
+}
+
+async function queryNvmAvailableVersions() {
+  if (envBusy || nvmAvailableChecked) return;
+  setEnvBusy(true);
+  try {
+    const data = await invokeStrict("nvmAvailableVersions");
+    nvmState = {
+      ...(nvmState || {}),
+      availableVersions: Array.isArray(data?.availableVersions) ? data.availableVersions : [],
+      hint: data?.hint || "",
+    };
+    nvmAvailableChecked = true;
+    if (envData) renderEnv(envData);
+  } catch (error) {
+    showToast("error", error.message || "查询 Node 可安装版本失败");
+  } finally {
+    setEnvBusy(false);
+  }
 }
 
 async function refreshNvm() {
@@ -1432,7 +1479,17 @@ async function runNvmAction(method, version, verb) {
   let freshEnv = null;
   try {
     const result = await invokeStrict(method, version);
-    if (result && result.nvm) nvmState = result.nvm;
+    if (result && result.nvm) {
+      // 后端回的是本地状态（不含联网的可安装版本），把已经查过的列表保住，
+      // 否则装完一个版本下拉就空了，用户得再点一次联网查询。
+      nvmState = {
+        ...(nvmState || {}),
+        ...result.nvm,
+        availableVersions: nvmAvailableChecked
+          ? (nvmState?.availableVersions || [])
+          : [],
+      };
+    }
     freshEnv = result?.env || null;
     showEnvDetail(`${verb}输出`, result?.detail || `${verb}完成`);
   } catch (error) {
@@ -1458,12 +1515,15 @@ async function refreshEnv(force = false) {
   const summary = byId("env-summary");
   summary.textContent = "正在体检…";
   try {
-    // nvm 状态先拉：Node 卡片要靠它画版本管理区。
-    // 放在 scanEnv 之前，两个都是子进程调用，顺序不影响耗时。
-    if (!nvmState) await refreshNvm();
+    // 两个查询在后端都走 spawn_blocking（不持状态锁），并行发起。
+    // 以前串行 await：nvmStatus 联网 2.66s + scanEnv 1.5s，加起来 4 秒多，
+    // 期间 /api/state 全在排队，左下角流量曲线直接停住。
+    const [data] = await Promise.all([
+      invokeStrict("scanEnv", force),
+      nvmState ? Promise.resolve() : refreshNvm(),
+    ]);
     // 后端对体检结果有 15 秒缓存，防止意外的高频轮询把整机拖起来；
     // 用户手动点「重新体检」要绕过缓存，否则点了像没反应。
-    const data = await invoke("scanEnv", force);
     renderEnv(data);
   } catch (error) {
     summary.textContent = `体检失败：${error.message || error}`;
@@ -1485,7 +1545,7 @@ function setEnvBusy(busy) {
   // 安装期间把所有按钮禁掉：winget 独占安装锁，连点两次只会得到一段乱序输出
   document.querySelectorAll(
     "[data-env-install], [data-env-reinstall], [data-env-update], [data-env-uninstall], [data-env-install-version], [data-env-query-versions]," +
-    "[data-nvm-use], [data-nvm-install], #env-install-all, #env-uninstall-all, #env-refresh, #env-check-latest, #env-update-all"
+    "[data-nvm-use], [data-nvm-install], [data-nvm-query-versions], #env-install-all, #env-uninstall-all, #env-refresh, #env-check-latest, #env-update-all"
   )
     .forEach((button) => { button.disabled = busy; });
   // 摘要交给 renderEnv 画真实体检数据；任务提示由下方的进度卡负责。
@@ -3723,6 +3783,11 @@ function bindEvents() {
       runNvmAction("nvmInstallVersion", picker.value, "安装版本");
       return;
     }
+    const nvmQuery = event.target.closest("[data-nvm-query-versions]");
+    if (nvmQuery) {
+      queryNvmAvailableVersions();
+      return;
+    }
     const installVersion = event.target.closest("[data-env-install-version]");
     if (installVersion) {
       const id = installVersion.dataset.envInstallVersion;
@@ -3732,13 +3797,13 @@ function bindEvents() {
         showToast("error", "先选一个要安装的版本");
         return;
       }
-      // 破坏性操作要确认一次：装指定版本会先卸载现在的
+      // 大版本系列是独立包、可并存；补丁版本才要覆盖现有安装，确认文案要分开讲。
       const card = document.querySelector(`.env-card[data-env-card="${id}"] .env-card-version`);
       const current = card ? card.textContent.trim() : "当前版本";
-      if (!window.confirm(
-        `${id} 目前是 ${current}。\n` +
-        `安装 ${version} 会先卸载现有版本（不能多版本并存）。\n\n继续吗？`
-      )) return;
+      const warning = SERIES_ENV_IDS.includes(id)
+        ? `${id} 目前是 ${current}。\n将安装 ${version} 系列的最新补丁（winget 独立包，与现有版本并存，不会卸载）。\n\n继续吗？`
+        : `${id} 目前是 ${current}。\n安装 ${version} 会先卸载现有版本（不能多版本并存）。\n\n继续吗？`;
+      if (!window.confirm(warning)) return;
       runEnvAction(id, "installEnv", "安装", version);
       return;
     }
