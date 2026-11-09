@@ -159,6 +159,9 @@ impl EnvItem {
             // 「更新」按钮能不能用：Rust 要有 rustup，其余要有 winget。
             // Node 特意不给 —— 它归 nvm 管，winget 那个系统级包会跟 nvm 打架。
             "canUpdate": can_update(self.id),
+            // 卸载白名单：WebView2 / VC++ 这类系统共用组件不给卸载入口。
+            // 缺失项也保留这个按钮，方便清掉「装了一半」留下的残留目录。
+            "canUninstall": can_uninstall(self.id),
         })
     }
 }
@@ -1413,6 +1416,558 @@ pub fn open_download(id: &str) -> Result<(), String> {
         _ => return Err(format!("未知的环境条目：{id}")),
     };
     open_url(url)
+}
+
+// ---------------------------------------------------------------------------
+// 一键卸载：官方卸载 + 残留清理
+// ---------------------------------------------------------------------------
+//
+// 「卸载干净」不是一句 winget uninstall 就完事：Go 这类工具会同时在
+// Program Files 留主程序、在 %LOCALAPPDATA% 留编译缓存、在用户目录留 GOPATH，
+// 还要往 PATH / GOROOT / GOPATH 写环境变量。winget 的 --purge 只管它自己
+// 认得的那个包目录，且包不在 winget 里时（手动装的）整个卸载会失败。
+//
+// 所以这里分四步：官方卸载 → 删白名单残留目录 → 清 PATH 与环境变量 → 复核体检。
+// 官方卸载失败**不中断**：残留目录照样清，报告里如实写明哪步没成功。
+// 所有路径都由下面的常量白名单拼出来，绝不接收前端传进来的任意路径。
+
+/// 能不能卸载。WebView2 / VC++ 运行库是系统组件，卸了会打坏别的程序
+/// （甚至本程序自己的界面），明确不给这个入口。
+pub fn can_uninstall(id: &str) -> bool {
+    matches!(
+        id,
+        "go" | "rust" | "python" | "node" | "git" | "jdk" | "adb" | "dotnet" | "php" | "ruby" | "nvm"
+    )
+}
+
+fn display_name(id: &str) -> &'static str {
+    match id {
+        "go" => "Go",
+        "rust" => "Rust",
+        "python" => "Python",
+        "node" => "Node.js",
+        "git" => "Git",
+        "jdk" => "JDK",
+        "adb" => "ADB Platform Tools",
+        "dotnet" => ".NET SDK",
+        "php" => "PHP",
+        "ruby" => "Ruby",
+        "nvm" => "nvm-windows",
+        "webview2" => "WebView2 Runtime",
+        "vcredist" => "VC++ 运行库",
+        _ => "未知组件",
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CleanupTarget {
+    /// install = 程序本体；cache = 缓存/配置；userdata = 可能含用户自己的东西
+    kind: &'static str,
+    path: PathBuf,
+    note: &'static str,
+}
+
+fn os_dir(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+}
+
+fn user_home() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\"))
+}
+
+/// 枚举 base 下名字以 prefix 开头的子目录（Python3xx / jdk-21 / Ruby 4.0 这类）。
+fn prefixed_dirs(base: Option<PathBuf>, prefix: &str) -> Vec<PathBuf> {
+    let Some(base) = base else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let needle = prefix.to_ascii_lowercase();
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_ascii_lowercase().starts_with(&needle))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// 该文件全部由白名单目录拼成；前端只能传 id 与一个 deep 布尔值。
+fn cleanup_targets(id: &str) -> Vec<CleanupTarget> {
+    let home = user_home();
+    let local = os_dir("LOCALAPPDATA");
+    let appdata = os_dir("APPDATA");
+    let pf = os_dir("ProgramFiles");
+    let pf86 = os_dir("ProgramFiles(x86)");
+    let drive = std::env::var_os("SystemDrive")
+        .map(|value| PathBuf::from(format!("{}\\", value.to_string_lossy())))
+        .filter(|path| path.is_dir());
+    let mut out: Vec<CleanupTarget> = Vec::new();
+    macro_rules! add {
+        ($kind:expr, $path:expr, $note:expr) => {
+            if let Some(path) = $path {
+                out.push(CleanupTarget { kind: $kind, path, note: $note });
+            }
+        };
+    }
+    let join = |base: &Option<PathBuf>, rel: &str| base.as_ref().map(|dir| dir.join(rel));
+
+    match id {
+        "go" => {
+            add!("install", join(&pf, "Go"), "Go 主安装目录");
+            add!("install", join(&pf86, "Go"), "Go 主安装目录（备用路径）");
+            add!("install", join(&local, r"Programs\Go"), "Go 用户级安装目录");
+            add!("cache", join(&local, "go-build"), "Go 编译缓存");
+            add!("cache", join(&appdata, "go"), "go env 配置与遥测");
+            add!("userdata", Some(home.join("go")), "GOPATH（可能含你自己写的项目或模块缓存）");
+        }
+        "rust" => {
+            add!("install", Some(home.join(".cargo")), "Cargo 工具链与 registry 缓存");
+            add!("install", Some(home.join(".rustup")), "rustup 工具链");
+        }
+        "python" => {
+            for dir in prefixed_dirs(local.as_ref().map(|p| p.join("Programs").join("Python")), "Python3") {
+                out.push(CleanupTarget { kind: "install", path: dir, note: "Python 安装目录" });
+            }
+            for dir in prefixed_dirs(drive.clone(), "Python3") {
+                out.push(CleanupTarget { kind: "install", path: dir, note: "Python 根目录安装" });
+            }
+            add!("cache", join(&local, r"pip\Cache"), "pip 下载缓存");
+            add!("cache", join(&appdata, "Python"), "Python 用户配置");
+        }
+        "node" => {
+            add!("install", join(&pf, "nodejs"), "Node 系统级安装目录");
+            add!("install", join(&local, r"Programs\nodejs"), "Node 用户级安装目录");
+            add!("cache", join(&appdata, "npm-cache"), "npm 缓存");
+            add!("cache", join(&local, "npm-cache"), "npm 缓存（本地）");
+            add!("userdata", join(&appdata, "npm"), "npm 全局安装的包");
+        }
+        "git" => {
+            add!("install", join(&pf, "Git"), "Git 安装目录");
+            add!("install", join(&pf86, "Git"), "Git 安装目录（备用路径）");
+        }
+        "jdk" => {
+            for dir in prefixed_dirs(pf.as_ref().map(|p| p.join("Microsoft")), "jdk-") {
+                out.push(CleanupTarget { kind: "install", path: dir, note: "Microsoft JDK" });
+            }
+            for dir in prefixed_dirs(pf.as_ref().map(|p| p.join("Eclipse Adoptium")), "jdk-") {
+                out.push(CleanupTarget { kind: "install", path: dir, note: "Eclipse Temurin JDK" });
+            }
+            for dir in prefixed_dirs(pf.as_ref().map(|p| p.join("Java")), "jdk") {
+                out.push(CleanupTarget { kind: "install", path: dir, note: "Java JDK" });
+            }
+        }
+        "adb" => {
+            add!("install", join(&local, r"Android\Sdk\platform-tools"), "Android platform-tools");
+            add!("install", drive.as_ref().map(|p| p.join("platform-tools")), "platform-tools 根目录");
+            add!("install", join(&pf, r"Android\platform-tools"), "platform-tools（Program Files）");
+        }
+        "dotnet" => {
+            add!("install", join(&pf, "dotnet"), ".NET SDK 安装目录");
+            add!("install", join(&local, r"Programs\dotnet"), ".NET SDK 用户级安装目录");
+            add!("cache", Some(home.join(".dotnet")), ".NET 用户级工具与缓存");
+            add!("cache", Some(home.join(".templateengine")), ".NET 模板缓存");
+        }
+        "php" => {
+            add!("install", join(&pf, "PHP"), "PHP 安装目录");
+            add!("install", drive.as_ref().map(|p| p.join("php")), "PHP 根目录安装");
+            add!("install", join(&local, r"Programs\PHP"), "PHP 用户级安装目录");
+        }
+        "ruby" => {
+            for dir in prefixed_dirs(drive.clone(), "Ruby") {
+                out.push(CleanupTarget { kind: "install", path: dir, note: "RubyInstaller 安装目录" });
+            }
+            add!("install", join(&local, r"Programs\Ruby"), "Ruby 用户级安装目录");
+        }
+        "nvm" => {
+            add!("install", join(&appdata, "nvm"), "nvm 版本库");
+            add!("install", join(&local, r"Programs\nvm"), "nvm 用户级安装目录");
+        }
+        _ => {}
+    }
+    out
+}
+
+/// PATH 条目里属于这个工具的片段。用带反斜杠的片段，避免把名字里碰巧含 go 的路径误删。
+fn path_needles(id: &str) -> Vec<&'static str> {
+    match id {
+        "go" => vec![r"\go\bin"],
+        "rust" => vec![r"\.cargo\bin", r"\.rustup"],
+        "python" => vec![r"\python3", r"\python\scripts"],
+        "node" => vec![r"\nodejs", r"\npm"],
+        "git" => vec![r"\git\cmd", r"\git\bin"],
+        "jdk" => vec![r"\jdk-", r"\java\jdk"],
+        "adb" => vec![r"\platform-tools"],
+        "dotnet" => vec![r"\dotnet"],
+        "php" => vec![r"\php"],
+        "ruby" => vec![r"\ruby"],
+        "nvm" => vec![r"\nvm"],
+        _ => vec![],
+    }
+}
+
+fn env_names(id: &str) -> Vec<&'static str> {
+    match id {
+        "go" => vec!["GOROOT", "GOPATH"],
+        "rust" => vec!["CARGO_HOME", "RUSTUP_HOME"],
+        "python" => vec!["PYTHONHOME", "PYTHONPATH"],
+        "jdk" => vec!["JAVA_HOME"],
+        "dotnet" => vec!["DOTNET_ROOT", "DOTNET_CLI_HOME"],
+        "node" => vec!["NODE_PATH", "npm_config_prefix"],
+        "nvm" => vec!["NVM_HOME", "NVM_SYMLINK"],
+        _ => vec![],
+    }
+}
+
+fn path_hit(id: &str, entry: &str) -> bool {
+    let lower = entry
+        .trim_end_matches(['\\', '/'])
+        .to_ascii_lowercase();
+    path_needles(id)
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// 当前进程 PATH 里会被清掉的条目，只用于卸载前的清单展示。
+fn current_path_entries(id: &str) -> Vec<String> {
+    let Some(path) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+    std::env::split_paths(&path)
+        .map(|dir| dir.to_string_lossy().to_string())
+        .filter(|dir| path_hit(id, dir))
+        .collect()
+}
+
+/// 只统计个大概：目录可能有上万文件，全量递归会让预览卡住状态轮询。
+fn dir_stats(path: &Path) -> (usize, u64) {
+    fn walk(path: &Path, depth: u8, files: &mut usize, bytes: &mut u64) {
+        if depth > 4 || *files > 3000 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if *files > 3000 {
+                break;
+            }
+            let child = entry.path();
+            if child.is_dir() {
+                walk(&child, depth + 1, files, bytes);
+            } else {
+                *files += 1;
+                *bytes += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+            }
+        }
+    }
+    let mut files = 0;
+    let mut bytes = 0;
+    walk(path, 0, &mut files, &mut bytes);
+    (files, bytes)
+}
+
+/// 卸载预览：纯只读，把「会删什么」摊给用户看，一个字节都不动。
+pub fn uninstall_preview(id: &str) -> Value {
+    let allowed = can_uninstall(id);
+    let reason = if allowed {
+        ""
+    } else if matches!(id, "webview2" | "vcredist") {
+        "WebView2 / VC++ 运行库是系统共用组件，卸载会破坏其它程序，本页不提供卸载"
+    } else {
+        "未知的环境条目"
+    };
+    let paths: Vec<Value> = cleanup_targets(id)
+        .iter()
+        .map(|target| {
+            let exists = target.path.exists();
+            let (files, bytes) = if exists {
+                dir_stats(&target.path)
+            } else {
+                (0, 0)
+            };
+            json!({
+                "kind": target.kind,
+                "path": target.path.to_string_lossy(),
+                "exists": exists,
+                "files": files,
+                "bytes": bytes,
+                "note": target.note,
+            })
+        })
+        .collect();
+    let env_vars: Vec<Value> = env_names(id)
+        .iter()
+        .map(|name| {
+            json!({
+                "name": name,
+                "value": std::env::var(name).unwrap_or_default(),
+            })
+        })
+        .collect();
+    json!({
+        "id": id,
+        "name": display_name(id),
+        "package": winget_id(id).unwrap_or(""),
+        "allowed": allowed,
+        "reason": reason,
+        "paths": paths,
+        "pathEntries": current_path_entries(id),
+        "envVars": env_vars,
+    })
+}
+
+/// 官方卸载命令。包不在 winget 里不算致命错误，后面还会清残留目录。
+fn official_uninstall(id: &str) -> Result<String, String> {
+    if id == "rust" {
+        let exe = find_exe(&["rustup.exe", "rustup"])
+            .ok_or_else(|| "没找到 rustup，跳过 rustup 自卸载".to_string())?;
+        let output = command(&exe.to_string_lossy())
+            .args(["self", "uninstall", "-y"])
+            .output()
+            .map_err(|error| format!("调用 rustup 失败：{error}"))?;
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .trim()
+        .to_string();
+        return if output.status.success() {
+            Ok(text)
+        } else {
+            Err(format!("rustup self uninstall 退出码 {:?}：\n{text}", output.status.code()))
+        };
+    }
+    let package = winget_id(id).ok_or_else(|| format!("未知的环境条目：{id}"))?;
+    let output = winget_command()?
+        .args([
+            "uninstall",
+            "--id",
+            package,
+            "--exact",
+            "--silent",
+            "--purge",
+            "--disable-interactivity",
+        ])
+        .output()
+        .map_err(|error| format!("调用 winget 失败：{error}"))?;
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .trim()
+    .to_string();
+    if output.status.success() {
+        Ok(text)
+    } else if uninstall_not_found(&text) {
+        Ok(format!("winget 里没有这个包（可能是手动安装的），跳过官方卸载：\n{text}"))
+    } else {
+        Err(format!(
+            "winget uninstall 退出码 {:?}：\n{text}",
+            output.status.code()
+        ))
+    }
+}
+
+/// winget「没找到已安装的包」也是非零退出，但它不代表失败：
+/// 用户可能手动装过，残留目录仍然要清。
+fn uninstall_not_found(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    output.contains("找不到已安装的包")
+        || output.contains("没有找到与输入条件匹配的已安装包")
+        || lower.contains("no installed package found")
+        || lower.contains("no package found matching")
+        || lower.contains("no applicable")
+}
+
+#[cfg(windows)]
+const CLEAN_ENV_SCRIPT: &str = r#"
+$needles = @(__NEEDLES__)
+$names = @(__NAMES__)
+foreach ($scope in @('User','Machine')) {
+  try {
+    $p = [Environment]::GetEnvironmentVariable('Path', $scope)
+    if ($p) {
+      $parts = @()
+      foreach ($entry in ($p -split ';')) {
+        $t = $entry.TrimEnd('\')
+        if (-not $t) { continue }
+        $hit = $false
+        foreach ($n in $needles) { if ($t.ToLower().Contains($n.ToLower())) { $hit = $true; break } }
+        if (-not $hit) { $parts += $entry }
+      }
+      $new = ($parts -join ';')
+      if ($new -ne $p) {
+        [Environment]::SetEnvironmentVariable('Path', $new, $scope)
+        Write-Output ("PATH(" + $scope + "): removed matching entries")
+      } else {
+        Write-Output ("PATH(" + $scope + "): nothing to remove")
+      }
+    }
+    foreach ($name in $names) {
+      if ([Environment]::GetEnvironmentVariable($name, $scope)) {
+        [Environment]::SetEnvironmentVariable($name, $null, $scope)
+        Write-Output ("ENV(" + $scope + "): removed " + $name)
+      }
+    }
+  } catch {
+    Write-Output ("ENV(" + $scope + "): skipped - " + $_.Exception.Message)
+  }
+}
+"#;
+
+#[cfg(windows)]
+fn ps_literal(items: &[&str]) -> String {
+    items
+        .iter()
+        .map(|item| format!("'{}'", item.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(windows)]
+fn clean_environment(id: &str) -> String {
+    let needles = path_needles(id);
+    let names = env_names(id);
+    if needles.is_empty() && names.is_empty() {
+        return "  该项没有需要清理的 PATH / 环境变量".to_string();
+    }
+    let script = CLEAN_ENV_SCRIPT
+        .replace("__NEEDLES__", &ps_literal(&needles))
+        .replace("__NAMES__", &ps_literal(&names));
+    match command("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+    {
+        Ok(output) => {
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let lines: Vec<String> = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|line| format!("  {line}"))
+                .collect();
+            if lines.is_empty() {
+                "  PowerShell 没有返回输出".to_string()
+            } else {
+                lines.join("\n")
+            }
+        }
+        Err(error) => format!("  调用 PowerShell 失败：{error}"),
+    }
+}
+
+#[cfg(not(windows))]
+fn clean_environment(_id: &str) -> String {
+    "  非 Windows 平台跳过环境变量清理".to_string()
+}
+
+/// 进程内的 PATH 是启动时读进来的，改注册表不会自动刷新。
+/// 不把它同步清掉，装完立刻复核时 find_exe 还会从旧 PATH 找到刚删掉的 exe。
+fn scrub_current_process_path(id: &str) {
+    let Some(path) = std::env::var_os("PATH") else {
+        return;
+    };
+    let kept: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|dir| !path_hit(id, &dir.to_string_lossy()))
+        .collect();
+    if let Ok(joined) = std::env::join_paths(kept) {
+        std::env::set_var("PATH", joined);
+    }
+}
+
+/// 一键卸载 + 清理。`deep` 为 true 才删 userdata 目录（GOPATH / npm 全局包等）。
+pub fn uninstall(id: &str, deep: bool) -> Result<String, String> {
+    if !cfg!(windows) {
+        return Err("卸载与清理目前只在 Windows 上可用".into());
+    }
+    if !can_uninstall(id) {
+        return Err(format!("{} 不允许在这里卸载", display_name(id)));
+    }
+    let mut report = vec![format!(
+        "卸载 {}（深度清理：{}）",
+        display_name(id),
+        if deep { "开" } else { "关（保留用户数据目录）" }
+    )];
+
+    crate::envtask::set_phase("调用官方卸载程序（winget 卸载可能需要几分钟）");
+    match official_uninstall(id) {
+        Ok(detail) => report.push(format!("[1/4] 官方卸载\n{}", indent(&detail))),
+        // 官方卸载失败照样往下清残留：winget 里没这个包时，目录才是真正要处理的东西
+        Err(error) => report.push(format!("[1/4] 官方卸载未完成，继续清理残留\n{}", indent(&error))),
+    }
+
+    crate::envtask::set_phase("清理残留目录");
+    let mut removed = 0;
+    let mut kept = 0;
+    let mut failed = 0;
+    for target in cleanup_targets(id) {
+        if !target.path.exists() {
+            continue;
+        }
+        if target.kind == "userdata" && !deep {
+            kept += 1;
+            report.push(format!("  保留 {}: {}（{}）", target.kind, target.path.display(), target.note));
+            continue;
+        }
+        match std::fs::remove_dir_all(&target.path) {
+            Ok(()) => {
+                removed += 1;
+                report.push(format!("  已删除 {}: {}", target.kind, target.path.display()));
+            }
+            Err(error) => {
+                failed += 1;
+                report.push(format!("  删除失败 {}: {} — {error}", target.kind, target.path.display()));
+            }
+        }
+    }
+    report.push(format!(
+        "[2/4] 残留目录：已删 {removed} 个，保留 {kept} 个，失败 {failed} 个"
+    ));
+
+    crate::envtask::set_phase("清理 PATH 与环境变量");
+    report.push(format!("[3/4] PATH / 环境变量\n{}", clean_environment(id)));
+    scrub_current_process_path(id);
+
+    crate::envtask::set_phase("复核体检结果");
+    let env = scan_fresh();
+    let still_ready = env
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+        })
+        .and_then(|item| item.get("ready").and_then(Value::as_bool))
+        .unwrap_or(false);
+    report.push(format!(
+        "[4/4] 复核：{}",
+        if still_ready {
+            "仍能检测到这个工具，可能还有别的安装位置；已打开的终端需要重开才会读到新的 PATH"
+        } else {
+            "已检测不到，环境清理完成（已打开的终端需重开才生效）"
+        }
+    ));
+    Ok(report.join("\n"))
+}
+
+fn indent(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 用系统默认浏览器打开一个链接。
