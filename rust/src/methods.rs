@@ -1373,11 +1373,37 @@ pub async fn dispatch(
         } else {
             crate::envmgr::scan()
         }),
+        // 批量任务开始前报一次总数；逐项动作由 run_env_long_action 自己推进。
+        // 这三个都是纯内存赋值，留在锁内没问题。
+        "envTaskBegin" => {
+            let label = text(&args, 0);
+            let items: Vec<String> = args
+                .get(1)
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            crate::envtask::begin(&label, items);
+            Ok(json!(true))
+        }
+        "envTaskFinish" => {
+            crate::envtask::finish();
+            Ok(json!(true))
+        }
+        "envTaskClear" => {
+            crate::envtask::clear();
+            Ok(json!(true))
+        }
+        // 卸载预览是只读的：只列「会删什么」，不动磁盘。前端确认后才调卸载。
+        "envUninstallPreview" => Ok(crate::envmgr::uninstall_preview(&text(&args, 0))),
         // install / reinstall / update 会同步跑 winget 几十秒到几分钟，
         // 必须走 server.rs 的锁外通道（run_env_long_action）。dispatch 是持锁调用的，
         // 留在这里会把状态轮询一起卡死。保留明确报错，免得以后有人从别的路径调进来。
-        "installEnv" | "reinstallEnv" | "updateEnv" => {
-            Err("环境安装须走锁外通道".into())
+        "installEnv" | "reinstallEnv" | "updateEnv" | "uninstallEnv" => {
+            Err("环境安装 / 卸载须走锁外通道".into())
         }
         // 最新版本查询会联网，已在 server.rs 的锁外分支处理；留个明确报错，
         // 免得以后有人从别的路径调进来，还以为是「未知方法」。
@@ -2466,7 +2492,50 @@ where
 
 /// 真正干活的部分，全程不碰 state。返回值里带上重扫后的 env / nvm 快照，
 /// 前端据此当场重画卡片，不用再发一次请求。
+///
+/// 外面包一层任务进度：动作真的开始了才 begin_item，真的结束了才 end_item，
+/// 界面上的「第 N/M 项」因此是后端执行到第几项的真实计数，不是估算或动画。
 fn env_long_action_body(method: &str, args: &[Value]) -> Result<Value, String> {
+    let label = match method {
+        "installEnv" => "部署",
+        "reinstallEnv" => "重装",
+        "updateEnv" => "更新",
+        "uninstallEnv" => "卸载并清理",
+        "nvmInstallVersion" => "安装 Node 版本",
+        _ => "环境操作",
+    };
+    let id = text(args, 0);
+    if !id.is_empty() {
+        crate::envtask::ensure_item(label, &id);
+        crate::envtask::begin_item(&id);
+        // winget 一次下载+安装实测要 1~4 分钟，期间没有中间输出可报。
+        // 先把「慢是正常的」写在阶段里，别让用户对着静止的进度条以为死机。
+        let phase = match method {
+            "installEnv" | "reinstallEnv" => "正在通过 winget 下载并安装，可能需要几分钟",
+            "updateEnv" => "正在通过官方包管理器更新，可能需要几分钟",
+            "uninstallEnv" => "正在卸载并清理，可能需要几分钟",
+            "nvmInstallVersion" => "正在通过 nvm 下载 Node，可能需要几分钟",
+            _ => "正在处理",
+        };
+        crate::envtask::set_phase(phase);
+    }
+    let outcome = env_long_action_run(method, args);
+    if !id.is_empty() {
+        match &outcome {
+            Ok(value) => {
+                let detail = value
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .unwrap_or("完成");
+                crate::envtask::end_item(&id, true, detail);
+            }
+            Err(error) => crate::envtask::end_item(&id, false, error),
+        }
+    }
+    outcome
+}
+
+fn env_long_action_run(method: &str, args: &[Value]) -> Result<Value, String> {
     match method {
         "installEnv" | "reinstallEnv" | "updateEnv" => {
             let id = text(args, 0);
@@ -2480,6 +2549,17 @@ fn env_long_action_body(method: &str, args: &[Value]) -> Result<Value, String> {
                 _ => crate::envmgr::update,
             };
             let detail = action(&id, &version)?;
+            let env = crate::envmgr::scan_fresh();
+            Ok(json!({ "detail": detail, "env": env }))
+        }
+        "uninstallEnv" => {
+            let id = text(args, 0);
+            if id.is_empty() {
+                return Err("缺少环境条目 id".into());
+            }
+            // 第二个参数是「连用户数据目录一起删」，默认 false。
+            let deep = flag(args, 1);
+            let detail = crate::envmgr::uninstall(&id, deep)?;
             let env = crate::envmgr::scan_fresh();
             Ok(json!({ "detail": detail, "env": env }))
         }

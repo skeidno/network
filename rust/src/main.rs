@@ -8,6 +8,8 @@ mod credentials;
 mod deploy;
 // 开发环境体检与一键部署（envmgr）
 mod envmgr;
+// 环境长任务的真实进度（独立全局锁，不占 state 锁）
+mod envtask;
 // Node 多版本管理，走 nvm-windows（nvm）
 mod nvm;
 // Windows 服务器远程管理：通过 SSH 在目标机上执行 PowerShell

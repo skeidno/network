@@ -414,6 +414,9 @@ pub fn build(state: &mut AppState) -> Value {
 
     json!({
         "version": env!("CARGO_PKG_VERSION"),
+        // 环境页装 / 卸 / 更新的真实任务进度。放在 state 里而不是另开接口，
+        // 是让前端沿用已有的 2.5 秒轮询，不额外增加常驻请求。
+        "envTask": crate::envtask::snapshot(),
         "capabilities": {
             "platform": std::env::consts::OS,
             // Linux 上没有原生窗口：即便没带 --headless 启动，界面也应当按
