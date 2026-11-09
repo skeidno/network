@@ -9,7 +9,12 @@
 //! 三条分支，按代价从小到大：
 //! 1. 别名在、命令跑不通（Store 未初始化）或包已注册但别名丢了 → 零下载重注册；
 //! 2. 包确实没有 → 下载官方三件套，逐个校验 SHA256 后注册；
-//! 3. 下载/注册失败 → 原样返回 PowerShell 输出，让上层自动降级到官方直连安装。
+//! 3. 下载/注册失败 → 原样返回日志，上层自动降级到官方直连安装。
+//!
+//! 下载源：GitHub release 是唯一官方发布点，但全新机器往往还没导入节点配置、
+//! 也没开系统代理，直连 GitHub 必然超时。因此按「官方直连 → 官方走本程序
+//! mixed-port → 国内镜像」依次尝试；镜像只是同一文件的转发副本，SHA256 钉死在
+//! 官方 digest 上，内容不符会在校验阶段被拦下，不会注册进系统。
 //!
 //! 版本和哈希全部钉死在 winget-cli v1.29.380 官方 release 上（取自 GitHub API 的
 //! `digest` 字段），不追 latest：包管理器自身升级由 Windows 商店负责，我们只负责
@@ -17,7 +22,7 @@
 
 #[cfg(windows)]
 mod imp {
-    use crate::envdirect::{download_file, ps_quote, run_powershell, temp_work_dir};
+    use crate::envdirect::{ps_quote, run_powershell, temp_work_dir};
     use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -29,6 +34,20 @@ mod imp {
     const BUNDLE: &str = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle";
     const DEPS: &str = "DesktopAppInstaller_Dependencies.zip";
     const LICENSE: &str = "e53e159d00e04f729cc2180cffd1c02e_License1.xml";
+    /// 国内可达的 GitHub release 转发镜像。实测 2026-11-09：三个源都返回
+    /// 与官方 `License1.xml` 完全一致的字节（SHA256 相同）。不写进配置、不追
+    /// latest，避免第三方域名哪天失效后还必须改代码才能用。
+    const MIRRORS: &[&str] = &[
+        "https://ghfast.top/",
+        "https://gh-proxy.com/",
+        "https://ghproxy.net/",
+    ];
+
+    pub(super) const DOWNLOAD_GUIDE: &str = "GitHub release 与国内镜像均无法下载或校验失败。\
+常见原因是这台机器还没有导入节点配置 / 没有开启接管，或系统代理未配置。\n\
+修复 winget 是可选增强：环境页的安装、更新、版本查询已自动走官方直连通道，不受影响。\n\
+仍要修复的话：先在程序里导入配置并开启接管（下载会自动使用本机代理端口），或配好网络后重试。";
+
     // GitHub release API 的 digest 字段（sha256），2026-11-09 核对。
     pub(super) const PAYLOADS: &[(&str, &str)] = &[
         (
@@ -61,8 +80,48 @@ mod imp {
         Ok(data_encoding::HEXLOWER.encode(&hasher.finalize()))
     }
 
+    fn official_url(name: &str) -> String {
+        format!("{BASE}/{name}")
+    }
+
+    /// 下载尝试顺序。官方优先；本机内核在跑时加一次「官方 + 本程序 mixed-port」；
+    /// 最后才是镜像。镜像与代理不做笛卡尔积，避免 217MB 的包被反复下载。
+    pub(super) fn download_attempts(
+        name: &str,
+        proxy: Option<&str>,
+    ) -> Vec<(String, Option<String>)> {
+        let official = official_url(name);
+        let mut attempts = vec![(official.clone(), None)];
+        if let Some(proxy) = proxy {
+            attempts.push((official.clone(), Some(proxy.to_string())));
+        }
+        for mirror in MIRRORS {
+            attempts.push((format!("{mirror}{official}"), None));
+        }
+        attempts
+    }
+
+    /// 本程序自己就是代理软件：内核起来后 mixed-port 一定在听，把它作为下载
+    /// 代理比让用户先去配系统代理靠谱。端口没通就返回 None，不影响其它源。
+    fn local_proxy() -> Option<String> {
+        let port = crate::store::load().mixed_port;
+        if port == 0 {
+            return None;
+        }
+        let address = format!("127.0.0.1:{port}");
+        let socket = address.parse::<std::net::SocketAddr>().ok()?;
+        std::net::TcpStream::connect_timeout(&socket, std::time::Duration::from_millis(300))
+            .is_ok()
+            .then(|| format!("http://{address}"))
+    }
+
     /// 本地已有且哈希吻合就直接复用：315MB 不必因为中途失败重下一遍。
-    fn ensure_payload(dir: &std::path::PathBuf, name: &str, expected: &str) -> Result<String, String> {
+    fn ensure_payload(
+        dir: &Path,
+        name: &str,
+        expected: &str,
+        proxy: Option<&str>,
+    ) -> Result<String, String> {
         let dest = dir.join(name);
         if dest.is_file() {
             match sha256_file(&dest) {
@@ -76,17 +135,40 @@ mod imp {
                 Err(error) => return Err(error),
             }
         }
-        let url = format!("{BASE}/{name}");
-        let size = download_file(&url, &dest)?;
-        let actual = sha256_file(&dest)?;
-        if actual != expected {
-            // 校验失败的文件绝不能进 Add-AppxPackage，但保留文件方便人工核对。
-            return Err(format!(
-                "{name} SHA256 不匹配，已中止安装。\n期望：{expected}\n实际：{actual}\n文件：{}",
-                dest.display()
-            ));
+        let mut failures = Vec::new();
+        for (url, via) in download_attempts(name, proxy) {
+            let label = match &via {
+                Some(proxy) => format!("{url}（经本机代理 {proxy}）"),
+                None => url.clone(),
+            };
+            match crate::envdirect::download_file_with(&url, &dest, via.as_deref()) {
+                Ok(size) => match sha256_file(&dest) {
+                    Ok(actual) if actual == expected => {
+                        return Ok(format!(
+                            "{name}：{label} 下载 {:.1} MB，SHA256 校验通过",
+                            size as f64 / 1024.0 / 1024.0
+                        ));
+                    }
+                    Ok(actual) => {
+                        // 镜像返回了 HTML 错误页之类的东西：丢弃再试下一个源。
+                        failures.push(format!("{label}：SHA256 不符（{actual}），已丢弃"));
+                        let _ = fs::remove_file(&dest);
+                    }
+                    Err(error) => {
+                        failures.push(format!("{label}：{error}"));
+                        let _ = fs::remove_file(&dest);
+                    }
+                },
+                Err(error) => failures.push(format!(
+                    "{label}：{}",
+                    error.lines().next().unwrap_or(error.as_str())
+                )),
+            }
         }
-        Ok(format!("{name}：下载 {:.1} MB，SHA256 校验通过", size as f64 / 1024.0 / 1024.0))
+        Err(format!(
+            "{name} 所有下载源均失败：\n{}\n\n{DOWNLOAD_GUIDE}",
+            failures.join("\n")
+        ))
     }
 
     /// 诊断：别名在不在、App Installer 包注册了没、命令能不能跑。
@@ -221,16 +303,20 @@ catch {{ "LICENSE_PATH_FAILED :: $($_.Exception.Message)"; Add-AppxPackage -Path
                 Err(error) => log.push(format!("重注册未成功，继续离线安装：{error}")),
             }
         } else {
-            log.push(format!("本机没有 App Installer，准备从 winget-cli {TAG} 官方 release 下载。").into());
+            log.push(format!("本机没有 App Installer，准备从 winget-cli {TAG} 官方 release 及国内镜像依次下载。"));
         }
 
         let dir = temp_work_dir()?;
+        let proxy = local_proxy();
+        if let Some(proxy) = &proxy {
+            log.push(format!("检测到本机代理端口，GitHub 官方源不可达时会自动经 {proxy} 重试。"));
+        }
         for &(name, expected) in PAYLOADS {
             // 本地文件哈希不符时 ensure_payload 只删文件并返回错误，这里重试一次真下载。
-            let result = match ensure_payload(&dir, name, expected) {
+            let result = match ensure_payload(&dir, name, expected, proxy.as_deref()) {
                 Ok(text) => Ok(text),
                 Err(error) if error.contains("已删除待重下") => {
-                    ensure_payload(&dir, name, expected)
+                    ensure_payload(&dir, name, expected, proxy.as_deref())
                 }
                 Err(error) => Err(error),
             };
@@ -272,7 +358,7 @@ pub fn repair() -> Result<String, String> {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::imp::{register_script, sha256_file, PAYLOADS};
+    use super::imp::{download_attempts, register_script, sha256_file, DOWNLOAD_GUIDE, PAYLOADS};
     use std::path::Path;
 
     #[test]
@@ -294,6 +380,84 @@ mod tests {
             digest,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn download_attempts_prefer_official_then_proxy_then_mirrors() {
+        let name = "DesktopAppInstaller_Dependencies.zip";
+        let direct = download_attempts(name, None);
+        assert_eq!(direct.len(), 4, "官方 + 三个国内镜像");
+        assert!(direct[0]
+            .0
+            .starts_with("https://github.com/microsoft/winget-cli/releases/download/"));
+        assert!(direct[0].1.is_none(), "官方源第一次先直连");
+        assert!(direct[1..]
+            .iter()
+            .all(|(url, proxy)| url.starts_with("https://gh") && proxy.is_none()));
+
+        let proxied = download_attempts(name, Some("http://127.0.0.1:7890"));
+        assert_eq!(proxied.len(), 5, "内核在跑时多一次官方源走本机代理");
+        assert_eq!(proxied[1].0, direct[0].0);
+        assert_eq!(proxied[1].1.as_deref(), Some("http://127.0.0.1:7890"));
+        assert!(proxied[2..].iter().all(|(_, proxy)| proxy.is_none()));
+        assert!(proxied.iter().all(|(url, _)| url.ends_with(name)));
+    }
+
+    #[test]
+    fn download_failure_guide_points_at_proxy_and_direct_channel() {
+        assert!(DOWNLOAD_GUIDE.contains("导入节点配置"));
+        assert!(DOWNLOAD_GUIDE.contains("开启接管"));
+        assert!(DOWNLOAD_GUIDE.contains("官方直连"));
+        assert!(DOWNLOAD_GUIDE.contains("不受影响"));
+    }
+
+    /// 联网自证：四个下载源返回的必须是同一个文件。镜像随时可能失效，
+    /// 所以默认 ignore，手动跑 `cargo test ... -- --ignored --nocapture` 核对。
+    #[test]
+    #[ignore = "联网实测：所有下载源返回与官方 digest 一致的字节"]
+    fn pinned_license_is_identical_across_download_sources() {
+        let name = "e53e159d00e04f729cc2180cffd1c02e_License1.xml";
+        let expected = PAYLOADS
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .expect("许可证应在钉住的清单里")
+            .1;
+        let dest = std::env::temp_dir().join(format!("nm-winget-license-{}.xml", std::process::id()));
+        let part = dest.with_extension("part");
+        for (url, proxy) in download_attempts(name, None) {
+            let _ = std::fs::remove_file(&dest);
+            let _ = std::fs::remove_file(&part);
+            let mut cmd = crate::envdirect::hidden_command("curl.exe");
+            cmd.args([
+                "-sSL",
+                "--fail",
+                "--connect-timeout",
+                "10",
+                "--max-time",
+                "60",
+                "-A",
+                "NetWorkManger-EnvDirect/1.0",
+                "-o",
+            ]);
+            cmd.arg(&part);
+            if let Some(proxy) = &proxy {
+                cmd.args(["-x", proxy]);
+            }
+            cmd.arg(&url);
+            let output = cmd.output().expect("应能调用 curl.exe");
+            assert!(
+                output.status.success(),
+                "{url} 下载失败：{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::fs::rename(&part, &dest).expect("应能重命名下载文件");
+            assert_eq!(
+                sha256_file(&dest).expect("应能算哈希"),
+                expected,
+                "{url} 内容与官方 digest 不一致"
+            );
+        }
+        let _ = std::fs::remove_file(&dest);
     }
 
     #[test]

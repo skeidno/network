@@ -449,24 +449,44 @@ mod imp {
     }
 
     pub(crate) fn download(url: &str, dest: &Path) -> Result<u64, String> {
+        download_with(url, dest, None)
+    }
+
+    /// 下载到 `dest.part` 再改名，中途失败不会留下半个包冒充成品。
+    /// `proxy` 给「本程序已经接管、但系统代理没配」的场景用：把下载流量
+    /// 显式送到本机的 mixed-port，全新机器也能连上 GitHub release。
+    pub(crate) fn download_with(
+        url: &str,
+        dest: &Path,
+        proxy: Option<&str>,
+    ) -> Result<u64, String> {
         let part = dest.with_extension("part");
         let part_text = part.to_string_lossy().to_string();
-        let output = command(&curl_exe())
-            .args([
-                "-sSL",
-                "--fail",
-                "--retry",
-                "2",
-                "--connect-timeout",
-                "15",
-                "--max-time",
-                "900",
-                "-A",
-                UA,
-                "-o",
-                &part_text,
-                url,
-            ])
+        let mut cmd = command(&curl_exe());
+        cmd.args([
+            "-sSL",
+            "--fail",
+            "--retry",
+            "1",
+            "--connect-timeout",
+            "12",
+            "--max-time",
+            "900",
+            // 连上了但几乎不传数据的「假可用」源要早点放弃，别拖满 900 秒。
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "30",
+            "-A",
+            UA,
+            "-o",
+            &part_text,
+        ]);
+        if let Some(proxy) = proxy {
+            cmd.args(["-x", proxy]);
+        }
+        cmd.arg(url);
+        let output = cmd
             .output()
             .map_err(|error| format!("调用 curl.exe 失败：{error}"))?;
         if !output.status.success() {
@@ -577,8 +597,8 @@ pub use imp::{install, supports, versions};
 // 避免两个模块各写一份、以后只修一边。
 #[cfg(windows)]
 pub(crate) use imp::{
-    download as download_file, hidden_command, powershell as run_powershell, quote as ps_quote,
-    work_dir as temp_work_dir,
+    download_with as download_file_with, hidden_command, powershell as run_powershell,
+    quote as ps_quote, work_dir as temp_work_dir,
 };
 
 #[cfg(not(windows))]
