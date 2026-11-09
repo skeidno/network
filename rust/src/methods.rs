@@ -2784,6 +2784,74 @@ fn env_long_action_body(method: &str, args: &[Value]) -> Result<Value, String> {
     outcome
 }
 
+/// 把「命令报告完成」和「体检是否真的检测到」对齐，再一起回给前端。
+///
+/// 修的是 PHP 8.5 那类真实故障：winget 输出「已成功安装」并提示「重启 shell」，
+/// 卡片却还是「未检测到」。以前输出面板只摊原始日志，用户根本分不清成没成。
+/// 现在第一行就写结论，并带 outcome 让前端决定标题、提示和颜色。
+fn install_result(id: &str, detail: &str, env: &Value) -> Value {
+    let item = env
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+        });
+    let name = item
+        .and_then(|i| i.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or(id);
+    let version = item
+        .and_then(|i| i.get("version"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let path = item
+        .and_then(|i| i.get("path"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let ready = item
+        .and_then(|i| i.get("ready"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let head = detail.lines().next().unwrap_or("").trim();
+    let (outcome, summary) = if ready {
+        let version_text = if version.is_empty() {
+            String::new()
+        } else {
+            format!(" {version}")
+        };
+        let path_text = if path.is_empty() {
+            String::new()
+        } else {
+            format!("（{path}）")
+        };
+        (
+            "ok",
+            format!("[结果] 安装成功：重新体检已检测到 {name}{version_text}{path_text}。"),
+        )
+    } else {
+        (
+            "check",
+            format!(
+                "[需确认] 命令已执行，但重新体检仍未检测到 {name}，目前无法确认安装生效。\n\
+                 命令返回：{head}\n\
+                 已按最新注册表 PATH 与 winget 便携包目录复查。安装器常把 PATH 写进注册表、\n\
+                 需要新进程才生效（winget 自己也会提示「重启 shell」）。\n\
+                 请先点「重新体检」；仍缺失就退出并重启本程序。命令行里要用它，请新开终端。\n\n\
+                 以下是命令原始输出："
+            ),
+        )
+    };
+    json!({
+        "outcome": outcome,
+        "detectedVersion": version,
+        "detectedPath": path,
+        "detail": format!("{summary}\n\n{detail}"),
+        "env": env.clone(),
+    })
+}
+
 fn env_long_action_run(method: &str, args: &[Value]) -> Result<Value, String> {
     match method {
         "installEnv" | "reinstallEnv" | "updateEnv" => {
@@ -2799,7 +2867,7 @@ fn env_long_action_run(method: &str, args: &[Value]) -> Result<Value, String> {
             };
             let detail = action(&id, &version)?;
             let env = crate::envmgr::scan_fresh();
-            Ok(json!({ "detail": detail, "env": env }))
+            Ok(install_result(&id, &detail, &env))
         }
         "uninstallEnv" => {
             let id = text(args, 0);
@@ -2833,6 +2901,32 @@ fn env_long_action_run(method: &str, args: &[Value]) -> Result<Value, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn 安装结果把体检结论写在第一行() {
+        let detected = json!({"items": [{"id": "php", "name": "PHP", "ready": true,
+            "version": "8.5.12", "path": "C:\\WinGet\\php.exe"}]});
+        let ok = install_result("php", "PHP.PHP.8.5 安装完成。\n已成功安装", &detected);
+        assert_eq!(ok["outcome"], "ok");
+        assert_eq!(ok["detectedVersion"], "8.5.12");
+        assert_eq!(ok["env"], detected);
+        assert!(ok["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("[结果] 安装成功"));
+        assert!(ok["detail"].as_str().unwrap().contains("8.5.12"));
+
+        let missing = json!({"items": [{"id": "php", "name": "PHP", "ready": false,
+            "version": "", "path": ""}]});
+        let check = install_result("php", "PHP.PHP.8.5 安装完成。", &missing);
+        assert_eq!(check["outcome"], "check");
+        let text = check["detail"].as_str().unwrap();
+        assert!(text.starts_with("[需确认]"), "{text}");
+        assert!(text.contains("重新体检"));
+        assert!(text.contains("以下是命令原始输出"));
+        // 命令原始输出必须完整保留，不能只给结论
+        assert!(text.ends_with("PHP.PHP.8.5 安装完成。"));
+    }
 
     #[test]
     fn rule_patch_uses_the_values_array_from_the_form() {
