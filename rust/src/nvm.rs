@@ -283,6 +283,25 @@ fn status_impl(include_available: bool) -> Value {
     })
 }
 
+/// 按需拉「可安装版本」：`nvm list available` 要联网，实测 2.66 秒。
+///
+/// 首屏的 nvmStatus 只调 status_local（纯本地），Node 版本下拉里用户点
+/// 「查看可安装版本」才走这里，这样进环境页不必等一次外网请求。
+pub fn available_versions() -> Value {
+    if !installed() {
+        return json!({
+            "availableVersions": [],
+            "hint": "未检测到 nvm，先安装 nvm 才能选 Node 版本",
+        });
+    }
+    let full = status();
+    let rows = full
+        .get("availableVersions")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    json!({ "availableVersions": rows, "hint": "" })
+}
+
 /// 用 nvm 装指定版本并切过去。
 ///
 /// 两步都要做：`install` 只把版本下载解压到 nvm 目录，不改软链接，

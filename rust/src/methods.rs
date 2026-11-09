@@ -1364,15 +1364,17 @@ pub async fn dispatch(
             crate::localca::open_dir()?;
             Ok(json!(true))
         }
-        // 开发环境体检与一键部署。
-        // 体检是纯只读，但要起十几个子进程问版本号，绝不能塞进每轮状态轮询里。
-        // 前端只在切进页面时调一次；后端另有 15 秒缓存兜底。
-        // 用户手动点「重新体检」会传 true，绕过缓存立刻重扫。
-        "scanEnv" => Ok(if flag(&args, 0) {
-            crate::envmgr::scan_fresh()
-        } else {
-            crate::envmgr::scan()
-        }),
+        // 下面这些「只读」查询要么起十几个子进程、要么联网，全部由 server.rs
+        // 路由到 run_env_read_action（spawn_blocking、不持 state 锁）。
+        // dispatch 是持锁调用的，留在这里实测会让 /api/state 堵到 2.2 秒，
+        // 左下角流量曲线直接停摆。保留明确报错，免得以后有人从别的路径调进来。
+        "scanEnv"
+        | "nvmStatus"
+        | "nvmAvailableVersions"
+        | "envAvailableVersions"
+        | "envUninstallPreview"
+        | "nvmUseVersion"
+        | "nvmUninstallVersion" => Err("环境查询须走锁外通道".into()),
         // 批量任务开始前报一次总数；逐项动作由 run_env_long_action 自己推进。
         // 这三个都是纯内存赋值，留在锁内没问题。
         "envTaskBegin" => {
@@ -1397,8 +1399,6 @@ pub async fn dispatch(
             crate::envtask::clear();
             Ok(json!(true))
         }
-        // 卸载预览是只读的：只列「会删什么」，不动磁盘。前端确认后才调卸载。
-        "envUninstallPreview" => Ok(crate::envmgr::uninstall_preview(&text(&args, 0))),
         // install / reinstall / update 会同步跑 winget 几十秒到几分钟，
         // 必须走 server.rs 的锁外通道（run_env_long_action）。dispatch 是持锁调用的，
         // 留在这里会把状态轮询一起卡死。保留明确报错，免得以后有人从别的路径调进来。
@@ -1408,49 +1408,8 @@ pub async fn dispatch(
         // 最新版本查询会联网，已在 server.rs 的锁外分支处理；留个明确报错，
         // 免得以后有人从别的路径调进来，还以为是「未知方法」。
         "envLatestVersions" => Err("最新版本查询须走锁外通道".into()),
-        // Node 的版本与 nvm 状态（已装哪些、可装哪些、当前用哪个）
-        "nvmStatus" => Ok(crate::nvm::status()),
         // nvm install 要下载整个 Node 包，同样走锁外通道。
         "nvmInstallVersion" => Err("Node 版本安装须走锁外通道".into()),
-        "nvmUseVersion" => {
-            let version = text(&args, 0).to_string();
-            let result = crate::nvm::use_version(&version);
-            let fresh = crate::nvm::status();
-            let env = crate::envmgr::scan_fresh();
-            match result {
-                Ok(detail) => {
-                    state.notify("success", format!("已切换到 Node {version}"));
-                    Ok(json!({ "detail": detail, "nvm": fresh, "env": env }))
-                }
-                Err(error) => {
-                    state.notify("error", error.lines().next().unwrap_or("切换失败").to_string());
-                    Err(error)
-                }
-            }
-        }
-        "nvmUninstallVersion" => {
-            let version = text(&args, 0).to_string();
-            state.busy = true;
-            let result = crate::nvm::uninstall_version(&version);
-            state.busy = false;
-            let fresh = crate::nvm::status();
-            let env = crate::envmgr::scan_fresh();
-            match result {
-                Ok(detail) => {
-                    state.notify("success", format!("已卸载 Node {version}"));
-                    Ok(json!({ "detail": detail, "nvm": fresh, "env": env }))
-                }
-                Err(error) => {
-                    state.notify("error", error.lines().next().unwrap_or("卸载失败").to_string());
-                    Err(error)
-                }
-            }
-        }
-        // 某一项能装哪些版本（走 winget 源，Node 走 nvm 不在这里）
-        "envAvailableVersions" => {
-            let id = text(&args, 0).to_string();
-            crate::envmgr::available_versions(&id)
-        }
         "openEnvDownload" => {
             let id = text(&args, 0).to_string();
             crate::envmgr::open_download(&id)?;
@@ -2495,6 +2454,50 @@ where
 ///
 /// 外面包一层任务进度：动作真的开始了才 begin_item，真的结束了才 end_item，
 /// 界面上的「第 N/M 项」因此是后端执行到第几项的真实计数，不是估算或动画。
+/// 环境页「只读但慢」的动作统一走这里：spawn_blocking，全程不碰 AppState。
+///
+/// 与 run_env_long_action 的区别：不设 busy、不写任务进度。这些是查询，前端自己
+/// 管转圈；设了 busy 反而会把卡片按钮全灰掉。核心目的是别再持住 state 锁——
+/// 体检 1.5 秒、nvm 联网 2.66 秒，串行起来足够让左下角流量曲线停 4 秒。
+pub async fn run_env_read_action(method: &str, args: Vec<Value>) -> Result<Value, String> {
+    let owned = method.to_string();
+    tokio::task::spawn_blocking(move || env_read_action_body(&owned, &args))
+        .await
+        .unwrap_or_else(|error| Err(format!("环境查询线程异常：{error}")))
+}
+
+fn env_read_action_body(method: &str, args: &[Value]) -> Result<Value, String> {
+    match method {
+        "scanEnv" => Ok(if flag(args, 0) {
+            crate::envmgr::scan_fresh()
+        } else {
+            crate::envmgr::scan()
+        }),
+        // 首屏只读本地：已装哪些 Node、当前用哪个。可安装版本要联网，
+        // 由用户点「查看可安装版本」时单独拉，不绑在进页面这条路径上。
+        "nvmStatus" => Ok(crate::nvm::status_local()),
+        "nvmAvailableVersions" => Ok(crate::nvm::available_versions()),
+        "envAvailableVersions" => crate::envmgr::available_versions(&text(args, 0)),
+        "envUninstallPreview" => Ok(crate::envmgr::uninstall_preview(&text(args, 0))),
+        // 切版本 / 卸版本要动软链接，还会顺带重扫环境，同样不能在锁里跑。
+        "nvmUseVersion" | "nvmUninstallVersion" => {
+            let version = text(args, 0);
+            if version.is_empty() {
+                return Err("缺少 Node 版本号".into());
+            }
+            let detail = if method == "nvmUseVersion" {
+                crate::nvm::use_version(&version)?
+            } else {
+                crate::nvm::uninstall_version(&version)?
+            };
+            let nvm = crate::nvm::status_local();
+            let env = crate::envmgr::scan_fresh();
+            Ok(json!({ "detail": detail, "nvm": nvm, "env": env }))
+        }
+        _ => Err(format!("未知的环境查询：{method}")),
+    }
+}
+
 fn env_long_action_body(method: &str, args: &[Value]) -> Result<Value, String> {
     let label = match method {
         "installEnv" => "部署",
@@ -2566,7 +2569,8 @@ fn env_long_action_run(method: &str, args: &[Value]) -> Result<Value, String> {
         "nvmInstallVersion" => {
             let version = text(args, 0);
             let detail = crate::nvm::install_version(&version)?;
-            let nvm = crate::nvm::status();
+            // 装完只要回本地状态：可安装版本要联网，留给用户点开下拉时再查。
+            let nvm = crate::nvm::status_local();
             let env = crate::envmgr::scan_fresh();
             Ok(json!({ "detail": detail, "nvm": nvm, "env": env }))
         }

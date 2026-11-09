@@ -287,6 +287,34 @@ async fn call_api(
         return security_headers(Json(json!({ "ok": true, "result": result })).into_response());
     }
 
+    // 环境页的「只读」查询同样要起子进程 / 联网：体检十几个 --version（实测 1.5s）、
+    // nvm list available（联网 2.66s）、winget show --versions、卸载预览扫磁盘。
+    // 它们以前全在 dispatch 里持 state 锁同步跑，首次进环境页串行 4 秒多，
+    // 实测期间 /api/state 最高被堵 2252ms —— 左下角流量曲线就是这么停的。
+    // 统一 spawn_blocking：既不持锁，也不占 tokio 的异步 worker。
+    if matches!(
+        method.as_str(),
+        "scanEnv"
+            | "nvmStatus"
+            | "nvmAvailableVersions"
+            | "envAvailableVersions"
+            | "envUninstallPreview"
+            | "nvmUseVersion"
+            | "nvmUninstallVersion"
+    ) {
+        let result = crate::methods::run_env_read_action(&method, args.clone()).await;
+        return match result {
+            Ok(value) => {
+                security_headers(Json(json!({ "ok": true, "result": value })).into_response())
+            }
+            Err(message) => security_headers((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": message })),
+            )
+                .into_response()),
+        };
+    }
+
     // 环境安装 / 更新会同步跑 winget（下载 MSI + 安装，几十秒到几分钟）。
     // 放进 dispatch 等于把 state 锁占满整段时间：下面 read_api 也要取同一把锁，
     // 状态轮询、静态资源全会排队，界面表现就是「点了一键部署没反应」。
