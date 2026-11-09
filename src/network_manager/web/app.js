@@ -1120,8 +1120,15 @@ let envTaskAutoBusy = false;
 let nvmState = null;
 // 「可安装版本」要联网拉 nvm list available，只在用户点开时查一次，别跟着体检跑。
 let nvmAvailableChecked = false;
-// winget 按大版本分包的项目：下拉给 3.10 / 3.11 / 3.12 这类系列，可并存。
+// winget 按大版本分包的项目：下拉给大版本系列，可并存。示例版本按语言分别给，
+// 别把 Python 的 3.10 / 3.11 / 3.12 印到 PHP 卡片上。
 const SERIES_ENV_IDS = ["python", "php", "ruby", "dotnet"];
+const SERIES_EXAMPLES = {
+  python: "3.10 / 3.11 / 3.12",
+  php: "8.3 / 8.4 / 8.5",
+  ruby: "3.3 / 3.4 / 4.0",
+  dotnet: "8 / 9 / 10",
+};
 let envVersionTarget = { id: "", versions: [], versionKind: "patch" };
 // 最近一次体检结果。查完最新版本要用它重画卡片，不重发 scanEnv。
 let envData = null;
@@ -1455,7 +1462,7 @@ function renderWingetVersionManager(item) {
         <div class="env-versions-hint">${envIsDirect()
           ? "本机没有 winget，版本列表来自官方发布源；安装会直接下载官方安装包。"
           : (seriesItem
-            ? "winget 里各系列是独立包，装 3.10 / 3.11 / 3.12 可与现有版本并存；命令行默认用哪个由 PATH / 版本选择器决定。"
+            ? `winget 里各系列是独立包，装 ${SERIES_EXAMPLES[item.id] || "不同大版本"} 可与现有版本并存；命令行默认用哪个由 PATH / 版本选择器决定。`
             : "<strong>这一项不能多版本并存</strong>：装指定版本会先卸载现有版本。要并存请用 Node 的 nvm。")}</div>
       </div>`;
   }
@@ -1567,10 +1574,10 @@ async function runNvmAction(method, version, verb) {
       };
     }
     freshEnv = result?.env || null;
-    showEnvDetail(`${verb}输出`, result?.detail || `${verb}完成`);
+    showEnvDetail(`${verb}输出`, result?.detail || `${verb}完成`, "ok");
   } catch (error) {
     const message = error.message || String(error);
-    showEnvDetail(`${verb}失败`, message);
+    showEnvDetail(`${verb}失败`, message, "fail");
     showToast("error", `${verb}失败：${message.split("\n")[0]}`);
   } finally {
     setEnvBusy(false);
@@ -1608,10 +1615,24 @@ async function refreshEnv(force = false) {
   }
 }
 
-function showEnvDetail(title, body) {
+function showEnvDetail(title, body, tone = "") {
   byId("env-detail-title").textContent = title;
   byId("env-detail-body").textContent = body || "（无输出）";
   const panel = byId("env-detail");
+  // tone: ok / check / fail。只有日志没有结论时，用户分不清 winget「已成功安装」
+  // 到底算不算装上了（PHP 8.5 装完仍显示缺失那次就是这个坑）。
+  panel.classList.remove("is-ok", "is-check", "is-fail");
+  if (tone) panel.classList.add(`is-${tone}`);
+  const subtitle = byId("env-detail-subtitle");
+  if (subtitle) {
+    subtitle.textContent = tone === "check"
+      ? "命令已执行，但体检结果与输出不一致，请看开头的结论与处理建议"
+      : tone === "fail"
+        ? "命令执行失败，下面是完整输出"
+        : tone === "ok"
+          ? "结论在第一行，下面是命令原始输出"
+          : "下面是命令的原始输出";
+  }
   panel.hidden = false;
   panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
 }
@@ -1768,11 +1789,11 @@ async function runEnvUninstall(id, deep) {
   try {
     const result = await invokeStrict("uninstallEnv", id, deep);
     if (result && result.env) renderEnv(result.env);
-    showEnvDetail("卸载输出", result?.detail || "卸载完成");
+    showEnvDetail("卸载输出", result?.detail || "卸载完成", "ok");
     showToast("success", `${id} 已卸载并清理`);
   } catch (error) {
     const message = error.message || String(error);
-    showEnvDetail("卸载失败", message);
+    showEnvDetail("卸载失败", message, "fail");
     showToast("error", `卸载失败：${message.split("\n")[0]}`);
   } finally {
     setEnvBusy(false);
@@ -1839,7 +1860,7 @@ async function runEnvBatchUninstall(ids, deep) {
         chunks.push(`### ${id} 失败\n${error.message || error}`);
       }
     }
-    showEnvDetail(failed ? `批量卸载输出（${failed} 项失败）` : "批量卸载输出", chunks.join("\n\n"));
+    showEnvDetail(failed ? `批量卸载输出（${failed} 项失败）` : "批量卸载输出", chunks.join("\n\n"), failed ? "fail" : "ok");
     showToast(failed ? "error" : "success", failed
       ? `${ids.length} 项中 ${failed} 项失败，详见输出`
       : `已卸载并清理 ${ids.length} 项`);
@@ -1858,11 +1879,21 @@ async function runEnvAction(id, method, verb, version = "") {
     // 版本为空 = 装最新版；后端对 Node 会转给 nvm，其它走 winget 的 --version
     const result = await invokeStrict(method, id, version);
     if (result && result.env) renderEnv(result.env);
-    showEnvDetail(`${verb}输出`, result?.detail || `${verb}完成`);
+    // 后端会用重新体检的结果给出 outcome：命令成功 ≠ 真的装上了。
+    // 以前成功时连个 toast 都没有，用户只能对着一屏 winget 日志猜。
+    const needsCheck = result?.outcome === "check";
+    showEnvDetail(
+      needsCheck ? `${verb}完成，但体检未确认` : `${verb}输出`,
+      result?.detail || `${verb}完成`,
+      needsCheck ? "check" : "ok"
+    );
+    showToast(needsCheck ? "warn" : "success", needsCheck
+      ? `${verb}命令已结束，但体检仍未检测到，详见输出`
+      : `${verb}完成`);
   } catch (error) {
     // 失败时把后端带来的详细输出也摊开，别只留一句「安装失败」
     const message = error.message || String(error);
-    showEnvDetail(`${verb}失败`, message);
+    showEnvDetail(`${verb}失败`, message, "fail");
     showToast("error", `${verb}失败：${message.split("\n")[0]}`);
   } finally {
     setEnvBusy(false);
@@ -1897,11 +1928,11 @@ async function repairWinget() {
   try {
     const result = await invokeStrict("repairWinget");
     if (result && result.env) renderEnv(result.env);
-    showEnvDetail("winget 修复输出", result?.detail || "修复完成");
+    showEnvDetail("winget 修复输出", result?.detail || "修复完成", "ok");
     showToast("success", "winget 已可用，环境页恢复完整安装能力");
   } catch (error) {
     const message = error.message || String(error);
-    showEnvDetail("winget 修复失败（不影响官方直连安装）", message);
+    showEnvDetail("winget 修复失败（不影响官方直连安装）", message, "fail");
     // 第一行往往是「诊断：state=...」，下载失败时真正有用的是后面那句指引。
     const head = message.includes("所有下载源均失败")
       ? "下载源不可达，可先导入配置并开启接管后重试"
@@ -1949,6 +1980,7 @@ async function installAllEnv() {
   await beginEnvTask("一键部署", cards);
   const chunks = [];
   let failed = 0;
+  let needsCheck = 0;
   try {
     for (const id of cards) {
       // 逐个装而不是并发：winget 有全局安装锁，官方安装器也会抢 MSI 安装事务，
@@ -1957,16 +1989,24 @@ async function installAllEnv() {
         const result = await invokeStrict("installEnv", id);
         if (result && result.detail) chunks.push(`### ${id}\n${result.detail}`);
         if (result && result.env) renderEnv(result.env);
+        if (result?.outcome === "check") needsCheck += 1;
       } catch (error) {
         // 单项失败不中断整批，但要如实计数、把错误留在输出里
         failed += 1;
         chunks.push(`### ${id} 失败\n${error.message || error}`);
       }
     }
-    showEnvDetail(failed ? `批量部署输出（${failed} 项失败）` : "批量部署输出", chunks.join("\n\n"));
-    showToast(failed ? "error" : "success", failed
+    showEnvDetail(
+      failed ? `批量部署输出（${failed} 项失败）`
+        : needsCheck ? `批量部署输出（${needsCheck} 项待确认）` : "批量部署输出",
+      chunks.join("\n\n"),
+      failed ? "fail" : needsCheck ? "check" : "ok"
+    );
+    showToast(failed ? "error" : needsCheck ? "warn" : "success", failed
       ? `${cards.length} 项中 ${failed} 项失败，详见输出`
-      : `已依次部署 ${cards.length} 项`);
+      : needsCheck
+        ? `${cards.length} 项中 ${needsCheck} 项命令完成但体检未确认，详见输出`
+        : `已依次部署 ${cards.length} 项`);
   } finally {
     await finishEnvTask();
     envLocalBatch = false;
@@ -2036,6 +2076,7 @@ async function updateAllEnv() {
   await beginEnvTask("一键更新", ids);
   const chunks = [];
   let failed = 0;
+  let needsCheck = 0;
   try {
     for (const id of ids) {
       const info = envLatest && envLatest.items ? envLatest.items[id] : null;
@@ -2047,15 +2088,23 @@ async function updateAllEnv() {
           envData = result.env;
           renderEnv(result.env);
         }
+        if (result?.outcome === "check") needsCheck += 1;
       } catch (error) {
         failed += 1;
         chunks.push(`### ${id} 失败\n${error.message || error}`);
       }
     }
-    showEnvDetail(failed ? `批量更新输出（${failed} 项失败）` : "批量更新输出", chunks.join("\n\n"));
-    showToast(failed ? "error" : "success", failed
+    showEnvDetail(
+      failed ? `批量更新输出（${failed} 项失败）`
+        : needsCheck ? `批量更新输出（${needsCheck} 项待确认）` : "批量更新输出",
+      chunks.join("\n\n"),
+      failed ? "fail" : needsCheck ? "check" : "ok"
+    );
+    showToast(failed ? "error" : needsCheck ? "warn" : "success", failed
       ? `${ids.length} 项中 ${failed} 项失败，详见输出`
-      : `已依次更新 ${ids.length} 项`);
+      : needsCheck
+        ? `${ids.length} 项中 ${needsCheck} 项命令完成但体检未确认，详见输出`
+        : `已依次更新 ${ids.length} 项`);
   } finally {
     await finishEnvTask();
     envLocalBatch = false;

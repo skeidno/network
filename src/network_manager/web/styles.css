@@ -948,6 +948,7 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
 }
 @keyframes toast-in { from { opacity: 0; transform: translateX(16px); } to { opacity: 1; transform: none; } }
 .toast.success { border-left-color: var(--green); }
+.toast.warn { border-left-color: var(--amber); }
 .toast.error { border-left-color: var(--danger); }
 
 /* ==========================================================================
@@ -1675,6 +1676,13 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
   padding: 14px 16px;
   margin-bottom: 16px;
 }
+/* 安装结果三态：不能只把 winget 原始日志摊给用户，得一眼看出成没成 */
+.env-detail.is-ok { border-left: 3px solid var(--green); }
+.env-detail.is-check { border-left: 3px solid var(--amber); }
+.env-detail.is-fail { border-left: 3px solid var(--danger); }
+.env-detail.is-ok #env-detail-title { color: var(--green-text); }
+.env-detail.is-check #env-detail-title { color: var(--amber-text); }
+.env-detail.is-fail #env-detail-title { color: var(--danger-text); }
 .env-detail-close { margin-left: auto; align-self: center; }
 .env-detail-body {
   margin: 12px 0 0;
