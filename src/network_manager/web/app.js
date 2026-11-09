@@ -13,7 +13,9 @@ let logsRefreshing = false;
 let lastLogsRefreshAt = 0;
 let lastLogsContent = null;
 let coreActionPending = false;
-let coreActionObservedBusy = false;
+let coreActionStartedAt = 0;
+// 接管动作的硬兜底：后端再慢、请求再怎么挂起，也不能让按钮永远停在「处理中」。
+const CORE_ACTION_MAX_WAIT_MS = 25000;
 let requestedPage = currentPage;
 let pageSwitchFrame = 0;
 let initialFailureCount = 0;
@@ -132,14 +134,35 @@ function icon(name) {
 }
 
 async function apiRequest(path, options = {}) {
-  const headers = { "X-Network-Session": SESSION_TOKEN, ...(options.headers || {}) };
-  const response = await fetch(path, { ...options, headers, cache: "no-store" });
-  if (!response.ok) {
-    let message = `请求失败 (${response.status})`;
-    try { message = (await response.json()).error || message; } catch (_error) { /* ignore */ }
-    throw new Error(message);
+  const { timeoutMs, ...init } = options;
+  const headers = { "X-Network-Session": SESSION_TOKEN, ...(init.headers || {}) };
+  // 只有明确给了 timeoutMs 的请求才上 AbortController：环境安装、原生文件对话框
+  // 这类动作本来就可以跑几分钟，不能一刀切超时。
+  const controller = timeoutMs ? new AbortController() : null;
+  const timer = controller
+    ? window.setTimeout(() => controller.abort(), timeoutMs)
+    : 0;
+  try {
+    const response = await fetch(path, {
+      ...init,
+      headers,
+      cache: "no-store",
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+    if (!response.ok) {
+      let message = `请求失败 (${response.status})`;
+      try { message = (await response.json()).error || message; } catch (_error) { /* ignore */ }
+      throw new Error(message);
+    }
+    return response;
+  } catch (error) {
+    if (controller && controller.signal.aborted) {
+      throw new Error(`请求超时（${Math.round(timeoutMs / 1000)} 秒），请稍后查看状态`);
+    }
+    throw error;
+  } finally {
+    if (timer) window.clearTimeout(timer);
   }
-  return response;
 }
 
 async function invoke(method, ...args) {
@@ -430,10 +453,12 @@ function renderSidebarTrafficChart(downloadValues, uploadValues) {
 
 function renderOverview() {
   const { core, summary, sources, traffic } = appState;
-  if (coreActionPending && core.busy) coreActionObservedBusy = true;
-  if (coreActionPending && coreActionObservedBusy && !core.busy) {
-    coreActionPending = false;
-    coreActionObservedBusy = false;
+  // 旧逻辑要求「先观察到后端 busy=true，再看到它变 false」才解锁按钮。可是
+  // toggleCore 过去在 state 锁里同步执行，期间 /api/state 全部排队，前端根本
+  // 没机会看到 busy=true —— 按钮就这样永久停在「处理中」。现在改由请求本身
+  // 收尾（见 toggleCoreFromUi），这里只留一道时间兜底，防止请求彻底失联。
+  if (coreActionPending && Date.now() - coreActionStartedAt > CORE_ACTION_MAX_WAIT_MS) {
+    releaseCoreAction();
   }
   if (shouldRender("overview-core", {
     admin: core.admin,
@@ -502,19 +527,39 @@ function renderOverview() {
   setText("exit-ip", localIp === "尚未检测" && proxyIp === "尚未检测" ? "尚未检测" : "出口已检测");
 }
 
+function releaseCoreAction() {
+  coreActionPending = false;
+  coreActionStartedAt = 0;
+  // 按钮内容在 shouldRender 里按签名缓存，状态没变就不会重画，必须主动失效。
+  renderSignatures.delete("overview-core");
+}
+
 async function toggleCoreFromUi() {
   if (coreActionPending || appState?.core?.busy) return;
   coreActionPending = true;
-  coreActionObservedBusy = false;
+  coreActionStartedAt = Date.now();
   const toggle = byId("core-toggle");
   toggle.disabled = true;
   toggle.innerHTML = `${icon("refresh-cw")}<span>处理中</span>`;
-  const accepted = await invoke("toggleCore");
-  if (!accepted) {
-    coreActionPending = false;
+  try {
+    // toggleCore 是同步 API：请求返回时后端动作已经结束（成功或失败都一样）。
+    // 自己收尾，不再依赖「轮询碰巧撞见 busy 由 true 变 false」。
+    const response = await apiRequest("/api/call", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ method: "toggleCore", args: [] }),
+      timeoutMs: CORE_ACTION_MAX_WAIT_MS,
+    });
+    const payload = await response.json();
+    if (!payload.ok) throw new Error(payload.error || "接管操作失败");
+  } catch (error) {
+    showToast("error", error.message || "接管操作失败");
+  } finally {
+    releaseCoreAction();
+    // 无论成败都拿一次最新状态：成功切按钮，失败也把真实的 running/busy 画回来。
     await refreshState();
+    renderOverview();
     scheduleStateRefresh(statePollDelay());
-    return;
   }
 }
 
@@ -1036,9 +1081,11 @@ function renderLocalCert() {
   byId("uninstall-local-cert").hidden = !cert.canInstallTrust;
 }
 
-async function refreshLogs() {
+async function refreshLogs(force = false) {
   const now = Date.now();
-  if (currentPage !== "logs" || logsRefreshing || now - lastLogsRefreshAt < 900) return;
+  // 用户主动点「清空显示」时不能撞上 900ms 节流，否则界面还留着旧日志，
+  // 看起来就是「点了没反应 / 卡住」。
+  if (currentPage !== "logs" || logsRefreshing || (!force && now - lastLogsRefreshAt < 900)) return;
   logsRefreshing = true;
   lastLogsRefreshAt = now;
   try {
@@ -3832,7 +3879,12 @@ function bindEvents() {
     byId("setting-server-proxy-port").value =
       MIN_RANDOM_SERVER_PROXY_PORT + (values[0] % (65536 - MIN_RANDOM_SERVER_PROXY_PORT));
   });
-  byId("clear-logs").addEventListener("click", () => { invoke("clearLogs"); refreshLogs(); });
+  // 原来 invoke 没 await 就立刻 refreshLogs，两个请求抢同一把状态锁，可能先读到
+  // 旧日志再清空，看起来像「点了没反应 / 卡住」。等清空落地再重读。
+  byId("clear-logs").addEventListener("click", async () => {
+    await invoke("clearLogs");
+    refreshLogs(true);
+  });
   byId("open-logs").addEventListener("click", () => invoke("openLogs"));
 
   // 环境管理页
