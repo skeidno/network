@@ -15,7 +15,8 @@
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// 起一条不弹控制台窗口的后台命令。
@@ -288,10 +289,191 @@ fn home_exe_dirs() -> Vec<PathBuf> {
     dirs_out
 }
 
+/// 安装器写进注册表的 PATH（User + Machine）。
+///
+/// winget 的便携包（PHP 8.5 / Ruby 这类 zip 分发）装完只改注册表，并在输出里明说
+/// 「已修改路径环境变量；重启 shell 以使用新值」。本进程的 PATH 是启动时读进来的
+/// 快照，光跑 `scan_fresh()` 依旧看不到新目录 —— 于是「已成功安装」和「未检测到」
+/// 同时出现在一屏上。体检时把注册表 PATH 一起当候选，才和磁盘真实状态一致。
+#[cfg(windows)]
+fn registry_path_dirs() -> Vec<PathBuf> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
+        HKEY_LOCAL_MACHINE, KEY_READ, REG_SAM_FLAGS,
+    };
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn read(root: HKEY, subkey: &str) -> Option<String> {
+        let path = wide(subkey);
+        let name = wide("Path");
+        unsafe {
+            let mut key: HKEY = Default::default();
+            // KEY_WOW64_64KEY：本程序是 64 位，别读到 32 位注册表视图里的旧 PATH
+            let access = REG_SAM_FLAGS(KEY_READ.0 | 0x0002_0000);
+            if RegOpenKeyExW(
+                root,
+                PCWSTR::from_raw(path.as_ptr()),
+                Some(0),
+                access,
+                &mut key,
+            )
+            .is_err()
+            {
+                return None;
+            }
+            let mut size: u32 = 0;
+            let probe = RegQueryValueExW(
+                key,
+                PCWSTR::from_raw(name.as_ptr()),
+                None,
+                None,
+                None,
+                Some(&mut size),
+            );
+            if probe.is_err() || size < 2 {
+                let _ = RegCloseKey(key);
+                return None;
+            }
+            let mut bytes = vec![0u8; size as usize];
+            let read = RegQueryValueExW(
+                key,
+                PCWSTR::from_raw(name.as_ptr()),
+                None,
+                None,
+                Some(bytes.as_mut_ptr()),
+                Some(&mut size),
+            );
+            let _ = RegCloseKey(key);
+            if read.is_err() {
+                return None;
+            }
+            bytes.truncate((size as usize).min(bytes.len()));
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+                .collect();
+            Some(
+                String::from_utf16_lossy(&units)
+                    .trim_end_matches('\0')
+                    .to_string(),
+            )
+        }
+    }
+
+    let mut out = Vec::new();
+    for (root, subkey) in [
+        (HKEY_CURRENT_USER, "Environment"),
+        (
+            HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+    ] {
+        if let Some(text) = read(root, subkey) {
+            for dir in std::env::split_paths(&expand_env_vars(&text)) {
+                if !dir.as_os_str().is_empty() {
+                    out.push(dir);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn registry_path_dirs() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// 展开 `%SystemRoot%` 这类占位。展开不了的条目后面会被跳过：进程 PATH 里
+/// 已经有展开后的系统目录，不会因此漏掉系统工具。
+#[cfg(windows)]
+fn expand_env_vars(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('%') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let name = &after[..end];
+        match std::env::var_os(name) {
+            Some(value) => out.push_str(&value.to_string_lossy()),
+            None => {
+                out.push('%');
+                out.push_str(name);
+                out.push('%');
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// winget 便携包的解压目录：`<LOCALAPPDATA>\Microsoft\WinGet\Packages\<包 id>_<源>`。
+/// 这类包不进 Program Files，命令行别名也要新 shell 才生成；只看固定兜底目录会漏掉。
+fn winget_package_dirs() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let Some(base) = dirs::data_local_dir().map(|p| p.join(r"Microsoft\WinGet\Packages"))
+        else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// 目录清单带 10 秒缓存：一次体检会为十几个工具各调一遍 `find_all_exes`，
+/// 每遍都读两处注册表 + 列一次 winget 目录没必要。`scan_fresh()` 会主动作废。
+static EXE_DIR_CACHE: OnceLock<Mutex<Option<(Instant, Vec<PathBuf>)>>> = OnceLock::new();
+const EXE_DIR_TTL: Duration = Duration::from_secs(10);
+
+/// 装完 / 卸完 / 用户手动重扫之前调用，让下一次体检看到刚写入的 PATH 与包目录。
+pub fn invalidate_exe_dirs() {
+    if let Some(cache) = EXE_DIR_CACHE.get() {
+        *cache.lock().unwrap_or_else(|err| err.into_inner()) = None;
+    }
+}
+
+fn extra_exe_dirs() -> Vec<PathBuf> {
+    let cache = EXE_DIR_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some((at, ref dirs)) = *guard {
+        if at.elapsed() < EXE_DIR_TTL {
+            return dirs.clone();
+        }
+    }
+    let mut dirs: Vec<PathBuf> = EXTRA_EXE_DIRS.iter().map(PathBuf::from).collect();
+    dirs.extend(home_exe_dirs());
+    dirs.extend(registry_path_dirs());
+    dirs.extend(winget_package_dirs());
+    let mut seen = HashSet::new();
+    dirs.retain(|dir| seen.insert(dir.to_string_lossy().to_lowercase()));
+    *guard = Some((Instant::now(), dirs.clone()));
+    dirs
+}
+
 /// 在 PATH 和几个常见安装位置里找一个可执行文件。
 ///
-/// 顺序刻意是「PATH 优先，常见目录兜底」：PATH 里的那个才是用户真正在用的，
-/// 而注册表/默认目录里可能躺着多个版本，挑错版本比找不到更麻烦。
+/// 顺序刻意是「进程 PATH → 注册表 PATH → 固定兜底目录 → winget 便携包目录」：
+/// PATH 里的那个才是用户真正在用的，兜底目录只负责补安装器没让当前进程看见的部分。
 fn find_exe(names: &[&str]) -> Option<PathBuf> {
     find_all_exes(names).into_iter().next()
 }
@@ -302,34 +484,27 @@ fn find_exe(names: &[&str]) -> Option<PathBuf> {
 /// 环境的就该跳过看下一个，而不是直接返回「没装」。
 fn find_all_exes(names: &[&str]) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            for name in names {
-                candidates.push(dir.join(name));
-            }
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path_var| std::env::split_paths(&path_var).collect())
+        .unwrap_or_default();
+    dirs.extend(extra_exe_dirs());
+    let mut seen_dirs = HashSet::new();
+    for dir in dirs {
+        let text = dir.to_string_lossy().to_string();
+        // 没展开成功的 %VAR% 不是真目录，跳过
+        if text.contains('%') || !seen_dirs.insert(text.to_lowercase()) {
+            continue;
         }
-    }
-    let mut extras: Vec<PathBuf> = EXTRA_EXE_DIRS.iter().map(PathBuf::from).collect();
-    extras.extend(home_exe_dirs());
-    for extra in extras {
         for name in names {
-            candidates.push(extra.join(name));
+            candidates.push(dir.join(name));
         }
     }
     // 去重但保序：同一个 exe 可能同时命中 PATH 与兜底目录
-    let mut seen = Vec::new();
+    let mut seen = HashSet::new();
     candidates
         .into_iter()
         .filter(|p| p.is_file())
-        .filter(|p| {
-            let key = p.to_string_lossy().to_lowercase();
-            if seen.contains(&key) {
-                false
-            } else {
-                seen.push(key);
-                true
-            }
-        })
+        .filter(|p| seen.insert(p.to_string_lossy().to_lowercase()))
         .collect()
 }
 
@@ -870,7 +1045,10 @@ pub fn scan() -> Value {
 }
 
 /// 安装 / 切换 / 卸载之后强制重扫：这时环境真的变了，缓存必须失效。
+/// 连 PATH / winget 包目录缓存一起作废 —— 安装器刚写进注册表的那条路径，
+/// 靠 10 秒 TTL 自然过期会让「装完立刻复核」继续误报缺失。
 pub fn scan_fresh() -> Value {
+    invalidate_exe_dirs();
     scan_cached(true)
 }
 
@@ -1376,8 +1554,9 @@ fn run_winget(id: &str, force: bool, version: &str) -> Result<String, String> {
     };
     let detail =
         run_winget_command("install", package, &WINGET_COMMON, extra, if version.is_empty() { None } else { Some(version) })?;
-    // winget 命中已安装时返回 0 但会说「No applicable upgrade found」，文案上区分一下
-    if detail.contains("already installed") || detail.contains("已安装") {
+    // winget 命中已安装时返回 0 但会说「No applicable upgrade found」，文案上区分一下。
+    // 不能只用 contains("已安装")：成功安装的输出里也可能出现「已安装此程序包」。
+    if winget_install_no_op(&detail) {
         return Ok(format!("{package} 已经是最新状态，无需重复安装。\n{detail}"));
     }
     Ok(if version.is_empty() {
@@ -1453,6 +1632,32 @@ fn winget_no_op(output: &str) -> bool {
         || lower.contains("no newer package versions")
         || lower.contains("no available upgrade");
     says_installed && says_nothing_to_do
+}
+
+/// 安装命令「其实什么都没装」的判定：必须没有任何下载 / 安装动作。
+///
+/// 以前用 `detail.contains("已安装")` 判 no-op，winget 真装成功时输出里的
+/// 「已安装此程序包」也会被当成「无需重复安装」，界面上就成了「安装完成」
+/// 和「未检测到」同时出现，用户分不清到底成没成。
+fn winget_install_no_op(detail: &str) -> bool {
+    let acted = [
+        "正在下载",
+        "已成功安装",
+        "正在启动程序包安装",
+        "添加了命令行别名",
+        "已修改路径环境变量",
+        "Downloading",
+        "Successfully installed",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle));
+    if acted {
+        return false;
+    }
+    winget_no_op(detail)
+        || detail.contains("已是最新，无需重复安装")
+        || detail.contains("already installed")
+        || detail.contains("已安装此程序包")
 }
 
 /// 打开某个工具的下载页。winget 不覆盖的版本走这里。
@@ -2345,6 +2550,70 @@ pub async fn latest_versions(force: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 用户截图里 PHP 8.5 首次安装的真实 winget 输出：明明装成功了，
+    /// 旧的 contains("已安装") 判定却可能把这类输出说成「无需重复安装」。
+    const PHP_INSTALLED_LOG: &str = "\
+已找到 PHP 8.5 [PHP.PHP.8.5] 版本 8.5.12
+正在下载 https://downloads.php.net/~windows/releases/archives/php-8.5.12-Win32-vs17-x64.zip
+已成功验证安装程序哈希
+正在启动程序包安装...
+已修改路径环境变量；重启 shell 以使用新值。
+添加了命令行别名： \"php\"
+已成功安装";
+
+    #[test]
+    fn 真实安装输出不能被判成无需安装() {
+        assert!(!winget_install_no_op(PHP_INSTALLED_LOG));
+        // 真的什么都没做时才算 no-op
+        let no_op = "已找到已安装的现有程序包；找不到可用的升级\n已安装 PHP 8.5";
+        assert!(winget_install_no_op(no_op));
+        assert!(winget_install_no_op("PHP.PHP.8.5 已是最新，无需重复安装。"));
+        // 纯失败输出既不是成功安装，也不是 no-op
+        assert!(!winget_no_op("下载失败：网络不可达"));
+    }
+
+    /// 本机自证：进程 PATH 里没有 winget 便携包目录时，体检仍能找到刚装上的 php.exe。
+    /// 跑法：`cargo test 本机PHP便携包 -- --ignored --nocapture`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "需要本机已通过 winget 安装 PHP 8.5"]
+    fn 本机PHP便携包能被体检找到() {
+        let process_has = std::env::var_os("PATH")
+            .map(|p| p.to_string_lossy().to_lowercase().contains("winget\\packages"))
+            .unwrap_or(false);
+        let found = find_all_exes(&["php.exe"]);
+        println!("进程 PATH 含 winget 包目录：{process_has}");
+        for path in &found {
+            println!("候选：{}", path.display());
+        }
+        assert!(
+            found
+                .iter()
+                .any(|p| p.to_string_lossy().to_lowercase().contains("winget\\packages")),
+            "注册表 PATH / winget 包目录兜底没生效：{found:?}"
+        );
+        let mut item = EnvItem::new_lang("php", "PHP");
+        probe_php(&mut item);
+        println!(
+            "体检结果：ready={} version={} path={}",
+            item.ready, item.version, item.path
+        );
+        assert!(item.ready);
+        assert!(item.version.starts_with("8.5"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn 环境变量展开不吞掉未知名() {
+        let text = "C:\\bin;%NETWORK_MANAGER_NO_SUCH_VAR_XYZ%\\tools";
+        let expanded = expand_env_vars(text);
+        assert!(expanded.starts_with("C:\\bin;"));
+        assert!(expanded.contains("%NETWORK_MANAGER_NO_SUCH_VAR_XYZ%"));
+        // 系统变量要真的展开，否则注册表里的系统 PATH 全会被跳过
+        let system = expand_env_vars("%SystemRoot%\\system32");
+        assert!(!system.contains('%'), "{system}");
+    }
 
     #[test]
     fn 版本号提取覆盖各家格式() {
