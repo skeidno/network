@@ -1284,6 +1284,29 @@ fn run_winget(id: &str, force: bool, version: &str) -> Result<String, String> {
         return Err("本机没有 winget，无法自动安装。\n请到「设置 → 应用 → 应用执行别名」里启用 winget，或手动到官网下载安装。".to_string());
     }
 
+    // 下拉里选的是「大版本系列」（Python 3.11 / .NET 10），不是补丁号。
+    // winget 把每个大版本拆成独立包 id，--version 只认补丁号，
+    // 所以这里换成对应包、装该系列最新补丁。不同包可并存，不会卸掉现有版本。
+    if !version.is_empty()
+        && series_search_prefix(id).is_some()
+        && version.split('.').count() <= 2
+    {
+        let Some(target) = cross_major_package(id, version) else {
+            return Err(format!("无法从版本 {version} 推导出 {id} 的 winget 包 id"));
+        };
+        let detail = run_winget_command(
+            "install",
+            &target,
+            &WINGET_COMMON,
+            if force { Some("--force") } else { None },
+            None,
+        )?;
+        return Ok(format!(
+            "已安装 {target}（{id} {version} 系列的最新补丁）。\n\
+             winget 里各系列是独立包，可与现有版本并存；命令行默认指向哪个由 PATH / 版本选择器决定。\n{detail}"
+        ));
+    }
+
     if force {
         // 指定了版本就只能强制安装到那个版本：upgrade 不接受「降到某个旧版本」
         if !version.is_empty() {
@@ -1993,14 +2016,38 @@ pub fn can_auto_install(id: &str) -> bool {
 /// 这一项支不支持指定版本安装。
 ///
 /// Node 特殊：它走 nvm，能同时并存多个版本，切版本不动其它项目。
-/// 其它项靠 winget 的 `--version`，但 winget 换版本要先卸载旧的
-/// （我们用 `--force` 达成），所以对用户来说是破坏性操作。
+/// python / php / ruby / dotnet 在 winget 里按大版本拆成多个包，
+/// 下拉给的是「系列」（3.10 / 3.11 / 3.12…），装不同系列可以并存；
+/// git / jdk / go 只有一个包，下拉给的是补丁号，换版本会覆盖现有安装。
 fn supports_versions(id: &str) -> bool {
-    matches!(id, "node" | "python" | "git" | "jdk")
+    matches!(
+        id,
+        "node" | "python" | "php" | "ruby" | "dotnet" | "git" | "jdk" | "go"
+    )
+}
+
+/// winget 里按大版本分包的项目：包 id 的公共前缀。
+/// 这些项不能用 `show --versions`（那只给某一个包里的补丁号），
+/// 要改用 `search` 把源里所有系列列出来。
+fn series_search_prefix(id: &str) -> Option<&'static str> {
+    match id {
+        "python" => Some("Python.Python."),
+        "php" => Some("PHP.PHP."),
+        "ruby" => Some("RubyInstallerTeam.Ruby."),
+        "dotnet" => Some("Microsoft.DotNet.SDK."),
+        _ => None,
+    }
+}
+
+/// 把版本号拆成数字段用于倒序排序，避免 "3.9" 排在 "3.10" 后面。
+fn version_key(text: &str) -> Vec<u64> {
+    text.split('.')
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .collect()
 }
 
 /// 列出某个项能装的版本（走 winget 的包）。
-/// Node 不在这里 —— 它的版本来自 nvm，见 crate::nvm::status。
+/// Node 不在这里 —— 它的版本来自 nvm，见 crate::nvm::available_versions。
 pub fn available_versions(id: &str) -> Result<Value, String> {
     let Some(package) = winget_id(id) else {
         return Err(format!("未知的环境条目：{id}"));
@@ -2008,6 +2055,82 @@ pub fn available_versions(id: &str) -> Result<Value, String> {
     if !winget_available() {
         return Err("本机没有 winget，无法查询可安装版本。".to_string());
     }
+    if let Some(prefix) = series_search_prefix(id) {
+        return series_versions(id, prefix);
+    }
+    patch_versions(id, package)
+}
+
+/// 按大版本分包的项：从 `winget search` 的真实结果里提取系列。
+///
+/// 实测 `winget search --id Python.Python` 会列出 3.0 ~ 3.14 全部包，
+/// 每行形如 `Python 3.11   Python.Python.3.11   3.11.9`，第二列就是包 id。
+/// 不硬编码版本清单：源里新增 3.15 时下拉自动跟上。
+fn series_versions(id: &str, prefix: &str) -> Result<Value, String> {
+    let output = winget_command()?
+        .args([
+            "search",
+            "--id",
+            prefix.trim_end_matches('.'),
+            "--source",
+            "winget",
+            "--disable-interactivity",
+            "--accept-source-agreements",
+        ])
+        .output()
+        .map_err(|error| format!("调用 winget 失败：{error}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        return Err(format!("查询 {id} 的大版本列表失败：\n{text}"));
+    }
+    let series = parse_series_versions(&text, prefix, id);
+    Ok(json!({
+        "id": id,
+        "versions": series,
+        // 前端据此把文案从「会卸载现有版本」改成「各系列可并存」
+        "versionKind": "series",
+    }))
+}
+
+/// 从 winget search 的输出里挑出大版本系列，倒序去重。
+/// 抽成纯函数是为了能拿真实输出片段做单测：字符串排序会把 "3.9" 排在
+/// "3.10" 后面，必须按数字段比。
+fn parse_series_versions(text: &str, prefix: &str, id: &str) -> Vec<String> {
+    let mut series: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            let token = line.split_whitespace().find(|part| part.starts_with(prefix))?;
+            let tail = &token[prefix.len()..];
+            let valid = !tail.is_empty()
+                && tail.split('.').count() <= 2
+                && tail.chars().all(|c| c.is_ascii_digit() || c == '.');
+            valid.then(|| tail.to_string())
+        })
+        .collect();
+    // 过滤掉早就没有维护必要的老系列，别让下拉里混进 Python 3.0。
+    let (min_major, min_minor) = match id {
+        "python" => (3, 9),
+        "php" => (8, 0),
+        "ruby" => (3, 0),
+        "dotnet" => (8, 0),
+        _ => (0, 0),
+    };
+    series.retain(|value| {
+        let key = version_key(value);
+        (key.first().copied().unwrap_or(0), key.get(1).copied().unwrap_or(0))
+            >= (min_major, min_minor)
+    });
+    series.sort_by(|a, b| version_key(b).cmp(&version_key(a)));
+    series.dedup();
+    series
+}
+
+/// 单包项目：列这个包自己的历史补丁版本。
+fn patch_versions(id: &str, package: &str) -> Result<Value, String> {
     let output = winget_command()?
         .args([
             "show",
@@ -2042,7 +2165,7 @@ pub fn available_versions(id: &str) -> Result<Value, String> {
         })
         .map(|line| line.to_string())
         .collect();
-    Ok(json!({ "id": id, "versions": versions }))
+    Ok(json!({ "id": id, "versions": versions, "versionKind": "patch" }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2529,5 +2652,39 @@ mod tests {
         assert!(!winget_no_op("已安装程序哈希校验失败；下载被中断"));
         assert!(!winget_no_op("已安装"), "只说装了、没说没得升，不能判成功");
         assert!(!winget_no_op(""));
+    }
+
+    #[test]
+    fn 大版本系列按数字倒序且过滤老版本() {
+        // 实测 winget search --id Python.Python 的输出片段。注意 3.10 不能排在 3.9 后面。
+        let lines = [
+            "名称                           ID                                  版本",
+            "-----------------------------------------------------------------------------",
+            "Python Embeddable Package 3.14 Python.PythonEmbeddablePackage.3.14 3.14.6",
+            "Python 2                       Python.Python.2                     2.7.18150",
+            "Python 3.8                     Python.Python.3.8                   3.8.10",
+            "Python 3.9                     Python.Python.3.9                   3.9.13",
+            "Python 3.10                    Python.Python.3.10                  3.10.11",
+            "Python 3.11                    Python.Python.3.11                  3.11.9",
+            "Python 3.12                    Python.Python.3.12                  3.12.10",
+            "Python 3.13                    Python.Python.3.13                  3.13.17",
+            "Python 3.14                    Python.Python.3.14                  3.14.10",
+        ];
+        let versions = parse_series_versions(&lines.join("\n"), "Python.Python.", "python");
+        assert_eq!(versions, vec!["3.14", "3.13", "3.12", "3.11", "3.10", "3.9"]);
+    }
+
+    #[test]
+    fn 选大版本会推导出对应的_winget_包id() {
+        assert_eq!(
+            cross_major_package("python", "3.11").as_deref(),
+            Some("Python.Python.3.11")
+        );
+        assert_eq!(
+            cross_major_package("dotnet", "10").as_deref(),
+            Some("Microsoft.DotNet.SDK.10")
+        );
+        assert!(cross_major_package("git", "2.45.0").is_none());
+        assert!(cross_major_package("python", "3.11; rm -rf /").is_none());
     }
 }
