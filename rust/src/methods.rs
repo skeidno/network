@@ -1402,8 +1402,8 @@ pub async fn dispatch(
         // install / reinstall / update 会同步跑 winget 几十秒到几分钟，
         // 必须走 server.rs 的锁外通道（run_env_long_action）。dispatch 是持锁调用的，
         // 留在这里会把状态轮询一起卡死。保留明确报错，免得以后有人从别的路径调进来。
-        "installEnv" | "reinstallEnv" | "updateEnv" | "uninstallEnv" => {
-            Err("环境安装 / 卸载须走锁外通道".into())
+        "installEnv" | "reinstallEnv" | "updateEnv" | "uninstallEnv" | "repairWinget" => {
+            Err("环境安装 / 卸载 / winget 修复须走锁外通道".into())
         }
         // 最新版本查询会联网，已在 server.rs 的锁外分支处理；留个明确报错，
         // 免得以后有人从别的路径调进来，还以为是「未知方法」。
@@ -2504,10 +2504,16 @@ fn env_long_action_body(method: &str, args: &[Value]) -> Result<Value, String> {
         "reinstallEnv" => "重装",
         "updateEnv" => "更新",
         "uninstallEnv" => "卸载并清理",
+        "repairWinget" => "修复 winget",
         "nvmInstallVersion" => "安装 Node 版本",
         _ => "环境操作",
     };
-    let id = text(args, 0);
+    // repairWinget 没有 id 参数，给个稳定的任务项名，进度卡才有阶段文字可显示。
+    let id = if method == "repairWinget" {
+        "winget".to_string()
+    } else {
+        text(args, 0)
+    };
     if !id.is_empty() {
         crate::envtask::ensure_item(label, &id);
         crate::envtask::begin_item(&id);
@@ -2517,6 +2523,7 @@ fn env_long_action_body(method: &str, args: &[Value]) -> Result<Value, String> {
             "installEnv" | "reinstallEnv" => "正在通过 winget 下载并安装，可能需要几分钟",
             "updateEnv" => "正在通过官方包管理器更新，可能需要几分钟",
             "uninstallEnv" => "正在卸载并清理，可能需要几分钟",
+            "repairWinget" => "正在下载并注册 App Installer（约 315 MB），可能需要几分钟",
             "nvmInstallVersion" => "正在通过 nvm 下载 Node，可能需要几分钟",
             _ => "正在处理",
         };
@@ -2563,6 +2570,11 @@ fn env_long_action_run(method: &str, args: &[Value]) -> Result<Value, String> {
             // 第二个参数是「连用户数据目录一起删」，默认 false。
             let deep = flag(args, 1);
             let detail = crate::envmgr::uninstall(&id, deep)?;
+            let env = crate::envmgr::scan_fresh();
+            Ok(json!({ "detail": detail, "env": env }))
+        }
+        "repairWinget" => {
+            let detail = crate::wingetboot::repair()?;
             let env = crate::envmgr::scan_fresh();
             Ok(json!({ "detail": detail, "env": env }))
         }

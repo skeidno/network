@@ -8,6 +8,10 @@ mod credentials;
 mod deploy;
 // 开发环境体检与一键部署（envmgr）
 mod envmgr;
+// 没有 winget 时的官方直连版本查询与静默安装（全新系统兜底）
+mod envdirect;
+// winget 缺失时的 App Installer 离线修复
+mod wingetboot;
 // 环境长任务的真实进度（独立全局锁，不占 state 锁）
 mod envtask;
 // Node 多版本管理，走 nvm-windows（nvm）
@@ -96,6 +100,13 @@ impl Options {
                 "--no-browser" => options.open_browser = false,
                 "--headless" => options.headless = true,
                 "--startup" => options.start_hidden = true,
+                // 内部自证开关：本机有 winget，没法真把 App Installer 卸了验证
+                // 「全新系统」分支。它必须走命令行而不是环境变量 —— UAC 提权重启
+                // 由 ShellExecuteExW("runas") 交给 AppInfo 服务拉起新进程，新进程
+                // 不继承调用者临时设置的环境变量，但会原样带上启动参数。
+                "--force-direct" => {
+                    std::env::set_var("NETWORK_MANAGER_ENV_FORCE_DIRECT", "1");
+                }
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -125,6 +136,7 @@ fn print_help() {
          \x20 --start-core        启动 WebGUI 时自动拉起内核\n\
          \x20 --headless          仅运行 HTTP 服务，不创建原生窗口（Windows）\n\
          \x20 --startup           随系统启动：隐藏窗口，仅驻留托盘（Windows）\n\
+         \x20 --force-direct       内部自证：强制按「本机没有 winget」走官方直连分支\n\
          \n\
          Linux 上没有原生界面，程序始终以常驻服务方式运行，管理页面用浏览器打开\n\
          上面打印的地址；用 SIGTERM（systemctl stop）结束。\n"

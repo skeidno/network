@@ -322,7 +322,7 @@ async fn call_api(
     // 与 deploySshServer / envLatestVersions 同构：只在首尾短暂取锁改 busy / 发通知。
     if matches!(
         method.as_str(),
-        "installEnv" | "reinstallEnv" | "updateEnv" | "uninstallEnv" | "nvmInstallVersion"
+        "installEnv" | "reinstallEnv" | "updateEnv" | "uninstallEnv" | "nvmInstallVersion" | "repairWinget"
     ) {
         let result = crate::methods::run_env_long_action(&shared, &method, args.clone()).await;
         return match result {

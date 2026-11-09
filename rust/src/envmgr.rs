@@ -900,8 +900,10 @@ fn build_scan() -> Value {
         "installed": installed,
         "outdated": outdated,
         "missing": items.len() - installed,
-        // winget 有没有是「一键部署 / 重装」能不能用的前提，没它整列按钮都得灰掉
+        // winget 有没有。没有时不再把整列按钮灰掉：installMode=direct 表示
+        // 自动切到官方直连安装，前端会额外给一个「修复 winget」的可选入口。
         "winget": winget_available(),
+        "installMode": install_mode(),
     })
 }
 
@@ -1053,9 +1055,30 @@ fn winget_exe() -> Option<PathBuf> {
     None
 }
 
-/// winget 在不在。在的话一键部署才有意义。
+/// 给修复模块用的别名路径。不重新实现一遍探测，避免两边判断不一致。
+pub fn winget_path() -> Option<PathBuf> {
+    winget_exe()
+}
+
+/// winget 在不在。在的话走包管理器；不在也不代表装不了 ——
+/// `envdirect` 会从官方源直连安装，见 `install_mode()`。
 pub fn winget_available() -> bool {
+    // 自证测试开关：全新电脑没有 App Installer，本机有，没法真把系统组件卸了验证。
+    // 设了这个环境变量就强制走直连分支，用来对照验证 scanEnv / 版本下拉 / 安装
+    // 按钮在「无 winget」时的真实行为。普通用户不会设置，也不影响鉴权与配置。
+    if std::env::var_os("NETWORK_MANAGER_ENV_FORCE_DIRECT").is_some() {
+        return false;
+    }
     winget_exe().is_some()
+}
+
+/// 环境页当前的安装通道。前端据此决定摘要文案和「修复 winget」按钮显不显示。
+pub fn install_mode() -> &'static str {
+    if winget_available() {
+        "winget"
+    } else {
+        "direct"
+    }
 }
 
 /// 用绝对路径起 winget，别让 PATH 决定功能在不在。
@@ -1107,7 +1130,8 @@ const WINGET_COMMON: [&str; 4] = [
 /// Node 走 nvm 而不是 winget：Node 要能同时装多个版本并存，winget 装的是
 /// 单一系统级安装，装第二个版本会跟第一个打架。nvm 天然解决这件事。
 pub fn install(id: &str, version: &str) -> Result<String, String> {
-    if id == "node" && !version.is_empty() {
+    // 全新系统没有 nvm，指定版本时也别硬转 nvm —— 交给官方 MSI 直连装这个系列。
+    if id == "node" && !version.is_empty() && winget_available() {
         return crate::nvm::install_version(version);
     }
     run_winget(id, false, version)
@@ -1120,7 +1144,7 @@ pub fn install(id: &str, version: &str) -> Result<String, String> {
 /// 升级不可用（版本太老不在源里、包不支持升级）再退回强制安装，
 /// 并且把降级这件事在返回文案里说清楚。
 pub fn reinstall(id: &str, version: &str) -> Result<String, String> {
-    if id == "node" && !version.is_empty() {
+    if id == "node" && !version.is_empty() && winget_available() {
         return crate::nvm::install_version(version);
     }
     run_winget(id, true, version)
@@ -1136,7 +1160,7 @@ pub fn can_update(id: &str) -> bool {
         // Node 有 nvm 就能装并切到最新版；没 nvm 时仍走卡片里的「版本管理」。
         // installed() 只查文件、不起子进程，逐项放进 to_json 也不拖慢体检。
         "node" => crate::nvm::installed(),
-        _ => winget_id(id).is_some() && winget_available(),
+        _ => can_auto_install(id),
     }
 }
 
@@ -1195,7 +1219,8 @@ fn cross_major_package(id: &str, latest: &str) -> Option<String> {
 /// 全程不碰 `--force`：更新不该有「卸了旧的却没装回来」的风险。
 /// `latest` 由前端把查到的最新稳定版传进来，空串表示没查到，走保守的同系列升级。
 pub fn update(id: &str, latest: &str) -> Result<String, String> {
-    if id == "node" {
+    // 没有 winget 时 nvm 通常也不存在，Node 的「更新」改走官方 MSI 直连。
+    if id == "node" && winget_available() {
         if latest.is_empty() {
             return Err("没拿到 Node 最新版本号，请先点「检查最新版本」".into());
         }
@@ -1206,6 +1231,10 @@ pub fn update(id: &str, latest: &str) -> Result<String, String> {
     // winget 只会升级 rustup 这个安装器本身。
     if id == "rust" {
         let Some(rustup) = find_exe(&["rustup.exe", "rustup"]) else {
+            if !winget_available() {
+                return crate::envdirect::install("rust", "")
+                    .map(|detail| format!("本机没有 rustup，已通过官方直连安装 Rust。\n{detail}"));
+            }
             return Err("没找到 rustup，无法更新 Rust 工具链；请先到 rustup.rs 安装".into());
         };
         let output = command(&rustup.to_string_lossy())
@@ -1233,7 +1262,9 @@ pub fn update(id: &str, latest: &str) -> Result<String, String> {
         return Err(format!("这一项没有可用的 winget 包：{id}"));
     };
     if !winget_available() {
-        return Err("本机没有 winget，无法自动更新".into());
+        // 全新系统：把「更新」等价成「直连装官方最新稳定版」，并如实说明通道。
+        return crate::envdirect::install(id, latest)
+            .map(|detail| format!("本机没有 winget，已通过官方直连安装最新稳定版。\n{detail}"));
     }
 
     // 跨大版本：装最新版对应的那个 winget 包，旧版本保留。
@@ -1281,7 +1312,10 @@ fn run_winget(id: &str, force: bool, version: &str) -> Result<String, String> {
         return Err(format!("未知的环境条目：{id}"));
     };
     if !winget_available() {
-        return Err("本机没有 winget，无法自动安装。\n请到「设置 → 应用 → 应用执行别名」里启用 winget，或手动到官网下载安装。".to_string());
+        // 全新系统没有 App Installer：不让用户去官网，也不弹「无法安装」，
+        // 直接走官方直连（版本为空时自动取官方最新稳定版）。
+        return crate::envdirect::install(id, version)
+            .map(|detail| format!("本机没有 winget，已自动切换为官方直连安装。\n{detail}"));
     }
 
     // 下拉里选的是「大版本系列」（Python 3.11 / .NET 10），不是补丁号。
@@ -2009,8 +2043,15 @@ fn open_url(url: &str) -> Result<(), String> {
 }
 
 /// 这个条目是不是「一键部署」能搞定的。
+///
+/// 全新系统没有 winget 时改看官方直连通道支不支持这一项；没有稳定直链的
+/// 项目仍然灰掉，但界面会把「修复 winget」摆出来，不是无解的死胡同。
 pub fn can_auto_install(id: &str) -> bool {
-    winget_id(id).is_some() && winget_available()
+    if winget_available() {
+        winget_id(id).is_some()
+    } else {
+        crate::envdirect::supports(id)
+    }
 }
 
 /// 这一项支不支持指定版本安装。
@@ -2053,7 +2094,10 @@ pub fn available_versions(id: &str) -> Result<Value, String> {
         return Err(format!("未知的环境条目：{id}"));
     };
     if !winget_available() {
-        return Err("本机没有 winget，无法查询可安装版本。".to_string());
+        // 全新电脑没有 App Installer。以前这里直接报错，用户点开下拉只看到一句
+        // 「本机没有 winget」，什么也做不了。改成问官方发布源，安装动作由 envdirect
+        // 直连完成，版本下拉不再是死胡同。
+        return crate::envdirect::versions(id);
     }
     if let Some(prefix) = series_search_prefix(id) {
         return series_versions(id, prefix);
