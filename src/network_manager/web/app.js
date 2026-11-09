@@ -301,6 +301,8 @@ function renderState() {
   applyCapabilities();
   renderChrome();
   renderActivePage();
+  // 环境任务的进度跟着已有的状态轮询走，不另开常驻请求。
+  renderEnvTask(appState.envTask);
 }
 
 function applyCapabilities() {
@@ -1059,6 +1061,13 @@ async function refreshLogs() {
    ------------------------------------------------------------------ */
 let envScanning = false;
 let envBusy = false;
+// 本页正在跑批量循环（区别于从 /api/state 里看到的后端任务）。
+// 批量循环自己负责收尾，进度组件不能中途把 busy 提前放开。
+let envLocalBatch = false;
+// 任务结束只处理一次：状态轮询每 2.5 秒来一次，不能每轮都重扫体检。
+let envTaskHandled = "";
+// busy 是不是「只因为后端任务还在跑」而置上的（页面刷新后没有本地动作可收尾）。
+let envTaskAutoBusy = false;
 // nvm 状态单独缓存一份：体检结果里只有「装了哪些」，没有「能装哪些」。
 // 可装版本要调 nvm（要联网拉 available 列表），单独按需拉一次就好。
 let nvmState = null;
@@ -1185,6 +1194,15 @@ function renderEnv(data) {
   updateAll.title = updatable.length
     ? `将依次更新：${updatable.map((item) => item.name).join("、")}`
     : "先点「检查最新版本」，查出新版后才能批量更新";
+
+  const uninstallable = items.filter((item) => item.ready && item.canUninstall);
+  const uninstallAll = byId("env-uninstall-all");
+  if (uninstallAll) {
+    uninstallAll.disabled = !uninstallable.length || envBusy;
+    uninstallAll.title = uninstallable.length
+      ? `打开清单勾选后批量卸载（默认只勾语言工具链）：${uninstallable.map((item) => item.name).join("、")}`
+      : "没有可卸载的已装组件";
+  }
 }
 
 function renderEnvCard(item) {
@@ -1226,6 +1244,11 @@ function renderEnvCard(item) {
     </div>`;
   }
 
+  // 卸载入口对所有在白名单里的项都给：缺失时也能用来清「装了一半」的残留目录。
+  const uninstallAction = item.canUninstall
+    ? `<button type="button" class="text-button env-uninstall" data-env-uninstall="${escapeHtml(item.id)}" title="卸载并清理残留目录、PATH 与环境变量，删除前会先列出清单">${item.ready ? "卸载并清理" : "清理残留"}</button>`
+    : "";
+
   let actions;
   if (item.outdated) {
     // 过期项给「重装」，不给「一键部署」—— 重装走 upgrade，破坏性小得多
@@ -1257,7 +1280,7 @@ function renderEnvCard(item) {
       ${pathHint ? `<div class="env-card-path">${pathHint}</div>` : ""}
       ${item.note ? `<div class="env-card-note">${escapeHtml(item.note)}</div>` : ""}
       ${renderVersionManager(item)}
-      <div class="env-card-actions">${actions}</div>
+      <div class="env-card-actions">${actions}${uninstallAction}</div>
     </div>`;
 }
 
@@ -1419,15 +1442,18 @@ async function runNvmAction(method, version, verb) {
   } finally {
     setEnvBusy(false);
   }
-  // 必须在 setEnvBusy(false) 之后重画：refreshEnv 开头有 `if (envBusy) return`，
-  // 在 busy 状态下调它会被直接跳过。
+  // refreshEnv 现在只看 envScanning，不再被 busy 拦；仍放在 setEnvBusy(false)
+  // 之后，是为了让按钮先恢复可用再重画卡片。
   // 失败时后端不返回 env，退回强制重扫（比如卸载的正好是当前版本）。
   if (freshEnv) renderEnv(freshEnv);
   else await refreshEnv(true);
 }
 
 async function refreshEnv(force = false) {
-  if (envScanning || envBusy) return;
+  // 体检是只读的，不能因为「有任务在跑」就整个跳过：任务期间切进环境页时，
+  // 页面还没渲染过任何卡片，这一跳会让整个列表空白，只剩一张任务卡。
+  // busy 只管按钮禁用（setEnvBusy），不挡状态读取；envScanning 防的是并发重扫。
+  if (envScanning) return;
   envScanning = true;
   const summary = byId("env-summary");
   summary.textContent = "正在体检…";
@@ -1458,12 +1484,235 @@ function setEnvBusy(busy) {
   envBusy = busy;
   // 安装期间把所有按钮禁掉：winget 独占安装锁，连点两次只会得到一段乱序输出
   document.querySelectorAll(
-    "[data-env-install], [data-env-reinstall], [data-env-update], [data-env-install-version], [data-env-query-versions]," +
-    "[data-nvm-use], [data-nvm-install], #env-install-all, #env-refresh, #env-check-latest, #env-update-all"
+    "[data-env-install], [data-env-reinstall], [data-env-update], [data-env-uninstall], [data-env-install-version], [data-env-query-versions]," +
+    "[data-nvm-use], [data-nvm-install], #env-install-all, #env-uninstall-all, #env-refresh, #env-check-latest, #env-update-all"
   )
     .forEach((button) => { button.disabled = busy; });
-  const summary = byId("env-summary");
-  if (busy) summary.textContent = "正在执行安装，这一步可能要几分钟…";
+  // 摘要交给 renderEnv 画真实体检数据；任务提示由下方的进度卡负责。
+  // 之前在这里改写摘要，会和体检结果互相覆盖，任务结束后还容易留下一句过期提示。
+}
+
+/* ------------------------------------------------------------------------
+   环境任务进度：数据来自 /api/state 的 envTask，由后端在每个动作真正
+   开始 / 结束时推进。winget 不提供逐百分比进度，所以这里显示的是
+   「第 N/M 项 + 当前阶段 + 每项真实结果」，不是估算出来的动画。
+   ------------------------------------------------------------------------ */
+function renderEnvTask(task) {
+  const root = byId("env-task");
+  if (!root) return;
+  if (!task || typeof task !== "object") {
+    root.hidden = true;
+    return;
+  }
+  root.hidden = false;
+  const running = Boolean(task.active);
+  const total = Number(task.total) || 0;
+  // 单项任务后端只能报 1/1 = 100%，可 winget 还要跑几分钟。
+  // 这种时候画一根满格进度条是骗人，改成不确定态动画 + 阶段文字。
+  const singleRunning = running && total <= 1;
+  root.classList.toggle("is-done", task.status === "done");
+  root.classList.toggle("is-failed", task.status === "failed");
+  root.classList.toggle("is-indeterminate", singleRunning);
+  byId("env-task-label").textContent = task.label || "环境任务";
+  byId("env-task-status").textContent = running
+    ? "进行中"
+    : (task.status === "failed" ? "有失败项" : "已完成");
+  byId("env-task-count").textContent = `${Number(task.current) || 0}/${total}`;
+  byId("env-task-fill").style.width = singleRunning
+    ? "35%"
+    : `${Math.min(100, Number(task.percent) || 0)}%`;
+  byId("env-task-phase").textContent = task.phase || "";
+  const seconds = Math.max(0, Math.round((Number(task.elapsedMs) || 0) / 1000));
+  byId("env-task-elapsed").textContent = `已用 ${Math.floor(seconds / 60)} 分 ${String(seconds % 60).padStart(2, "0")} 秒`;
+  const logs = Array.isArray(task.logs) ? task.logs.slice(-6) : [];
+  byId("env-task-logs").innerHTML = logs.map((entry) => `
+    <li class="env-task-log ${entry.ok ? "is-ok" : "is-fail"}">
+      <span class="env-task-log-mark">${entry.ok ? "✓" : "✕"}</span>
+      <strong>${escapeHtml(entry.id)}</strong>
+      <span>${escapeHtml(entry.detail || "")}</span>
+    </li>`).join("");
+
+  // 刷新页面后任务可能还在跑：按钮必须跟着禁用，不能只看本地 envBusy。
+  if (running && !envBusy) {
+    setEnvBusy(true);
+    envTaskAutoBusy = true;
+  }
+  // 双保险：任务卡都显示了、卡片区却还是空的（典型场景就是在任务进行中
+  // 才切进环境页，切页那次体检可能还没回来），主动补一次只读体检。
+  // refreshEnv 已不再被 envBusy 拦住，这里能拿到真实数据把卡片画上。
+  const envGrid = byId("env-grid");
+  if (running && envGrid && !envGrid.children.length && !envScanning) refreshEnv();
+  const key = `${task.startedAt}:${task.status}`;
+  if (!running && key !== envTaskHandled) {
+    envTaskHandled = key;
+    // 自己置的 busy 自己清；批量循环 / 单项动作由它们的 finally 收尾。
+    if (envTaskAutoBusy) {
+      setEnvBusy(false);
+      envTaskAutoBusy = false;
+    }
+    if (!envLocalBatch && !envBusy) refreshEnv(true);
+  }
+}
+
+async function beginEnvTask(label, ids) {
+  envTaskHandled = "";
+  try {
+    await invokeStrict("envTaskBegin", label, ids);
+  } catch (_error) {
+    // 进度通道不可用时也要让动作照常跑，别拿展示问题挡住功能。
+  }
+}
+
+async function finishEnvTask() {
+  try { await invoke("envTaskFinish"); } catch (_error) { /* 同上 */ }
+}
+
+function formatEnvBytes(bytes) {
+  const value = Number(bytes) || 0;
+  return value >= 1048576
+    ? `${(value / 1048576).toFixed(1)} MB`
+    : `${Math.round(value / 1024)} KB`;
+}
+
+/** 单项卸载：先拿只读清单，列全路径让用户确认，再真正动手。 */
+async function uninstallEnvById(id) {
+  if (envBusy) return;
+  let preview;
+  try {
+    preview = await invokeStrict("envUninstallPreview", id);
+  } catch (error) {
+    showToast("error", error.message || "读取卸载清单失败");
+    return;
+  }
+  if (!preview.allowed) {
+    showToast("error", preview.reason || "该项不允许卸载");
+    return;
+  }
+  const kindLabels = { install: "程序目录", cache: "缓存/配置", userdata: "用户数据" };
+  const paths = (Array.isArray(preview.paths) ? preview.paths : []).filter((entry) => entry.exists);
+  const rows = paths.map((entry) => `
+    <li class="cleanup-item ${entry.kind === "userdata" ? "is-userdata" : ""}">
+      <span class="cleanup-kind">${escapeHtml(kindLabels[entry.kind] || entry.kind)}</span>
+      <code>${escapeHtml(entry.path)}</code>
+      <span class="cleanup-size">约 ${Number(entry.files) || 0} 个文件 · ${formatEnvBytes(entry.bytes)}</span>
+      <span class="cleanup-note">${escapeHtml(entry.note || "")}</span>
+    </li>`).join("");
+  const pathEntries = Array.isArray(preview.pathEntries) ? preview.pathEntries : [];
+  const envVars = (Array.isArray(preview.envVars) ? preview.envVars : []).filter((entry) => entry.value);
+  openModal(`卸载并清理 ${escapeHtml(preview.name)}`, `
+    <p class="modal-warning">⚠️ 此操作非常危险，可能导致不可逆的数据丢失！</p>
+    <p>将调用 <code>winget uninstall --purge</code>（${escapeHtml(preview.package || "对应包")}），
+       并删除以下残留目录。清单之外的路径一律不动。</p>
+    <ul class="cleanup-list">${rows || '<li class="cleanup-empty">没有检测到残留目录</li>'}</ul>
+    ${pathEntries.length
+      ? `<p class="cleanup-sub">PATH 中将被清理的条目：</p><ul class="cleanup-list">${pathEntries.map((entry) => `<li><code>${escapeHtml(entry)}</code></li>`).join("")}</ul>`
+      : ""}
+    ${envVars.length
+      ? `<p class="cleanup-sub">将被清除的环境变量：</p><ul class="cleanup-list">${envVars.map((entry) => `<li><code>${escapeHtml(entry.name)}</code> = ${escapeHtml(entry.value)}</li>`).join("")}</ul>`
+      : ""}
+    <label class="env-uninstall-deep"><input type="checkbox" id="env-deep-clean"> 连同用户数据目录一起删除（默认保留，可能含你自己写的项目）</label>
+    <p class="modal-hint">已打开的终端需要重开才会读到新的 PATH。</p>
+  `, [
+    { label: "取消", kind: "secondary", action: closeModal },
+    {
+      label: "确认卸载并清理",
+      kind: "danger",
+      action: () => {
+        const deep = Boolean(byId("env-deep-clean") && byId("env-deep-clean").checked);
+        closeModal();
+        runEnvUninstall(id, deep);
+      },
+    },
+  ]);
+}
+
+async function runEnvUninstall(id, deep) {
+  if (envBusy) return;
+  setEnvBusy(true);
+  try {
+    const result = await invokeStrict("uninstallEnv", id, deep);
+    if (result && result.env) renderEnv(result.env);
+    showEnvDetail("卸载输出", result?.detail || "卸载完成");
+    showToast("success", `${id} 已卸载并清理`);
+  } catch (error) {
+    const message = error.message || String(error);
+    showEnvDetail("卸载失败", message);
+    showToast("error", `卸载失败：${message.split("\n")[0]}`);
+  } finally {
+    setEnvBusy(false);
+    refreshEnv(true);
+  }
+}
+
+/** 批量卸载：先勾选，再逐项跑。core 组默认不勾，免得一下卸掉程序自己的依赖。 */
+async function uninstallAllEnv() {
+  if (envBusy) return;
+  const items = (envData && Array.isArray(envData.items) ? envData.items : [])
+    .filter((item) => item.ready && item.canUninstall);
+  if (!items.length) {
+    showToast("info", "没有可卸载的已装组件");
+    return;
+  }
+  const rows = items.map((item) => `
+    <label class="env-uninstall-row" data-group="${escapeHtml(item.group || "core")}">
+      <input type="checkbox" value="${escapeHtml(item.id)}" ${item.group === "language" ? "checked" : ""}>
+      <span><strong>${escapeHtml(item.name)}</strong> ${escapeHtml(item.version || "")}</span>
+      <span class="env-uninstall-warn">${item.group === "core" ? "核心组件，卸载可能影响本程序" : "语言工具链"}</span>
+    </label>`).join("");
+  openModal("一键卸载", `
+    <p class="modal-warning">⚠️ 此操作非常危险，可能导致不可逆的数据丢失！</p>
+    <p>勾选要卸载的组件。默认只勾语言工具链；核心组件是本程序的依赖，请自己确认后再勾。</p>
+    <div class="env-uninstall-list">${rows}</div>
+    <label class="env-uninstall-deep"><input type="checkbox" id="env-batch-deep"> 连同用户数据目录一起删除（GOPATH / npm 全局包等，默认保留）</label>
+    <p class="modal-hint">逐项执行：官方卸载 → 清残留目录 → 清 PATH 与环境变量 → 复核。进度见页面任务卡。</p>
+  `, [
+    { label: "取消", kind: "secondary", action: closeModal },
+    {
+      label: "确认卸载",
+      kind: "danger",
+      action: () => {
+        const ids = [...document.querySelectorAll(".env-uninstall-row input:checked")]
+          .map((input) => input.value);
+        const deep = Boolean(byId("env-batch-deep") && byId("env-batch-deep").checked);
+        closeModal();
+        if (!ids.length) {
+          showToast("info", "没有勾选任何组件");
+          return;
+        }
+        runEnvBatchUninstall(ids, deep);
+      },
+    },
+  ]);
+}
+
+async function runEnvBatchUninstall(ids, deep) {
+  if (envBusy) return;
+  setEnvBusy(true);
+  envLocalBatch = true;
+  await beginEnvTask("一键卸载", ids);
+  const chunks = [];
+  let failed = 0;
+  try {
+    for (const id of ids) {
+      try {
+        const result = await invokeStrict("uninstallEnv", id, deep);
+        if (result && result.detail) chunks.push(`### ${id}\n${result.detail}`);
+        if (result && result.env) renderEnv(result.env);
+      } catch (error) {
+        failed += 1;
+        chunks.push(`### ${id} 失败\n${error.message || error}`);
+      }
+    }
+    showEnvDetail(failed ? `批量卸载输出（${failed} 项失败）` : "批量卸载输出", chunks.join("\n\n"));
+    showToast(failed ? "error" : "success", failed
+      ? `${ids.length} 项中 ${failed} 项失败，详见输出`
+      : `已卸载并清理 ${ids.length} 项`);
+  } finally {
+    await finishEnvTask();
+    envLocalBatch = false;
+    setEnvBusy(false);
+    await refreshEnv(true);
+  }
 }
 
 async function runEnvAction(id, method, verb, version = "") {
@@ -1522,6 +1771,8 @@ async function installAllEnv() {
     return;
   }
   setEnvBusy(true);
+  envLocalBatch = true;
+  await beginEnvTask("一键部署", cards);
   const chunks = [];
   let failed = 0;
   try {
@@ -1542,6 +1793,8 @@ async function installAllEnv() {
       ? `${cards.length} 项中 ${failed} 项失败，详见输出`
       : `已依次部署 ${cards.length} 项`);
   } finally {
+    await finishEnvTask();
+    envLocalBatch = false;
     setEnvBusy(false);
     refreshEnv(true);
   }
@@ -1604,6 +1857,8 @@ async function updateAllEnv() {
     return;
   }
   setEnvBusy(true);
+  envLocalBatch = true;
+  await beginEnvTask("一键更新", ids);
   const chunks = [];
   let failed = 0;
   try {
@@ -1627,6 +1882,8 @@ async function updateAllEnv() {
       ? `${ids.length} 项中 ${failed} 项失败，详见输出`
       : `已依次更新 ${ids.length} 项`);
   } finally {
+    await finishEnvTask();
+    envLocalBatch = false;
     setEnvBusy(false);
     await refreshEnv(true);
   }
@@ -3441,6 +3698,12 @@ function bindEvents() {
   byId("env-check-latest").addEventListener("click", () => checkEnvLatest(true));
   byId("env-update-all").addEventListener("click", () => updateAllEnv());
   byId("env-install-all").addEventListener("click", () => installAllEnv());
+  byId("env-uninstall-all").addEventListener("click", () => uninstallAllEnv());
+  byId("env-task-close").addEventListener("click", () => {
+    byId("env-task").hidden = true;
+    envTaskHandled = "";
+    invoke("envTaskClear");
+  });
   byId("env-detail-close").addEventListener("click", () => { byId("env-detail").hidden = true; });
   // 卡片里的按钮是渲染出来的，用事件委托绑一次就够，不用每张卡重绑
   byId("env-grid").addEventListener("click", (event) => {
@@ -3482,6 +3745,11 @@ function bindEvents() {
     const queryVersions = event.target.closest("[data-env-query-versions]");
     if (queryVersions) {
       queryEnvVersions(queryVersions.dataset.envQueryVersions);
+      return;
+    }
+    const uninstall = event.target.closest("[data-env-uninstall]");
+    if (uninstall) {
+      uninstallEnvById(uninstall.dataset.envUninstall);
       return;
     }
     const update = event.target.closest("[data-env-update]");

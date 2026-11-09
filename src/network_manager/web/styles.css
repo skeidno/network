@@ -2216,7 +2216,11 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
   padding: 8px 0;
   background: var(--bg);
   border-bottom: 1px solid var(--line-hairline);
+  /* 五个按钮 + 摘要在窄窗口会横向溢出、把「检查最新版本」裁掉。
+     常驻工具栏允许换行，宁可高一点也不能藏按钮。 */
+  flex-wrap: wrap;
 }
+.env-page > .page-toolbar .button { white-space: nowrap; }
 .env-summary-idle { color: var(--text-3); }
 .env-summary-warn { color: var(--amber-text); }
 
@@ -2266,3 +2270,78 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
   .env-group-count { margin-left: 0; }
   .env-latest-bar { font-size: 11.5px; }
 }
+
+/* ---------------------------------------------------------------------------
+   环境任务进度卡 / 卸载确认清单
+   --------------------------------------------------------------------------- */
+.env-task {
+  margin: 0 0 14px; padding: 12px 14px;
+  border: 1px solid var(--line); border-left: 3px solid var(--blue);
+  border-radius: var(--radius); background: var(--surface);
+  box-shadow: 0 1px 2px rgba(20, 28, 38, .04);
+}
+.env-task[hidden] { display: none; }
+.env-task.is-done { border-left-color: var(--green); }
+.env-task.is-failed { border-left-color: var(--danger); }
+.env-task-head { display: flex; align-items: center; gap: 10px; }
+.env-task-label { font-weight: 600; color: var(--text); }
+.env-task-status {
+  padding: 2px 8px; border-radius: 999px; font-size: 11px;
+  color: var(--blue-text); background: var(--blue-soft);
+}
+.env-task.is-done .env-task-status { color: var(--green-text); background: var(--green-soft); }
+.env-task.is-failed .env-task-status { color: var(--danger-text); background: var(--danger-soft); }
+.env-task-count { font-variant-numeric: tabular-nums; color: var(--text-2); font-size: 12px; }
+.env-task-close { margin-left: auto; }
+.env-task-track { height: 6px; margin: 10px 0 6px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
+.env-task-fill { height: 100%; width: 0; border-radius: 999px; background: var(--blue); transition: width .35s ease; }
+.env-task.is-done .env-task-fill { background: var(--green); }
+.env-task.is-failed .env-task-fill { background: var(--danger); }
+/* 单项动作没有可拆的子进度：用往返滑块表示「确实还在跑」，不假装 100% */
+.env-task.is-indeterminate .env-task-fill { width: 35%; animation: env-task-slide 1.8s ease-in-out infinite; }
+@keyframes env-task-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(286%); }
+}
+.env-task-meta { display: flex; justify-content: space-between; gap: 10px; font-size: 11.5px; color: var(--text-3); }
+.env-task-logs { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.env-task-log { display: flex; gap: 8px; align-items: baseline; font-size: 11.5px; color: var(--text-2); }
+.env-task-log strong { color: var(--text); min-width: 54px; }
+.env-task-log span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.env-task-log-mark { font-weight: 700; }
+.env-task-log.is-ok .env-task-log-mark { color: var(--green-text); }
+.env-task-log.is-fail .env-task-log-mark { color: var(--danger-text); }
+
+/* 卸载入口与确认清单 */
+.button.danger:disabled { opacity: .5; }
+.env-uninstall { color: var(--danger-text) !important; }
+.env-uninstall:hover { text-decoration: underline; }
+.modal-warning {
+  margin: 0 0 10px; padding: 9px 12px; border-radius: 6px;
+  color: var(--danger-text); background: var(--danger-soft);
+  border: 1px solid var(--danger); font-weight: 600; font-size: 12.5px;
+}
+.modal-hint { margin: 10px 0 0; color: var(--text-3); font-size: 11.5px; }
+.cleanup-sub { margin: 12px 0 4px; font-size: 12px; color: var(--text-2); }
+.cleanup-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.cleanup-list > li, .cleanup-item {
+  padding: 7px 9px; border: 1px solid var(--line-hairline); border-radius: 6px;
+  background: var(--surface-2); font-size: 11.5px; color: var(--text-2);
+}
+.cleanup-item { display: grid; grid-template-columns: 72px 1fr auto; gap: 4px 8px; align-items: center; }
+.cleanup-item code, .cleanup-list code { color: var(--text); word-break: break-all; font-size: 11.5px; }
+.cleanup-kind { color: var(--blue-text); font-weight: 600; }
+.cleanup-size { color: var(--text-3); font-variant-numeric: tabular-nums; }
+.cleanup-note { grid-column: 2 / -1; color: var(--text-3); }
+.cleanup-item.is-userdata { border-color: var(--amber-line); background: var(--amber-soft); }
+.cleanup-item.is-userdata .cleanup-kind { color: var(--amber-text); }
+.cleanup-empty { color: var(--text-3); }
+.env-uninstall-deep { display: flex; gap: 8px; align-items: flex-start; margin-top: 12px; font-size: 12px; color: var(--text-2); }
+.env-uninstall-list { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.env-uninstall-row {
+  display: flex; gap: 8px; align-items: center; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); font-size: 12px;
+}
+.env-uninstall-row strong { color: var(--text); }
+.env-uninstall-warn { margin-left: auto; color: var(--text-3); font-size: 11px; }
+.env-uninstall-row[data-group="core"] .env-uninstall-warn { color: var(--orange-text); }
