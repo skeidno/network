@@ -55,7 +55,11 @@ private val IPV4 = Regex("""\d{1,3}(?:\.\d{1,3}){3}""")
  * 关掉某条规则都不会被下次启动塞回来。
  */
 private const val PREF_RULE_SEED_VERSION = "ruleSeedVersion"
+/** v1：补 claude / anthropic 关键字兜底规则。 */
 private const val RULE_SEED_VERSION_KEYWORDS = 1
+/** v2：补 openai.azure.com 到内置海外组。 */
+private const val RULE_SEED_VERSION_AZURE_OPENAI = 2
+private const val RULE_SEED_VERSION_LATEST = RULE_SEED_VERSION_AZURE_OPENAI
 
 class AppRepository private constructor(private val context: Context) {
     private val profileStore = ProfileStore.get(context)
@@ -76,25 +80,37 @@ class AppRepository private constructor(private val context: Context) {
     }
 
     /**
-     * 老档案升级时补进新增的内置默认规则（目前是 claude / anthropic 关键字）。
+     * 老档案升级时补进新增的内置默认规则（v1 关键字兜底、v2 内置组域名）。
      *
      * 桌面端用 `CONFIG_VERSION` 做一次性迁移，端上按档案的偏好文件做同样的
-     * 一次性播种。注意 `AppState.portableRules` 的默认值仍是空列表：单测里
-     * 直接 new 一个 AppState 不该凭空多出规则，播种只发生在真正读写偏好的
-     * Repository 里。
+     * 一次性播种，每个版本各自判断：从 0 直接升到 2 的档案要同时补两批，
+     * 已经在 1 的只补 v2。注意 `AppState.portableRules` 的默认值仍是空列表：
+     * 单测里直接 new 一个 AppState 不该凭空多出规则，播种只发生在真正读写
+     * 偏好的 Repository 里。
      */
     private fun ensureDefaultRuleSeeds() {
-        if (preferences.getInt(PREF_RULE_SEED_VERSION, 0) >= RULE_SEED_VERSION_KEYWORDS) return
+        val seedVersion = preferences.getInt(PREF_RULE_SEED_VERSION, 0)
+        if (seedVersion >= RULE_SEED_VERSION_LATEST) return
         // 先写标记再改状态：万一后面落盘失败，也不会每次启动都把用户删掉的
         // 规则强行塞回去。
         preferences.edit()
-            .putInt(PREF_RULE_SEED_VERSION, RULE_SEED_VERSION_KEYWORDS)
+            .putInt(PREF_RULE_SEED_VERSION, RULE_SEED_VERSION_LATEST)
             .apply()
         val current = mutableState.value
-        val seeded = withDefaultProxyKeywords(current.portableRules)
-        if (seeded.size != current.portableRules.size) {
-            update(current.copy(portableRules = seeded))
+        var next = current
+        if (seedVersion < RULE_SEED_VERSION_KEYWORDS) {
+            val seeded = withDefaultProxyKeywords(next.portableRules)
+            if (seeded.size != next.portableRules.size) {
+                next = next.copy(portableRules = seeded)
+            }
         }
+        if (seedVersion < RULE_SEED_VERSION_AZURE_OPENAI) {
+            val seeded = withDefaultOverseasDomainSeeds(next.ruleGroup.domains)
+            if (seeded.size != next.ruleGroup.domains.size) {
+                next = next.copy(ruleGroup = next.ruleGroup.copy(domains = seeded))
+            }
+        }
+        if (next != current) update(next)
     }
 
     fun activeProfileId(): String = profileId
@@ -752,7 +768,9 @@ class AppRepository private constructor(private val context: Context) {
                 nodeGroups = nodeGroups,
                 subscriptions = subscriptions,
                 ruleGroup = defaultOverseasRuleGroup().copy(
-                    domains = commonDomains,
+                    // 老版本桌面端导出的清单里没有 Azure OpenAI；导入会整份替换
+                    // 内置组，必须像关键字规则一样在这里显式补齐。
+                    domains = withDefaultOverseasDomainSeeds(commonDomains),
                     enabled = common.optBoolean("enabled", true),
                 ),
                 commonRuleTarget = common.optString("target", "proxy").toFallbackTarget(),
@@ -764,7 +782,7 @@ class AppRepository private constructor(private val context: Context) {
             ),
         )
         preferences.edit()
-            .putInt(PREF_RULE_SEED_VERSION, RULE_SEED_VERSION_KEYWORDS)
+            .putInt(PREF_RULE_SEED_VERSION, RULE_SEED_VERSION_LATEST)
             .apply()
         return PortableImportResult(nodes.size, skippedRules)
     }

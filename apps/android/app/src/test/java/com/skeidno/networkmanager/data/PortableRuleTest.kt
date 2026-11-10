@@ -104,4 +104,30 @@ class PortableRuleTest {
         assertEquals(1, seeded.count { it.value == "claude" })
         assertEquals("重复播种不能加两遍", seeded, withDefaultProxyKeywords(seeded))
     }
+
+    @Test
+    fun azureOpenaiIsInFreshDefaultOverseasGroup() {
+        val domains = defaultOverseasRuleGroup().domains
+        assertTrue("内置海外组必须含 Azure OpenAI 后缀", "openai.azure.com" in domains)
+        assertEquals(domains.size, domains.toSet().size)
+    }
+
+    @Test
+    fun overseasDomainSeedingOnlyAddsNewDomainsAndIsIdempotent() {
+        // 模拟用户精简过的老清单：只补本次新增的一条，不能把整份默认清单塞回去，
+        // 也不能把用户删掉的旧域名变回来。
+        val old = listOf("openai.com", "chatgpt.com")
+        val seeded = withDefaultOverseasDomainSeeds(old)
+
+        assertEquals(old + "openai.azure.com", seeded)
+        assertEquals("重复播种不能加两遍", seeded, withDefaultOverseasDomainSeeds(seeded))
+        assertEquals("不该塞回整份默认清单", 3, seeded.size)
+    }
+
+    @Test
+    fun overseasDomainSeedingIsCaseInsensitive() {
+        val seeded = withDefaultOverseasDomainSeeds(listOf("OPENAI.AZURE.COM"))
+        assertEquals(1, seeded.size)
+        assertEquals("OPENAI.AZURE.COM", seeded.single())
+    }
 }

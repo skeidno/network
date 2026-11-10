@@ -429,6 +429,9 @@ val DEFAULT_PROXY_DOMAINS = listOf(
     "chatgpt.com",
     "oaistatic.com",
     "oaiusercontent.com",
+    // Codex CLI 接 Azure OpenAI 时走 <resource>.openai.azure.com。
+    // 用这个后缀而不是整个 azure.com，避免把国内 Azure 流量也绕出去。
+    "openai.azure.com",
     "claude.ai",
     "anthropic.com",
     "x.ai",
@@ -615,4 +618,19 @@ fun withDefaultProxyKeywords(rules: List<PortableRule>): List<PortableRule> {
         .map { it.value.lowercase() }
         .toSet()
     return rules + defaultProxyKeywordRules().filterNot { it.value.lowercase() in present }
+}
+
+/**
+ * v2 播种：本次新加进 `DEFAULT_PROXY_DOMAINS` 的域名，和桌面端
+ * `PROXY_DOMAINS_V17_ADDED` 一一对应。
+ *
+ * 只补这几条增量，不把整份默认清单塞回去 —— 用户可能精简过内置组，
+ * 升级不该把他删掉的旧域名又变回来。
+ */
+val DEFAULT_PROXY_DOMAINS_SEED_V2 = listOf("openai.azure.com")
+
+/** 补齐本次新增的内置域名；已有的一律保留，抽成纯函数便于单测。 */
+fun withDefaultOverseasDomainSeeds(domains: List<String>): List<String> {
+    val present = domains.asSequence().map { it.lowercase() }.toSet()
+    return domains + DEFAULT_PROXY_DOMAINS_SEED_V2.filterNot { it.lowercase() in present }
 }
