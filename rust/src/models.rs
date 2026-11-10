@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::net::IpAddr;
 
-pub const CONFIG_VERSION: i32 = 15;
+pub const CONFIG_VERSION: i32 = 16;
 pub const DEFAULT_SERVER_PROXY_PORT: i32 = 24443;
 pub const COMMON_OVERSEAS_GROUP: &str = "common-overseas";
 /// 「常用国内站点」规则组 id：一组直连规则，默认整组走 DIRECT。
@@ -342,6 +342,17 @@ pub fn default_routing_rules() -> Vec<RoutingRule> {
             ..Default::default()
         });
     }
+    // 关键字兜底放在整组之后：它是普通规则（不进内置组），这样
+    // 「恢复默认 / 整组启停」只影响人工维护的域名清单，不会把兜底一起清掉。
+    for (keyword, label) in DEFAULT_PROXY_KEYWORDS {
+        rules.push(RoutingRule {
+            rule_type: "DOMAIN-KEYWORD".into(),
+            value: (*keyword).into(),
+            target: "CLASH".into(),
+            note: (*label).into(),
+            ..Default::default()
+        });
+    }
     rules
 }
 
@@ -587,6 +598,20 @@ pub const DEFAULT_PROXY_DOMAINS: &[(&str, &str)] = &[
     ("epicgames.com", "Epic Games"),
     ("playstation.com", "PlayStation"),
     ("nintendo.com", "Nintendo"),
+];
+
+/// 域名里带这些词的一律走海外出口，用关键字而不是逐个列后缀。
+///
+/// AI 工具的子域和 CDN 换得很勤：`api.anthropic.com`、`console.anthropic.com`、
+/// `claudeusercontent.com`（附件 / artifacts）、`claude.com` 等等，靠人工补后缀
+/// 永远慢一拍，而且老配置升级时补不全（见 `store::append_new_domains` 的差集逻辑）。
+/// 这两个词足够独特，不会误伤国内域名；规则放在内置组之外，用户可以单独关掉。
+///
+/// 注意：`DOMAIN-KEYWORD` 是子串匹配，`claude` 也会命中 `notclaude.example.com`
+/// 这类域名，但相比漏掉 API / CDN 域名导致 Claude Code 连不上，这个代价可以接受。
+pub const DEFAULT_PROXY_KEYWORDS: &[(&str, &str)] = &[
+    ("claude", "Claude / Anthropic（含 API 与 CDN 域名）"),
+    ("anthropic", "Claude / Anthropic（含 API 与 CDN 域名）"),
 ];
 
 /// 上一版内置的域名快照（v12 之前）。

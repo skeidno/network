@@ -2,7 +2,9 @@ package com.skeidno.networkmanager.vpn
 
 import com.skeidno.networkmanager.data.AppState
 import com.skeidno.networkmanager.data.DEFAULT_PROXY_DOMAINS
+import com.skeidno.networkmanager.data.DEFAULT_PROXY_KEYWORDS
 import com.skeidno.networkmanager.data.FallbackTarget
+import com.skeidno.networkmanager.data.defaultProxyKeywordRules
 import com.skeidno.networkmanager.data.LocalDnsEntry
 import com.skeidno.networkmanager.data.ProxyNode
 import com.skeidno.networkmanager.data.PortableRule
@@ -97,6 +99,42 @@ class SingBoxConfigBuilderTest {
         val portable = rules.getJSONObject(5)
         assertEquals("example.org", portable.getJSONArray("domain_suffix").getString(0))
         assertEquals("proxy", portable.getString("outbound"))
+    }
+
+    @Test
+    fun defaultProxyKeywordsEmitRouteAndDnsKeywordRules() {
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(
+                AppState(
+                    selectedNodeId = node.id,
+                    nodes = listOf(node),
+                    portableRules = defaultProxyKeywordRules(),
+                ),
+            ),
+        )
+
+        val routeRules = config.getJSONObject("route").getJSONArray("rules")
+        val dnsRules = config.getJSONObject("dns").getJSONArray("rules")
+        val routeKeywords = (0 until routeRules.length())
+            .map { routeRules.getJSONObject(it) }
+            .filter { it.has("domain_keyword") }
+        val dnsKeywords = (0 until dnsRules.length())
+            .map { dnsRules.getJSONObject(it) }
+            .filter { it.has("domain_keyword") }
+
+        assertEquals(DEFAULT_PROXY_KEYWORDS.size, routeKeywords.size)
+        assertEquals(DEFAULT_PROXY_KEYWORDS.size, dnsKeywords.size)
+        for (keyword in DEFAULT_PROXY_KEYWORDS) {
+            val route = routeKeywords.first {
+                it.getJSONArray("domain_keyword").getString(0) == keyword
+            }
+            assertEquals("proxy", route.getString("outbound"))
+            val dns = dnsKeywords.first {
+                it.getJSONArray("domain_keyword").getString(0) == keyword
+            }
+            // 域名解析也要走远端，否则 DNS 先被本地解析掉，路由规则根本没机会命中。
+            assertEquals("remote-proxy", dns.getString("server"))
+        }
     }
 
     @Test

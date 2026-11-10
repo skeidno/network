@@ -49,6 +49,14 @@ private val PROXY_EXIT_ENDPOINTS = listOf(
 
 private val IPV4 = Regex("""\d{1,3}(?:\.\d{1,3}){3}""")
 
+/**
+ * 内置默认规则的「播种」版本，与桌面端 `CONFIG_VERSION` 是同一个思路：
+ * 新增默认规则时 +1，老档案启动时只补一次。之后用户手动删掉、改出口、
+ * 关掉某条规则都不会被下次启动塞回来。
+ */
+private const val PREF_RULE_SEED_VERSION = "ruleSeedVersion"
+private const val RULE_SEED_VERSION_KEYWORDS = 1
+
 class AppRepository private constructor(private val context: Context) {
     private val profileStore = ProfileStore.get(context)
 
@@ -62,6 +70,32 @@ class AppRepository private constructor(private val context: Context) {
 
     private val mutableState = MutableStateFlow(load())
     val state: StateFlow<AppState> = mutableState.asStateFlow()
+
+    init {
+        ensureDefaultRuleSeeds()
+    }
+
+    /**
+     * 老档案升级时补进新增的内置默认规则（目前是 claude / anthropic 关键字）。
+     *
+     * 桌面端用 `CONFIG_VERSION` 做一次性迁移，端上按档案的偏好文件做同样的
+     * 一次性播种。注意 `AppState.portableRules` 的默认值仍是空列表：单测里
+     * 直接 new 一个 AppState 不该凭空多出规则，播种只发生在真正读写偏好的
+     * Repository 里。
+     */
+    private fun ensureDefaultRuleSeeds() {
+        if (preferences.getInt(PREF_RULE_SEED_VERSION, 0) >= RULE_SEED_VERSION_KEYWORDS) return
+        // 先写标记再改状态：万一后面落盘失败，也不会每次启动都把用户删掉的
+        // 规则强行塞回去。
+        preferences.edit()
+            .putInt(PREF_RULE_SEED_VERSION, RULE_SEED_VERSION_KEYWORDS)
+            .apply()
+        val current = mutableState.value
+        val seeded = withDefaultProxyKeywords(current.portableRules)
+        if (seeded.size != current.portableRules.size) {
+            update(current.copy(portableRules = seeded))
+        }
+    }
 
     fun activeProfileId(): String = profileId
 
@@ -78,6 +112,8 @@ class AppRepository private constructor(private val context: Context) {
         preferences = context.getSharedPreferences(profilePrefsName(id), Context.MODE_PRIVATE)
         probePort = 0
         mutableState.value = load()
+        // 每个档案都有自己的偏好文件，切过去同样要做一次性播种。
+        ensureDefaultRuleSeeds()
     }
 
     fun setMode(mode: RoutingMode) = update(mutableState.value.copy(mode = mode))
@@ -721,9 +757,15 @@ class AppRepository private constructor(private val context: Context) {
                 ),
                 commonRuleTarget = common.optString("target", "proxy").toFallbackTarget(),
                 // 国内直连排在最前：它是「国内的就别绕出去」，要先于其它自定义规则命中。
-                portableRules = chinaRules + rules,
+                // 老版本桌面端导出的文件里没有关键字兜底规则，导入会整份替换掉
+                // portableRules —— 这里必须显式补齐，否则「导入配置」反而把
+                // 默认规则弄丢了（不能只靠 init 的一次性播种，那个标记早已写过）。
+                portableRules = withDefaultProxyKeywords(chinaRules + rules),
             ),
         )
+        preferences.edit()
+            .putInt(PREF_RULE_SEED_VERSION, RULE_SEED_VERSION_KEYWORDS)
+            .apply()
         return PortableImportResult(nodes.size, skippedRules)
     }
 

@@ -582,3 +582,37 @@ fun defaultOverseasRuleGroup() = RuleGroup(
     name = "常用海外站点",
     domains = DEFAULT_PROXY_DOMAINS,
 )
+
+/**
+ * 域名里带这些词的一律走代理出口，和桌面端 `DEFAULT_PROXY_KEYWORDS` 保持一致。
+ *
+ * 光靠 `claude.ai` / `anthropic.com` 两个后缀不够：`api.anthropic.com`、
+ * `console.anthropic.com`、`claudeusercontent.com`（附件 / artifacts）、
+ * `claude.com` 这些 API 与 CDN 域名换得很勤，人工补后缀永远慢一拍，
+ * 表现就是 Claude Code 报 `Connection to api.anthropic.com timed out`。
+ * 这两个词足够独特，不会误伤国内域名。
+ *
+ * 注意 `domain_keyword` 是子串匹配，`claude` 也会命中 `notclaude.example.com`，
+ * 但比漏掉 API 域名导致工具连不上代价小；用户可以单独关掉或删掉。
+ */
+val DEFAULT_PROXY_KEYWORDS = listOf("claude", "anthropic")
+
+/** 新档案 / 老档案升级时写入的默认关键字兜底规则。 */
+fun defaultProxyKeywordRules(): List<PortableRule> = portableRulesFromValues(
+    type = "domain_keyword",
+    values = DEFAULT_PROXY_KEYWORDS,
+    target = FallbackTarget.Proxy,
+    note = "Claude / Anthropic（含 API 与 CDN 域名）",
+)
+
+/**
+ * 补齐默认关键字规则，只补缺失的那几条，已有同名规则（含用户改过出口 /
+ * 关掉的）一律保留。抽成纯函数是为了能单测，也不用 Android Context。
+ */
+fun withDefaultProxyKeywords(rules: List<PortableRule>): List<PortableRule> {
+    val present = rules.asSequence()
+        .filter { it.type == "domain_keyword" }
+        .map { it.value.lowercase() }
+        .toSet()
+    return rules + defaultProxyKeywordRules().filterNot { it.value.lowercase() in present }
+}

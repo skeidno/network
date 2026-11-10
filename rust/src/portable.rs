@@ -702,6 +702,58 @@ mod tests {
         );
     }
 
+    /// 桌面端导出的「域名含 claude / anthropic」兜底规则必须能跨端流转：
+    /// 导出落在普通 `rules` 区（type=domain_keyword），Android 的
+    /// `AppRepository.importPortable()` 正是按这个字段解析成 PortableRule；
+    /// 反过来桌面端导入同样要能还原成 DOMAIN-KEYWORD 规则。
+    /// 若哪天误把这两条塞进内置组，导出会被整组折叠成 domain_suffix，
+    /// 端上就只剩 claude.ai / anthropic.com 两个后缀，API / CDN 子域又漏了。
+    #[test]
+    fn proxy_keywords_survive_portable_round_trip() {
+        let config = AppConfig {
+            rules: default_routing_rules(),
+            ..Default::default()
+        };
+        let exported = export_portable_config(&config);
+
+        let custom = exported["rules"].as_array().expect("rules 是数组");
+        assert_eq!(
+            custom.len(),
+            crate::models::DEFAULT_PROXY_KEYWORDS.len(),
+            "默认配置里除两个内置组外只剩关键字兜底"
+        );
+        for (keyword, _) in crate::models::DEFAULT_PROXY_KEYWORDS {
+            let hit = custom
+                .iter()
+                .find(|item| item["value"].as_str() == Some(*keyword))
+                .unwrap_or_else(|| panic!("导出缺少关键字规则 {keyword}"));
+            assert_eq!(hit["type"].as_str(), Some("domain_keyword"));
+            assert_eq!(hit["target"].as_str(), Some("proxy"));
+            assert_eq!(hit["enabled"].as_bool(), Some(true));
+        }
+        let overseas = exported["routing"]["commonOverseas"]["domains"]
+            .as_array()
+            .expect("海外组仍在");
+        assert!(
+            !overseas.iter().any(|item| item.as_str() == Some("claude")),
+            "关键字不能被折叠进内置组的后缀清单"
+        );
+
+        let imported = import_portable_config(&AppConfig::default(), &exported)
+            .expect("关键字规则应该能导回来");
+        for (keyword, _) in crate::models::DEFAULT_PROXY_KEYWORDS {
+            let hits: Vec<&RoutingRule> = imported
+                .rules
+                .iter()
+                .filter(|rule| {
+                    rule.rule_type == "DOMAIN-KEYWORD" && rule.value.eq_ignore_ascii_case(keyword)
+                })
+                .collect();
+            assert_eq!(hits.len(), 1, "{keyword} 导入后应有且仅有一条");
+            assert!(hits[0].group.is_empty(), "兜底规则不该混进内置组");
+        }
+    }
+
     #[test]
     fn legacy_portable_config_without_china_group_still_imports() {
         let mut config = AppConfig::default();

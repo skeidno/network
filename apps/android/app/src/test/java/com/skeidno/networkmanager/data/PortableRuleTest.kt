@@ -2,6 +2,7 @@ package com.skeidno.networkmanager.data
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PortableRuleTest {
@@ -62,5 +63,45 @@ class PortableRuleTest {
         )
 
         assertEquals(listOf("example.com", "custom.example"), domains)
+    }
+
+    @Test
+    fun defaultProxyKeywordsCoverApiAndCdnDomains() {
+        val rules = defaultProxyKeywordRules()
+
+        assertEquals(listOf("claude", "anthropic"), rules.map(PortableRule::value))
+        assertTrue(rules.all { it.type == "domain_keyword" })
+        assertTrue(rules.all { it.target == FallbackTarget.Proxy && it.enabled })
+        // 只列后缀会漏掉这些，正是用户遇到的 `api.anthropic.com timed out`。
+        for (domain in listOf(
+            "api.anthropic.com",
+            "console.anthropic.com",
+            "claudeusercontent.com",
+            "claude.com",
+        )) {
+            assertTrue(
+                "$domain 必须被某个关键字命中",
+                rules.any { domain.contains(it.value) },
+            )
+        }
+    }
+
+    @Test
+    fun keywordSeedingKeepsUserRulesAndIsIdempotent() {
+        val userEdited = PortableRule(
+            type = "domain_keyword",
+            value = "claude",
+            target = FallbackTarget.Direct,
+            enabled = false,
+            note = "手动改过",
+        )
+        val custom = PortableRule("domain_suffix", "example.org", FallbackTarget.Proxy)
+        val seeded = withDefaultProxyKeywords(listOf(userEdited, custom))
+
+        assertEquals(3, seeded.size)
+        assertEquals("用户改过的同名规则必须原样保留", userEdited, seeded[0])
+        assertEquals(1, seeded.count { it.value == "anthropic" })
+        assertEquals(1, seeded.count { it.value == "claude" })
+        assertEquals("重复播种不能加两遍", seeded, withDefaultProxyKeywords(seeded))
     }
 }

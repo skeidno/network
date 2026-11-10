@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::models::{
     AppConfig, RoutingRule, COMMON_CHINA_GROUP, COMMON_OVERSEAS_GROUP, DEFAULT_DIRECT_DOMAINS,
-    DEFAULT_PROXY_DOMAINS, PROXY_DOMAINS_V11,
+    DEFAULT_PROXY_DOMAINS, DEFAULT_PROXY_KEYWORDS, PROXY_DOMAINS_V11,
 };
 use crate::paths::settings_path;
 
@@ -90,7 +90,53 @@ fn migrate(config: &mut AppConfig, stored_version: i64) -> bool {
     if stored_version < 15 {
         changed = prune_builtin_groups(config) || changed;
     }
+    if stored_version < 16 {
+        changed = append_proxy_keywords(config) || changed;
+    }
     changed
+}
+
+/// 把「域名含 claude / anthropic 一律走海外」的关键字规则补进已有配置。
+///
+/// 内置组里那两条 `claude.ai` / `anthropic.com` 后缀规则，恰好也在
+/// [`PROXY_DOMAINS_V11`] 快照里，所以 `append_new_domains` 的差集永远算不出
+/// 「这是新增的」——老配置升级时补不进来。加上 AI 工具的 API / CDN 域名
+/// 换得太勤，只补后缀也追不上。这里按关键字补一次，迁移只在版本升级时跑，
+/// 用户之后手动删掉不会被塞回来。
+fn append_proxy_keywords(config: &mut AppConfig) -> bool {
+    let present: Vec<String> = config
+        .rules
+        .iter()
+        .filter(|rule| rule.rule_type == "DOMAIN-KEYWORD")
+        .map(|rule| crate::mihomo::normalize_rule_value(&rule.rule_type, &rule.value))
+        .collect();
+    let added: Vec<RoutingRule> = DEFAULT_PROXY_KEYWORDS
+        .iter()
+        .filter(|(keyword, _)| !present.iter().any(|value| value == *keyword))
+        .map(|(keyword, label)| RoutingRule {
+            rule_type: "DOMAIN-KEYWORD".into(),
+            value: (*keyword).into(),
+            target: "CLASH".into(),
+            enabled: true,
+            note: (*label).into(),
+            ..Default::default()
+        })
+        .collect();
+    if added.is_empty() {
+        return false;
+    }
+    // 落到海外组之后、用户自定义规则之前：规则是有次序的，兜底不能压到
+    // 用户自己配的精确规则前面。
+    let position = config
+        .rules
+        .iter()
+        .rposition(crate::portable::is_common_overseas_rule)
+        .map(|index| index + 1)
+        .unwrap_or(config.rules.len());
+    let tail = config.rules.split_off(position);
+    config.rules.extend(added);
+    config.rules.extend(tail);
+    true
 }
 
 /// 让内置组和用户看到的清单对齐：只留当前清单里还存在的域名。
@@ -438,6 +484,54 @@ mod tests {
         config.rules = default_routing_rules();
         assert!(!append_new_domains(&mut config));
         assert_eq!(config.rules.len(), default_routing_rules().len());
+    }
+
+    #[test]
+    fn ai_keywords_seed_into_old_configs() {
+        // 关键回归：claude.ai / anthropic.com 在 PROXY_DOMAINS_V11 快照里，
+        // append_new_domains 的差集算不出它们是「新增」，老配置永远补不到；
+        // 关键字迁移必须独立把它们（以及 API/CDN 子域）兜住。
+        let mut config = config_from(PROXY_DOMAINS_V11);
+        assert!(append_proxy_keywords(&mut config));
+        assert!(!append_proxy_keywords(&mut config), "重复迁移不能加两遍");
+        for keyword in ["claude", "anthropic"] {
+            let hits: Vec<&RoutingRule> = config
+                .rules
+                .iter()
+                .filter(|rule| rule.rule_type == "DOMAIN-KEYWORD" && rule.value == keyword)
+                .collect();
+            assert_eq!(hits.len(), 1, "{keyword} 应有且仅有一条兜底规则");
+            assert_eq!(hits[0].target, "CLASH");
+            assert!(hits[0].group.is_empty(), "兜底规则不能混进内置组");
+        }
+        for domain in [
+            "api.anthropic.com",
+            "console.anthropic.com",
+            "claudeusercontent.com",
+            "claude.com",
+        ] {
+            assert!(
+                DEFAULT_PROXY_KEYWORDS
+                    .iter()
+                    .any(|(keyword, _)| domain.contains(keyword)),
+                "{domain} 必须被某个关键字命中"
+            );
+        }
+    }
+
+    #[test]
+    fn ai_keyword_migration_keeps_user_rules_last() {
+        let mut config = config_from(&PROXY_DOMAINS_V11[..3]);
+        config.rules.push(RoutingRule {
+            value: "my-rule.example".into(),
+            ..Default::default()
+        });
+        assert!(append_proxy_keywords(&mut config));
+        assert_eq!(
+            config.rules.last().map(|rule| rule.value.as_str()),
+            Some("my-rule.example"),
+            "兜底不能压到用户自定义规则前面"
+        );
     }
 }
 
