@@ -113,13 +113,29 @@ fn append_proxy_keywords(config: &mut AppConfig) -> bool {
         .filter(|rule| rule.rule_type == "DOMAIN-KEYWORD")
         .map(|rule| crate::mihomo::normalize_rule_value(&rule.rule_type, &rule.value))
         .collect();
+    // 去向必须跟着当前配置走：老配置里上游 Clash 常常是关掉的、整组海外规则都
+    // 指向内置节点组。这里以前写死 "CLASH"，渲染成并不存在的 UPSTREAM-CLASH，
+    // mihomo 读配置就 fatal 退出（实测「接管反复被取消」就是这么来的）。
+    let target = config
+        .rules
+        .iter()
+        .find(|rule| rule.group == COMMON_OVERSEAS_GROUP)
+        .map(|rule| rule.target.clone())
+        .filter(|target| !target.trim().is_empty())
+        .unwrap_or_else(|| {
+            if config.clash.enabled {
+                "CLASH".into()
+            } else {
+                "BUILTIN".into()
+            }
+        });
     let added: Vec<RoutingRule> = DEFAULT_PROXY_KEYWORDS
         .iter()
         .filter(|(keyword, _)| !present.iter().any(|value| value == *keyword))
         .map(|(keyword, label)| RoutingRule {
             rule_type: "DOMAIN-KEYWORD".into(),
             value: (*keyword).into(),
-            target: "CLASH".into(),
+            target: target.clone(),
             enabled: true,
             note: (*label).into(),
             ..Default::default()
@@ -528,6 +544,29 @@ mod tests {
                     .iter()
                     .any(|(keyword, _)| domain.contains(keyword)),
                 "{domain} 必须被某个关键字命中"
+            );
+        }
+    }
+
+    #[test]
+    fn ai_keywords_follow_the_overseas_group_target() {
+        // 用户关掉了上游 Clash、整组海外规则都改走内置节点。迁移写死 "CLASH"
+        // 会渲染出不存在的 UPSTREAM-CLASH，mihomo 直接 fatal（接管反复被取消）。
+        let mut config = config_from(&PROXY_DOMAINS_V11[..3]);
+        for rule in &mut config.rules {
+            rule.target = "BUILTIN".into();
+        }
+        config.clash.enabled = false;
+        assert!(append_proxy_keywords(&mut config));
+        for keyword in ["claude", "anthropic"] {
+            let hit = config
+                .rules
+                .iter()
+                .find(|rule| rule.rule_type == "DOMAIN-KEYWORD" && rule.value == keyword)
+                .expect("关键字规则应被补进");
+            assert_eq!(
+                hit.target, "BUILTIN",
+                "不能写死 CLASH 渲染出不存在的 UPSTREAM-CLASH"
             );
         }
     }

@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 use crate::models::{
@@ -210,20 +211,56 @@ pub fn normalize_rule_value(rule_type: &str, value: &str) -> String {
     }
 }
 
-fn rule_line(rule: &RoutingRule) -> String {
+/// 本次配置里真正存在的出口名。
+///
+/// mihomo 解析 `rules` 时只要有一条指向不存在的 proxy / proxy-group，就会
+/// `level=fatal Parse config error` **整个退出**，不是跳过那一条。实测老配置升级
+/// 补进的 `DOMAIN-KEYWORD,claude,UPSTREAM-CLASH` 在「上游 Clash 已关、改用内置
+/// 节点」的机器上正好踩中：点一次接管内核死一次，守护又按退避反复拉起，界面
+/// 表现就是「接管反复被取消」。
+fn available_targets(config: &AppConfig, proxies: &[Value]) -> HashSet<String> {
+    let mut names: HashSet<String> = ["DIRECT", "REJECT", "PASS", "REJECT-DROP"]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    for proxy in proxies {
+        if let Some(name) = proxy.get("name").and_then(Value::as_str) {
+            names.insert(name.to_string());
+        }
+    }
+    if !config.imported_nodes.is_empty() {
+        names.insert(target_name("BUILTIN"));
+        names.insert("SMART-NODES".into());
+    }
+    names
+}
+
+/// 目标不存在时退到这里：有内置节点就走节点组，否则直连，绝不留一个死名字。
+fn fallback_target(config: &AppConfig) -> String {
+    if config.imported_nodes.is_empty() {
+        "DIRECT".into()
+    } else {
+        target_name("BUILTIN")
+    }
+}
+
+fn resolve_target(name: &str, available: &HashSet<String>, fallback: &str) -> String {
+    if available.contains(name) {
+        name.to_string()
+    } else {
+        fallback.to_string()
+    }
+}
+
+fn rule_line(rule: &RoutingRule, available: &HashSet<String>, fallback: &str) -> String {
     let value = normalize_rule_value(&rule.rule_type, &rule.value);
     let suffix = if rule.rule_type == "IP-CIDR" {
         ",no-resolve"
     } else {
         ""
     };
-    format!(
-        "{},{},{}{}",
-        rule.rule_type,
-        value,
-        target_name(&rule.target),
-        suffix
-    )
+    let target = resolve_target(&target_name(&rule.target), available, fallback);
+    format!("{},{},{}{}", rule.rule_type, value, target, suffix)
 }
 
 /// 统一中转是否真的生效：开了开关、且中转节点确实还在节点列表里。
@@ -387,6 +424,10 @@ pub fn build(config: &AppConfig) -> Value {
         }
     }
 
+    // 规则里所有出口名都必须真的存在，缺失的一律降级，避免 mihomo 整份配置 fatal。
+    let available = available_targets(config, &proxies);
+    let fallback = fallback_target(config);
+
     // 检测入站必须排在最前面：它要压过下面的 `PROCESS-NAME,NetworkManager.exe,DIRECT`，
     // 否则代理出口检测又会退化成直连（见 PROBE_LISTENER_NAME 的说明）。
     let probe_port = probe_port(config);
@@ -427,7 +468,7 @@ pub fn build(config: &AppConfig) -> Value {
                     // 空值规则必须排除：`DOMAIN-SUFFIX,,X` 会让 mihomo 直接 fatal 退出，
                     // 整个接管都起不来（见 RoutingRule::is_complete 的说明）。
                     .filter(|rule| rule.enabled && rule.is_complete())
-                    .map(rule_line),
+                    .map(|rule| rule_line(rule, &available, &fallback)),
             );
             target_name(&config.default_target)
         }
@@ -438,6 +479,7 @@ pub fn build(config: &AppConfig) -> Value {
         "SMART" => "SMART-NODES".to_string(),
         _ => "DIRECT".to_string(),
     };
+    let final_target = resolve_target(&final_target, &available, &fallback);
     rules.push(format!("MATCH,{final_target}"));
 
     let mut result = json!({
@@ -877,6 +919,61 @@ mod tests {
             "不该出现空值规则：{rules:?}"
         );
         assert_eq!(rules.iter().filter(|rule| rule.contains("example.com")).count(), 1);
+    }
+
+    #[test]
+    fn rules_never_point_at_a_missing_upstream() {
+        // 老配置升级补进的关键字规则写死了 CLASH，但用户的上游 Clash 已关闭、
+        // 用的是内置节点组 —— 渲染出 UPSTREAM-CLASH 会让 mihomo 整份配置 fatal。
+        let mut config = relay_config_with_servers(&["node-a"], &[]);
+        config.clash.enabled = false;
+        config.v2ray.enabled = false;
+        config.rules = vec![
+            crate::models::RoutingRule {
+                rule_type: "DOMAIN-KEYWORD".into(),
+                value: "claude".into(),
+                target: "CLASH".into(),
+                ..Default::default()
+            },
+            crate::models::RoutingRule {
+                rule_type: "DOMAIN-SUFFIX".into(),
+                value: "example.com".into(),
+                target: "V2RAY".into(),
+                ..Default::default()
+            },
+        ];
+        let rules = rules_of(&build(&config));
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule.contains("UPSTREAM-CLASH") || rule.contains("UPSTREAM-V2RAY")),
+            "不能把规则指向不存在的上游：{rules:?}"
+        );
+        assert!(rules.contains(&"DOMAIN-KEYWORD,claude,IMPORTED-NODES".to_string()));
+        assert!(rules.contains(&"DOMAIN-SUFFIX,example.com,IMPORTED-NODES".to_string()));
+    }
+
+    #[test]
+    fn global_mode_without_its_upstream_falls_back_too() {
+        let mut config = relay_config_with_servers(&["node-a"], &[]);
+        config.clash.enabled = false;
+        config.mode = "GLOBAL_CLASH".into();
+        let rules = rules_of(&build(&config));
+        assert_eq!(
+            rules.last().map(String::as_str),
+            Some("MATCH,IMPORTED-NODES")
+        );
+    }
+
+    #[test]
+    fn enabled_upstream_keeps_its_own_target() {
+        // 上游真的开着时不能降级，否则「全局走 Clash」会被悄悄改成走内置节点。
+        let config = AppConfig::default();
+        let rules = rules_of(&build(&config));
+        assert!(
+            rules.iter().any(|rule| rule.ends_with(",UPSTREAM-CLASH")),
+            "存在 UPSTREAM-CLASH 代理时不该被降级：{rules:?}"
+        );
     }
 
     #[test]
