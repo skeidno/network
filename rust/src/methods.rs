@@ -2377,7 +2377,12 @@ pub async fn run_core_toggle_action(shared: &Shared) -> Result<Value, String> {
                 );
             }
             Err(error) => {
-                // 失败不动用户意图：原来想开着就留给自愈守护继续兜底。
+                // 配置被内核拒绝是确定性失败，留着「想开着」的意图只会让守护
+                // 每 15s→120s 重试一次，界面在「接管中 / 已停止」之间反复跳。
+                // 其它临时故障（端口占用、内核被回收）仍交给守护兜底。
+                if error.contains("内核拒绝配置并退出") {
+                    state.core_desired_running = false;
+                }
                 state.notify(
                     "error",
                     format!(

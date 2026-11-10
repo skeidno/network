@@ -387,6 +387,35 @@ impl CoreProcess {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(log_mark);
         self.running.store(true, Ordering::Relaxed);
+
+        // `spawn()` 成功不等于接管成功：配置被拒绝时 mihomo 会在几毫秒内
+        // `level=fatal` 退出。以前这里直接 Ok，界面先弹「接管已开启」，守护随后
+        // 把状态回滚成「已停止」，又按退避间隔无限重试 —— 用户看到的正是
+        // 「接管反复被取消」。这里短等一下，把确定的失败连同内核原始报错返回。
+        let started_at = Instant::now();
+        loop {
+            let exited = child_guard
+                .as_mut()
+                .and_then(|child| child.try_wait().ok().flatten())
+                .is_some();
+            if exited {
+                // 日志是异步写的，退出那一瞬间 fatal 行可能还没落盘。
+                std::thread::sleep(Duration::from_millis(120));
+                let reason = self.fatal_since_start();
+                if let Some(mut dead) = child_guard.take() {
+                    let _ = dead.wait();
+                }
+                self.running.store(false, Ordering::Relaxed);
+                return Err(match reason {
+                    Some(reason) => format!("内核拒绝配置并退出：{reason}"),
+                    None => "内核启动后立即退出，请查看内核日志".into(),
+                });
+            }
+            if started_at.elapsed() >= Duration::from_millis(800) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
         Ok(())
     }
 
@@ -488,6 +517,19 @@ impl CoreProcess {
             .lines()
             .rev()
             .find(|line| line.contains("Start TUN listening error"))
+            .and_then(|line| line.split("msg=").nth(1))
+            .map(|message| message.trim().trim_matches('"').to_string())
+            .filter(|message| !message.is_empty())
+    }
+
+    /// 本次启动之后内核打出的第一条 fatal / error。
+    ///
+    /// 只看 `log_mark` 之后的新内容，不会把上一次启动的历史报错当成这次的原因。
+    fn fatal_since_start(&self) -> Option<String> {
+        self.log_since_start()
+            .lines()
+            .rev()
+            .find(|line| line.contains("level=fatal") || line.contains("level=error"))
             .and_then(|line| line.split("msg=").nth(1))
             .map(|message| message.trim().trim_matches('"').to_string())
             .filter(|message| !message.is_empty())
@@ -993,6 +1035,20 @@ pub async fn supervise_core(shared: crate::server::Shared, shutdown: Arc<AtomicB
         if let Err(err) = started {
             failures += 1;
             eprintln!("自动恢复接管核心失败：{err}");
+            // 配置被内核拒绝时重试多少次都是同样结局，还会让界面不停在
+            // 「接管中 / 已停止」之间跳。直接熄掉用户意图并说明原因，
+            // 用户修好配置后手动点一次接管即可重新拉起。
+            if err.contains("内核拒绝配置并退出") {
+                let mut state = shared.lock().await;
+                state.core_desired_running = false;
+                state.notify("error", format!("配置被内核拒绝，已停止自动重试：{err}"));
+                failures = 0;
+                backoff = RESTART_INTERVAL;
+                if sleep_watch(&shutdown, RESTART_INTERVAL).await {
+                    return;
+                }
+                continue;
+            }
             if failures == 1 {
                 let mut state = shared.lock().await;
                 state.notify("error", format!("接管核心启动失败：{err}"));
