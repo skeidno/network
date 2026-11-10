@@ -1660,6 +1660,14 @@ fn winget_install_no_op(detail: &str) -> bool {
         || detail.contains("已安装此程序包")
 }
 
+/// ADB 的「去官网下载」目标。原先指向 `developer.android.com/tools/releases/platform-tools`：
+/// 该文档站在国内 / 没配代理的新机器上打不开，浏览器经常直接显示 404。按钮的用途是
+/// 「把 adb 拿到手」，所以改成官方下载域名的直链 zip（dl.google.com，实测 200 /
+/// 8.04 MB / PK 头，国内可直连），点一下就能下到 platform-tools。
+/// 备用镜像与版本化地址由 `envdirect.rs` 的直连安装链路负责。
+pub(crate) const ADB_DOWNLOAD_URL: &str =
+    "https://dl.google.com/android/repository/platform-tools-latest-windows.zip";
+
 /// 打开某个工具的下载页。winget 不覆盖的版本走这里。
 pub fn open_download(id: &str) -> Result<(), String> {
     let url = match id {
@@ -1669,7 +1677,7 @@ pub fn open_download(id: &str) -> Result<(), String> {
         "jdk" => "https://learn.microsoft.com/java/jdk/download",
         "webview2" => "https://developer.microsoft.com/microsoft-edge/webview2/",
         "vcredist" => "https://aka.ms/vs/17/release/vc_redist.x64.exe",
-        "adb" => "https://developer.android.com/tools/releases/platform-tools",
+        "adb" => ADB_DOWNLOAD_URL,
         "rust" => "https://rustup.rs/",
         "go" => "https://go.dev/dl/",
         "dotnet" => "https://dotnet.microsoft.com/download",
@@ -2549,6 +2557,22 @@ pub async fn latest_versions(force: bool) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn adb_download_link_is_a_direct_official_zip() {
+        let url = super::ADB_DOWNLOAD_URL;
+        assert!(
+            url.starts_with("https://dl.google.com/android/repository/"),
+            "{url}"
+        );
+        assert!(
+            url.ends_with("platform-tools-latest-windows.zip"),
+            "{url}"
+        );
+        // 回归：developer.android.com 的文档站在国内 / 无代理机器上打不开，
+        // 浏览器常直接报 404，不要再放回「去官网下载」按钮。
+        assert!(!url.contains("developer.android.com"), "{url}");
+    }
+
     use super::*;
 
     /// 用户截图里 PHP 8.5 首次安装的真实 winget 输出：明明装成功了，

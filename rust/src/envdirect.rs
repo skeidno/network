@@ -266,6 +266,7 @@ mod imp {
         }
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
     enum Kind {
         Msi,
         Exe,
@@ -274,6 +275,8 @@ mod imp {
 
     struct Plan {
         url: String,
+        /// 主源 404 / TLS 失败时按顺序尝试的备用地址。只有极少数条目需要。
+        fallbacks: Vec<String>,
         file: String,
         kind: Kind,
         args: Vec<String>,
@@ -427,7 +430,24 @@ mod imp {
             ),
             _ => return Err(format!("{id} 暂不支持官方直连安装；请点「修复 winget」恢复完整安装能力")),
         };
-        Ok(Plan { url, file, kind, args, note })
+        // ADB 的官方 latest 别名在个别地区 / CDN 节点会被判 404，而文档页
+        // developer.android.com 在国内本就打不开。给两条能直连的备用源：
+        // 腾讯云 SDK 镜像（同样是 latest 别名，不会随版本过期）和 2026-11-10
+        // 从官方 repository2-1.xml 读出的版本化包（-win.zip，不是 -windows.zip）。
+        // download_plan() 还会在全挂时重新解析一次官方清单，避免写死的版本过期。
+        let fallbacks = if id == "adb" {
+            ADB_FALLBACKS.iter().map(|url| url.to_string()).collect()
+        } else {
+            Vec::new()
+        };
+        Ok(Plan {
+            url,
+            fallbacks,
+            file,
+            kind,
+            args,
+            note,
+        })
     }
 
     pub(crate) fn work_dir() -> Result<PathBuf, String> {
@@ -508,6 +528,107 @@ mod imp {
         Ok(size)
     }
 
+    /// 官方 SDK 仓库清单里 platform-tools 的 Windows 包名会随版本变
+    /// （2026-11-10 是 platform-tools_r37.0.1-win.zip，注意是 -win 不是 -windows）。
+    /// 不按版本号猜文件名，直接从 repository2-1.xml 读出真实 `<url>`，与
+    /// git_plan() 一样按清单来，避免上游改名后整条备用链路 404。
+    const ADB_REPO: &str = "https://dl.google.com/android/repository/";
+
+    /// ADB 主源挂掉后的静态备用源（2026-11-10 逐个 HEAD 实测）：
+    /// 腾讯云 SDK 镜像 200，官方版本化包 200；清华 / BFSU 镜像的
+    /// `platform-tools-latest-windows.zip` 实测 404，不能放进来。
+    pub(super) const ADB_FALLBACKS: [&str; 2] = [
+        "https://mirrors.cloud.tencent.com/AndroidSDK/platform-tools-latest-windows.zip",
+        "https://dl.google.com/android/repository/platform-tools_r37.0.1-win.zip",
+    ];
+
+    pub(super) fn parse_adb_zip(body: &str) -> Option<String> {
+        let start = body.find("<remotePackage path=\"platform-tools\"")?;
+        let rest = &body[start..];
+        let end = rest.find("</remotePackage>")?;
+        let package = &rest[..end];
+        for archive in package.split("<archive>").skip(1) {
+            if !archive.contains("<host-os>windows</host-os>") {
+                continue;
+            }
+            let name = archive
+                .split("<url>")
+                .nth(1)?
+                .split("</url>")
+                .next()?
+                .trim();
+            if name.starts_with("platform-tools") && name.ends_with(".zip") {
+                return Some(name.to_string());
+            }
+        }
+        None
+    }
+
+    pub(super) fn adb_versioned_url() -> Option<String> {
+        let index = format!("{ADB_REPO}repository2-1.xml");
+        let body = http_text(&index, 12).ok()?;
+        let name = parse_adb_zip(&body)?;
+        Some(format!("{ADB_REPO}{name}"))
+    }
+
+    /// CDN 偶尔对 404 返回 200 + HTML。zip 类安装包开头必须是 PK\x03\x04，
+    /// 否则当坏源换下一个，不能把错误页解压到用户目录。
+    pub(super) fn looks_like_zip(path: &Path) -> bool {
+        use std::io::Read;
+        let Ok(mut file) = fs::File::open(path) else {
+            return false;
+        };
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic).is_ok() && magic == [0x50, 0x4b, 0x03, 0x04]
+    }
+
+    fn try_download(url: &str, kind: Kind, dest: &Path) -> Result<u64, String> {
+        let size = download(url, dest)?;
+        if kind == Kind::Zip && !looks_like_zip(dest) {
+            let _ = fs::remove_file(dest);
+            return Err("返回的不是 zip（可能被 CDN 换成了错误页）".into());
+        }
+        Ok(size)
+    }
+
+    /// 依次尝试主源与备用源，返回（字节数，真正用上的地址）。
+    /// 每个源的失败原因都带回来，全挂时用户能看到「到底哪几个地址不行」，
+    /// 而不是一句笼统的「下载失败」。
+    fn download_plan(plan: &Plan, dest: &Path, id: &str) -> Result<(u64, String), String> {
+        let mut urls: Vec<String> = std::iter::once(plan.url.clone())
+            .chain(plan.fallbacks.iter().cloned())
+            .collect();
+        let mut errors: Vec<String> = Vec::new();
+        let mut queried_index = false;
+        loop {
+            let batch = std::mem::take(&mut urls);
+            if batch.is_empty() {
+                break;
+            }
+            for url in batch {
+                match try_download(&url, plan.kind, dest) {
+                    Ok(size) => return Ok((size, url)),
+                    Err(error) => {
+                        let _ = fs::remove_file(dest);
+                        errors.push(format!("{url}：{error}"));
+                    }
+                }
+            }
+            // 静态源全挂时才去问官方清单：正常路径不该为用不上的 XML 多等一次往返。
+            if !queried_index && id == "adb" {
+                queried_index = true;
+                if let Some(url) = adb_versioned_url() {
+                    urls.push(url);
+                }
+            }
+        }
+        Err(format!(
+            "所有官方/镜像下载地址都失败（已试 {} 个）：\n{}",
+            errors.len(),
+            errors.join("\n")
+        ))
+    }
+
     /// 把解压目录写进用户 PATH，并同步当前进程 PATH。
     /// 不同步的话 `scan_fresh()` 里的 find_exe 仍按旧 PATH 找，会误报没装上。
     fn add_user_path(dir: &Path) -> Result<(), String> {
@@ -573,7 +694,7 @@ mod imp {
         let plan = plan(id, version)?;
         let dir = work_dir()?;
         let dest = dir.join(&plan.file);
-        let size = download(&plan.url, &dest)?;
+        let (size, source) = download_plan(&plan, &dest, id)?;
         let detail = run_installer(&dest, &plan, id);
         // 成功就把几十 MB 的安装包删掉；失败保留原始文件，错误信息里已经给了路径。
         if detail.is_ok() {
@@ -583,7 +704,7 @@ mod imp {
         Ok(format!(
             "官方直连安装：{}\n来源：{}\n下载：{:.1} MB\n\n{}",
             plan.note,
-            plan.url,
+            source,
             size as f64 / 1024.0 / 1024.0,
             if output.is_empty() { "安装器已静默完成（无输出）" } else { &output }
         ))
@@ -632,7 +753,56 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod win_tests {
-    use super::imp::{clean_version, git_plan, hidden_command, min_series, series_of, supports, version_key};
+    use super::imp::{
+        clean_version, git_plan, hidden_command, looks_like_zip, min_series, parse_adb_zip,
+        series_of, supports, version_key, ADB_FALLBACKS,
+    };
+
+    #[test]
+    fn adb_fallbacks_are_verified_and_never_point_at_dead_mirrors() {
+        assert_eq!(ADB_FALLBACKS.len(), 2);
+        assert!(ADB_FALLBACKS
+            .iter()
+            .any(|url| url.contains("mirrors.cloud.tencent.com")));
+        assert!(ADB_FALLBACKS.iter().any(|url| url.ends_with("-win.zip")));
+        for url in ADB_FALLBACKS {
+            assert!(url.starts_with("https://"), "{url}");
+            // 官方版本化包是 -win.zip，按 -windows.zip 拼会得到 404。
+            assert!(!url.contains("platform-tools_r37.0.1-windows.zip"), "{url}");
+        }
+    }
+
+    #[test]
+    fn adb_repository_index_yields_the_windows_zip_name() {
+        let xml = r#"<remotePackage path="platform-tools">
+          <archives>
+            <archive><complete><url>platform-tools_r37.0.1-linux.zip</url></complete><host-os>linux</host-os></archive>
+            <archive><complete><url>platform-tools_r37.0.1-darwin.zip</url></complete><host-os>macosx</host-os></archive>
+            <archive><complete><url>platform-tools_r37.0.1-win.zip</url></complete><host-os>windows</host-os></archive>
+          </archives>
+        </remotePackage>"#;
+        assert_eq!(
+            parse_adb_zip(xml).as_deref(),
+            Some("platform-tools_r37.0.1-win.zip")
+        );
+        assert_eq!(parse_adb_zip("<remotePackage path=\"emulator\" />"), None);
+        let no_windows = r#"<remotePackage path="platform-tools"><archives><archive><complete><url>platform-tools_r37-linux.zip</url></complete><host-os>linux</host-os></archive></archives></remotePackage>"#;
+        assert_eq!(parse_adb_zip(no_windows), None);
+    }
+
+    #[test]
+    fn zip_magic_rejects_html_error_pages() {
+        let dir = std::env::temp_dir().join("nm-adb-zip-check");
+        std::fs::create_dir_all(&dir).expect("临时目录应可创建");
+        let good = dir.join("good.zip");
+        let bad = dir.join("bad.zip");
+        std::fs::write(&good, b"PK\x03\x04rest").expect("写入测试文件");
+        std::fs::write(&bad, b"<html>404 Not Found</html>").expect("写入测试文件");
+        assert!(looks_like_zip(&good));
+        assert!(!looks_like_zip(&bad));
+        assert!(!looks_like_zip(&dir.join("missing.zip")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn version_key_sorts_numeric_segments() {
@@ -678,6 +848,49 @@ mod win_tests {
         // 这几项没有稳定直链，宁可明确提示「修复 winget」，也不猜 URL 装坏环境。
         for id in ["php", "ruby", "dotnet", "nvm"] {
             assert!(!supports(id), "{id} 不该被标成可直连");
+        }
+    }
+
+    /// 联网自证：`cargo test adb_download_urls_are_reachable -- --ignored`。
+    /// 这次修的就是「去官网下载 404」，所以三个地址都得实测 200，不能靠眼看。
+    #[test]
+    #[ignore]
+    fn adb_download_urls_are_reachable() {
+        // 静态备用源全挂时才会走的「官方清单动态解析」也要实测，别留一条
+        // 从没跑过、上游改名后必然 404 的回退路径。
+        let dynamic = super::imp::adb_versioned_url()
+            .expect("官方仓库清单应能解析出 platform-tools 的 Windows 包名");
+        assert!(dynamic.ends_with("-win.zip"), "{dynamic}");
+        for url in std::iter::once(crate::envmgr::ADB_DOWNLOAD_URL)
+            .chain(ADB_FALLBACKS.iter().copied())
+            .chain(std::iter::once(dynamic.as_str()))
+        {
+            // 和 download_with() 一样走 GET，别用 HEAD 探测：部分代理对 HEAD
+            // 直接断链，HEAD 000 会误判成一个本来能正常下载的地址。
+            let probe = hidden_command("curl.exe")
+                .args([
+                    "-sSL",
+                    "--fail",
+                    "--max-time",
+                    "90",
+                    "-o",
+                    "NUL",
+                    "-w",
+                    "%{http_code}",
+                    url,
+                ])
+                .output()
+                .expect("应能调用 curl.exe");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&probe.stdout),
+                String::from_utf8_lossy(&probe.stderr)
+            );
+            assert!(
+                probe.status.success() && text.trim() == "200",
+                "ADB 下载地址必须真实可达：{url}\n退出码 {:?}：{text}",
+                probe.status.code()
+            );
         }
     }
 

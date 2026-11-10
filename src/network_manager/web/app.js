@@ -1345,12 +1345,21 @@ function renderEnvCard(item) {
     actions = `${updatable
         ? `<button type="button" class="button primary" data-env-update="${escapeHtml(item.id)}" title="${escapeHtml(updateHint)}">${icon("arrow-up")}<span>更新</span></button>`
         : ""}
-      <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">打开官网</button>`;
+      <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}">${item.id === "adb" ? "下载 ADB 官方包" : "打开官网"}</button>`;
   } else {
+    // ADB 的官网链接是官方下载域名的 zip 直链（文档页在国内常打不开/404），
+    // 按钮文案别再写成「官网」让人以为会跳到说明页。
+    const adbDirect = item.id === "adb";
+    const openLabel = adbDirect ? "下载 ADB 官方包" : "去官网下载";
+    const openHint = adbDirect
+      ? "从 Google 官方下载域名直接取 platform-tools 压缩包；也可点「一键部署」自动解压并配置 PATH"
+      : envIsDirect() && !canInstall
+        ? "这一项没有稳定的官方直连安装包；可点工具栏「修复 winget」恢复完整安装能力，或前往官网手动下载"
+        : "打开该项目官方下载页";
     actions = `${canInstall
         ? `<button type="button" class="button primary" data-env-install="${escapeHtml(item.id)}">${icon("download")}<span>一键部署</span></button>`
         : ""}
-      <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}" title="${escapeHtml(envIsDirect() && !canInstall ? "这一项没有稳定的官方直连安装包；可点工具栏「修复 winget」恢复完整安装能力，或前往官网手动下载" : "打开该项目官方下载页")}">去官网下载</button>`;
+      <button type="button" class="text-button" data-env-open="${escapeHtml(item.id)}" title="${escapeHtml(openHint)}">${openLabel}</button>`;
   }
 
   return `
