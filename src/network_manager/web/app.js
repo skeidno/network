@@ -221,6 +221,8 @@ function renderActivePage() {
       loadWinServerFixes();
     } else if (serverTab === "transfer") {
       renderXferServers();
+    } else if (serverTab === "remote") {
+      renderRemoteServers();
     } else {
       renderSshServers();
     }
@@ -335,6 +337,12 @@ function applyCapabilities() {
   byId("server-deployment-nav").classList.toggle("is-hidden", !sshDeployment);
   byId("page-servers").classList.toggle("is-hidden", !sshDeployment);
   byId("overview-ssh-row").classList.toggle("is-hidden", !sshDeployment);
+  // mstsc.exe 只在 Windows 有；Linux / headless 上把这个按钮收起来，
+  // 但服务器管理页本身（SSH 部署、文件快传、远程界面）照样可用。
+  byId("winserver-connect").classList.toggle(
+    "is-hidden",
+    capabilities.rdpAvailable === false
+  );
   document.querySelectorAll(".desktop-only-setting").forEach((row) => {
     row.classList.toggle("is-hidden", Boolean(capabilities.headless));
   });
@@ -2123,7 +2131,7 @@ async function updateAllEnv() {
 let serverTab = "linux";
 
 function setServerTab(tab) {
-  if (tab !== "linux" && tab !== "windows" && tab !== "transfer") return;
+  if (tab !== "linux" && tab !== "windows" && tab !== "transfer" && tab !== "remote") return;
   if (serverTab === tab) return;
   serverTab = tab;
   document.querySelectorAll("[data-server-tab]").forEach((button) => {
@@ -2132,6 +2140,7 @@ function setServerTab(tab) {
   byId("server-tab-linux").classList.toggle("is-active", tab === "linux");
   byId("server-tab-windows").classList.toggle("is-active", tab === "windows");
   byId("server-tab-transfer").classList.toggle("is-active", tab === "transfer");
+  byId("server-tab-remote").classList.toggle("is-active", tab === "remote");
   // 切过去才渲染那半边。Windows 那半要起 powercfg / reg 子进程，
   // 不该在用户没看它的时候白跑一趟。
   if (tab === "windows") {
@@ -2140,8 +2149,199 @@ function setServerTab(tab) {
   } else if (tab === "transfer") {
     // 服务器清单与另外两个标签共用同一份 appState，切过来重画一次即可
     renderXferServers();
+  } else if (tab === "remote") {
+    renderRemoteServers();
   } else {
     renderSshServers();
+  }
+}
+
+/* ------------------------------------------------------------------
+   服务器管理页 · 远程界面标签
+   文件树 / Web 终端 / 系统监控三块共用一份已保存的 SSH 凭据。
+   远端输出一律走 textContent：服务器上的文件名和命令回显都不可信，
+   拼进 innerHTML 等于把远端内容当本页脚本执行。
+   ------------------------------------------------------------------ */
+let remoteSelected = "";
+let remotePath = "/";
+let remoteBusy = false;
+let remoteTranscript = [];
+
+function remoteServers() {
+  // 终端与监控是 POSIX 语义，Windows 服务器请用「Windows 服务器」标签
+  return (appState?.sshServers || []).filter((server) => server.kind !== "windows");
+}
+
+// 自己算父目录：后端 parent_of 不归一化 `..`，直接拼 "/a/b/.." 会越点越深。
+function parentOfRemotePath(path) {
+  const trimmed = String(path || "/").replace(/[\\/]+$/, "");
+  if (!trimmed) return "/";
+  const index = trimmed.search(/[\\/][^\\/]+$/);
+  return index > 0 ? trimmed.slice(0, index) : index === 0 ? "/" : "/";
+}
+
+function remoteServerById(id) {
+  return remoteServers().find((server) => server.profileId === id) || null;
+}
+
+function setRemoteStatus(message, isError = false) {
+  const box = byId("remote-terminal-status");
+  box.textContent = message || "";
+  box.classList.toggle("is-error", Boolean(isError));
+}
+
+function renderRemoteServers() {
+  const servers = remoteServers();
+  const list = byId("remote-server-list");
+  if (!list) return;
+  // 删掉服务器后选中项要跟着失效，否则命令会打到空 id 上
+  if (remoteSelected && !remoteServerById(remoteSelected)) remoteSelected = "";
+  if (!servers.length) {
+    list.innerHTML = '<div class="winserver-item-reason">还没有 Linux 服务器，请先在「Linux 服务器」标签添加</div>';
+    byId("remote-metrics-body").innerHTML = '<div class="winserver-item-reason">先在左侧选一台服务器</div>';
+    byId("remote-files").innerHTML = '<div class="winserver-item-reason">—</div>';
+    return;
+  }
+  if (!remoteSelected) {
+    remoteSelected = servers[0].profileId;
+    loadRemoteMetrics();
+    browseRemote(remotePath || "/");
+  }
+  list.innerHTML = servers.map((server) => `<button type="button" class="remote-server${server.profileId === remoteSelected ? " is-active" : ""}" data-remote-pick="${escapeHtml(server.profileId)}">
+      <strong>${escapeHtml(server.name)}</strong>
+      <small>${escapeHtml(server.username)}@${escapeHtml(server.host)}:${server.port}${server.hasCredential ? "" : " · 未保存凭据"}</small>
+    </button>`).join("");
+}
+
+function selectRemoteServer(id) {
+  if (!id || id === remoteSelected) return;
+  remoteSelected = id;
+  remotePath = "/";
+  remoteTranscript = [];
+  byId("remote-terminal-output").textContent = "已切换服务器，输入命令开始。";
+  byId("remote-path").value = remotePath;
+  renderRemoteServers();
+  loadRemoteMetrics();
+  browseRemote(remotePath);
+}
+
+async function loadRemoteMetrics() {
+  const box = byId("remote-metrics-body");
+  if (!remoteSelected) {
+    box.innerHTML = '<div class="winserver-item-reason">先在左侧选一台服务器</div>';
+    return;
+  }
+  box.innerHTML = '<div class="winserver-item-reason">正在采集系统状态…</div>';
+  try {
+    const m = await invokeStrict("remoteMetrics", remoteSelected);
+    renderRemoteMetrics(m);
+  } catch (error) {
+    box.innerHTML = `<div class="winserver-item-reason">采集失败：${escapeHtml(error.message || String(error))}</div>`;
+  }
+}
+
+function remoteMetricBar(label, percent, foot) {
+  const pct = Math.max(0, Math.min(100, Number(percent) || 0));
+  return `<div class="remote-metric-row"><span>${escapeHtml(label)}</span><strong>${pct.toFixed(1)}%</strong></div>
+    <div class="remote-metric-bar"><span style="width:${pct}%"></span></div>
+    <div class="env-uninstall-warn" style="margin:0 0 10px">${escapeHtml(foot)}</div>`;
+}
+
+function renderRemoteMetrics(m) {
+  const box = byId("remote-metrics-body");
+  if (!m || typeof m !== "object") {
+    box.innerHTML = '<div class="winserver-item-reason">没有拿到状态数据</div>';
+    return;
+  }
+  const row = (label, value) => `<div class="remote-metric-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value ?? "—"))}</strong></div>`;
+  box.innerHTML = [
+    `<div class="winserver-monitor-head"><div><div class="winserver-monitor-host">${escapeHtml(m.hostName || "未知主机")}</div>
+      <div class="winserver-monitor-os">${escapeHtml(m.os || "Linux")} · ${escapeHtml(m.osVersion || "")} · ${escapeHtml(m.arch || "")}</div></div></div>`,
+    row("运行时间", m.uptimeText || "—"),
+    row("CPU / 核心", `${Number(m.cpuPercent || 0).toFixed(1)}% / ${m.cpuCores || 0} 核`),
+    row("负载 (1/5/15)", m.load || "—"),
+    remoteMetricBar("内存", m.memoryPercent, `${formatBytes(m.memoryUsedBytes || 0)} / ${formatBytes(m.memoryTotalBytes || 0)}`),
+    remoteMetricBar("根分区", m.diskPercent, `${formatBytes(m.diskUsedBytes || 0)} / ${formatBytes(m.diskTotalBytes || 0)}`),
+  ].join("");
+}
+
+async function browseRemote(path) {
+  const box = byId("remote-files");
+  if (!remoteSelected) {
+    box.innerHTML = '<div class="winserver-item-reason">—</div>';
+    return;
+  }
+  const wanted = path || byId("remote-path").value.trim() || "/";
+  box.innerHTML = '<div class="winserver-item-reason">正在列目录…</div>';
+  try {
+    const result = await invokeStrict("remoteBrowse", remoteSelected, wanted);
+    remotePath = result.path || wanted;
+    byId("remote-path").value = remotePath;
+    renderRemoteFiles(result);
+  } catch (error) {
+    box.innerHTML = `<div class="winserver-item-reason">列目录失败：${escapeHtml(error.message || String(error))}</div>`;
+  }
+}
+
+function renderRemoteFiles(result) {
+  const box = byId("remote-files");
+  const entries = Array.isArray(result?.entries) ? result.entries : [];
+  const parent = result?.parent || "";
+  const rows = [];
+  if (parent) {
+    rows.push(`<button type="button" class="xfer-entry is-dir" data-remote-enter="${escapeHtml(parent)}">
+      <span class="xfer-entry-icon">${icon("arrow-up")}</span><span class="xfer-entry-name">..</span></button>`);
+  }
+  for (const entry of entries) {
+    const name = entry.name || "";
+    const isDir = entry.kind === "dir";
+    const meta = isDir ? "目录" : formatBytes(entry.size || 0);
+    const attr = isDir
+      ? `data-remote-enter="${escapeHtml(joinRemotePath(remotePath, name))}"`
+      : `data-remote-file="${escapeHtml(joinRemotePath(remotePath, name))}"`;
+    rows.push(`<button type="button" class="xfer-entry ${isDir ? "is-dir" : ""}" ${attr}>
+      <span class="xfer-entry-icon">${icon(isDir ? "folder-open" : "file-text")}</span>
+      <span class="xfer-entry-name">${escapeHtml(name)}</span>
+      <span class="xfer-entry-meta">${escapeHtml(meta)}</span></button>`);
+  }
+  box.innerHTML = rows.length ? rows.join("") : '<div class="winserver-item-reason">目录是空的</div>';
+}
+
+function appendRemoteTranscript(text) {
+  remoteTranscript.push(text);
+  // 只留最近 200 行，长时间用下来别让 DOM 无限膨胀
+  if (remoteTranscript.length > 200) remoteTranscript = remoteTranscript.slice(-200);
+  const output = byId("remote-terminal-output");
+  output.textContent = remoteTranscript.join("\n");
+  output.scrollTop = output.scrollHeight;
+}
+
+async function runRemoteCommand(preset) {
+  if (remoteBusy) return;
+  if (!remoteSelected) {
+    setRemoteStatus("先在左侧选一台服务器", true);
+    return;
+  }
+  const input = byId("remote-command");
+  const command = String(preset ?? input.value).trim();
+  if (!command) return;
+  remoteBusy = true;
+  const runButton = byId("remote-run");
+  runButton.disabled = true;
+  setRemoteStatus("正在远端执行…");
+  appendRemoteTranscript(`$ ${command}`);
+  try {
+    const result = await invokeStrict("remoteShellRun", remoteSelected, command);
+    appendRemoteTranscript(result?.output || "（无输出）");
+    setRemoteStatus(result?.truncated ? "输出过长，已截断" : "执行完成");
+    input.value = "";
+  } catch (error) {
+    appendRemoteTranscript(`执行失败：${error.message || String(error)}`);
+    setRemoteStatus(error.message || String(error), true);
+  } finally {
+    remoteBusy = false;
+    runButton.disabled = false;
+    input.focus();
   }
 }
 
@@ -4026,6 +4226,35 @@ function bindEvents() {
   // 服务器管理页的标签切换
   document.querySelectorAll("[data-server-tab]").forEach((button) => {
     button.addEventListener("click", () => setServerTab(button.dataset.serverTab));
+  });
+
+  // 远程界面：选服务器 / 翻文件 / 跑命令
+  byId("remote-server-list").addEventListener("click", (event) => {
+    const pick = event.target.closest("[data-remote-pick]");
+    if (pick) selectRemoteServer(pick.dataset.remotePick);
+  });
+  byId("remote-metrics-refresh").addEventListener("click", () => loadRemoteMetrics());
+  byId("remote-browse").addEventListener("click", () => browseRemote(byId("remote-path").value.trim() || "/"));
+  byId("remote-browse-up").addEventListener("click", () => browseRemote(parentOfRemotePath(remotePath)));
+  byId("remote-path").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); browseRemote(byId("remote-path").value.trim() || "/"); }
+  });
+  byId("remote-files").addEventListener("click", (event) => {
+    const enter = event.target.closest("[data-remote-enter]");
+    if (enter) { browseRemote(enter.dataset.remoteEnter); return; }
+    // 点文件不下载：把完整路径填进路径框，方便复制或拼到命令里
+    const file = event.target.closest("[data-remote-file]");
+    if (file) {
+      byId("remote-path").value = file.dataset.remoteFile;
+      setRemoteStatus("已填入文件路径；下载请用「文件快传」标签");
+    }
+  });
+  byId("remote-run").addEventListener("click", () => runRemoteCommand());
+  byId("remote-command").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); runRemoteCommand(); }
+  });
+  document.querySelectorAll("[data-remote-cmd]").forEach((button) => {
+    button.addEventListener("click", () => runRemoteCommand(button.dataset.remoteCmd));
   });
 
   // Windows 服务器管理（远程，SSH）

@@ -2353,3 +2353,108 @@ dialog[open]::backdrop { animation: fade-in 160ms ease-out; }
 .env-uninstall-row strong { color: var(--text); }
 .env-uninstall-warn { margin-left: auto; color: var(--text-3); font-size: 11px; }
 .env-uninstall-row[data-group="core"] .env-uninstall-warn { color: var(--orange-text); }
+
+/* ==========================================================================
+   远程界面（Web 终端 + 远端文件树 + 系统监控）
+   三栏：服务器/文件 | 终端 | 状态。窄屏按「服务器 → 终端 → 状态」纵向排。
+   ========================================================================== */
+.remote-layout {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr) 280px;
+  gap: 16px;
+  align-items: start;
+}
+.remote-side, .remote-metrics {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  padding: 14px;
+  position: sticky;
+  top: 12px;
+}
+.remote-main { min-width: 0; }
+.remote-server-list { display: flex; flex-direction: column; gap: 6px; margin: 10px 0 4px; }
+.remote-server {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  transition: border-color 140ms, background-color 140ms;
+}
+.remote-server:hover { background: var(--blue-soft); }
+.remote-server.is-active {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+  box-shadow: var(--shadow-card-hover);
+}
+.remote-server strong { color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remote-server small { color: var(--text-3); font: 11px Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remote-files-title { margin-top: 18px; }
+.remote-side .xfer-input-row { margin-top: 10px; }
+.remote-files {
+  margin-top: 10px;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--line-hairline);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.remote-files .xfer-entry { border-bottom-color: var(--line-hairline); }
+.remote-terminal-panel { padding: 16px; }
+.remote-quick { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0 10px; }
+.remote-terminal-output {
+  margin: 0;
+  min-height: 280px;
+  max-height: 460px;
+  overflow: auto;
+  padding: 14px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--line-hairline);
+  background: var(--surface-inset);
+  color: var(--surface-inset-text);
+  font: 12.5px/1.65 Consolas, "Microsoft YaHei UI", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.remote-terminal-output .remote-cmd { color: var(--blue); font-weight: 600; }
+.remote-command-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+}
+.remote-prompt { color: var(--text-3); font: 13px Consolas, monospace; }
+.remote-terminal-status { margin-top: 8px; font-size: 12px; color: var(--text-3); min-height: 18px; }
+.remote-terminal-status.is-error { color: var(--danger-text); }
+.remote-metrics .env-versions-title { display: flex; align-items: center; gap: 8px; }
+.remote-metrics .env-versions-title .icon-button { margin-left: auto; }
+#remote-metrics-body { border: 0; box-shadow: none; padding: 0; margin: 12px 0 0; }
+.remote-metric-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line-hairline);
+  font-size: 12px;
+}
+.remote-metric-row:last-child { border-bottom: 0; }
+.remote-metric-row span { color: var(--text-3); }
+.remote-metric-row strong { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; word-break: break-word; }
+.remote-metric-bar { height: 6px; border-radius: 999px; background: var(--surface-sunken); overflow: hidden; margin: 6px 0 12px; }
+.remote-metric-bar span { display: block; height: 100%; border-radius: 999px; background: var(--blue); transition: width 260ms ease; }
+
+@media (max-width: 1180px) {
+  .remote-layout { grid-template-columns: 240px minmax(0, 1fr); }
+  .remote-metrics { grid-column: 1 / -1; position: static; }
+}
+@media (max-width: 860px) {
+  .remote-layout { grid-template-columns: 1fr; }
+  .remote-side, .remote-metrics { position: static; }
+  .remote-quick { overflow-x: auto; flex-wrap: nowrap; }
+}

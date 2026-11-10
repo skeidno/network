@@ -276,6 +276,7 @@
             <button class="tab is-active" data-server-tab="linux" role="tab"><span class="icon" style="--icon:url('./icons/server.svg')"></span><span>Linux 服务器</span></button>
             <button class="tab" data-server-tab="windows" role="tab"><span class="icon" style="--icon:url('./icons/monitor.svg')"></span><span>Windows 服务器</span></button>
             <button class="tab" data-server-tab="transfer" role="tab"><span class="icon" style="--icon:url('./icons/hard-drive-download.svg')"></span><span>文件快传</span></button>
+            <button class="tab" data-server-tab="remote" role="tab"><span class="icon" style="--icon:url('./icons/monitor.svg')"></span><span>远程界面</span></button>
           </div>
 
           <div id="server-tab-linux" class="server-tab-panel is-active">
@@ -488,6 +489,64 @@
                 <div id="xfer-result" class="xfer-result"><div class="winserver-item-reason">还没传过东西</div></div>
               </div>
             </div>
+          </div>
+          </div>
+
+          <div id="server-tab-remote" class="server-tab-panel">
+          <section class="panel ssh-status-panel">
+            <div class="panel-heading compact">
+              <div class="heading-icon"><span class="icon" style="--icon:url('./icons/monitor.svg')"></span></div>
+              <div><h2>远程界面</h2><p>在一处看服务器状态、翻文件、跑命令 —— 全走已保存的 SSH 凭据，不需要另装客户端</p></div>
+            </div>
+            <details class="info-note compact">
+              <summary><span class="icon" style="--icon:url('./icons/file-text.svg')"></span><span>使用前须知</span></summary>
+              <div class="info-note-body">命令<strong>在选中的远端服务器上执行</strong>，不是本机；用的是「Linux 服务器」列表里保存的账号，请先确认选对了机器。终端是一次执行一条命令（非交互式会话），<code>cd</code> 不会保留到下一次，需要固定目录请用绝对路径或 <code>cd /path &amp;&amp; 命令</code>。文件上传下载请用「文件快传」标签。</div>
+            </details>
+          </section>
+
+          <div class="remote-layout">
+            <aside class="remote-side">
+              <div class="env-versions-title"><span class="icon" style="--icon:url('./icons/server.svg')"></span><span>服务器</span></div>
+              <div id="remote-server-list" class="remote-server-list"></div>
+
+              <div class="env-versions-title remote-files-title"><span class="icon" style="--icon:url('./icons/folder-open.svg')"></span><span>远端文件</span></div>
+              <div class="xfer-input-row">
+                <input id="remote-path" type="text" placeholder="/" spellcheck="false">
+                <button id="remote-browse" type="button" class="button secondary">浏览</button>
+                <button id="remote-browse-up" type="button" class="button secondary" title="上一级" aria-label="上一级"><span class="icon" style="--icon:url('./icons/arrow-up.svg')"></span></button>
+              </div>
+              <div id="remote-files" class="remote-files"></div>
+            </aside>
+
+            <div class="remote-main">
+              <section class="panel remote-terminal-panel">
+                <div class="panel-heading compact">
+                  <div class="heading-icon"><span class="icon" style="--icon:url('./icons/activity.svg')"></span></div>
+                  <div><h2>Web 终端</h2><p>一次一条命令，输出与退出码原样回显</p></div>
+                </div>
+                <div class="remote-quick">
+                  <button type="button" class="button secondary compact-button" data-remote-cmd="uname -a">uname -a</button>
+                  <button type="button" class="button secondary compact-button" data-remote-cmd="df -h">df -h</button>
+                  <button type="button" class="button secondary compact-button" data-remote-cmd="free -h">free -h</button>
+                  <button type="button" class="button secondary compact-button" data-remote-cmd="uptime">uptime</button>
+                  <button type="button" class="button secondary compact-button" data-remote-cmd="systemctl --type=service --state=running">服务</button>
+                </div>
+                <pre id="remote-terminal-output" class="remote-terminal-output">选一台服务器，然后输入命令。</pre>
+                <div class="remote-command-row">
+                  <span class="remote-prompt">$</span>
+                  <input id="remote-command" type="text" placeholder="例如 ls -la /etc" spellcheck="false" autocomplete="off">
+                  <button id="remote-run" type="button" class="button primary"><span class="icon" style="--icon:url('./icons/play.svg')"></span><span>执行</span></button>
+                </div>
+                <div id="remote-terminal-status" class="remote-terminal-status"></div>
+              </section>
+            </div>
+
+            <aside class="remote-metrics">
+              <div class="env-versions-title"><span class="icon" style="--icon:url('./icons/cpu.svg')"></span><span>系统状态</span>
+                <button id="remote-metrics-refresh" type="button" class="icon-button" title="刷新" aria-label="刷新系统状态"><span class="icon" style="--icon:url('./icons/refresh-cw.svg')"></span></button>
+              </div>
+              <div id="remote-metrics-body" class="winserver-monitor"><div class="winserver-item-reason">先在左侧选一台服务器</div></div>
+            </aside>
           </div>
           </div>
         </section>
