@@ -423,7 +423,14 @@ pub fn build(state: &mut AppState) -> Value {
             // 「Linux WebGUI」渲染（隐藏开机自启、关闭到托盘这类只有桌面端
             // 才有意义的设置）。
             "headless": state.headless || !cfg!(windows),
-            "sshDeployment": cfg!(windows),
+            // SSH 客户端、文件快传、远端命令执行都是纯 Rust / POSIX 实现，
+            // 不依赖任何 Windows API —— Linux WebGUI 同样能用整个服务器管理页。
+            // 早期用 cfg!(windows) 一刀切隐藏是错的：底层能力本来就在。
+            "sshDeployment": true,
+            // 只有「打开远程桌面」是本机平台相关的（mstsc.exe 只在 Windows）。
+            // Windows 服务器那些 PowerShell 修复 / 截图都是在**远端**执行的，
+            // Linux 本机照样能用，所以只隐藏 RDP 按钮，不隐藏整个标签。
+            "rdpAvailable": cfg!(windows),
             // Rust 侧只有 importFileText / *PortableConfigText 这类「浏览器读文件、
             // 把内容发回来」的接口，没有原生文件对话框。非 Windows 必须让前端走
             // 浏览器选文件，否则它会去调不存在的 importFile。

@@ -2568,6 +2568,52 @@ fn dialog_test_delay() {
     }
 }
 
+/// 自证钩子：模拟一次慢 SSH 往返（真实终端 / 文件树可能几秒），用来验证
+/// 动作期间 `/api/state` 仍然可用。用异步 sleep 而不是 sleep 阻塞线程，
+/// 行为与等网络 I/O 一致；上限 10 秒，名字带 TEST，正常环境不会命中。
+async fn remote_action_test_delay() {
+    let Ok(value) = std::env::var("NETWORK_MANAGER_REMOTE_ACTION_DELAY_MS") else {
+        return;
+    };
+    let ms = value.parse::<u64>().unwrap_or(0).min(10_000);
+    if ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
+
+/// 远程界面的三个动作统一走这里：只在锁内快照服务器配置与凭据，
+/// SSH 往返全程不持锁，避免 `/api/state` 被堵住（实测一套 SSH 命令几秒）。
+///
+/// 与 `deploy::run` 同构，但只读、不改配置、不写部署状态，所以不需要
+/// 首尾改 busy 的任务卡 —— 前端自己用按钮的 loading 态表示「正在执行」。
+pub async fn run_remote_action(
+    shared: &Shared,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
+    let profile_id = text(&args, 0);
+    if profile_id.is_empty() {
+        return Err("请先选择一台服务器".into());
+    }
+    let (profile, credential) = {
+        let state = shared.lock().await;
+        let profile = srv_profile(&state, &profile_id)?;
+        let credential = crate::credentials::get(&profile.profile_id).unwrap_or_default();
+        (profile, credential)
+    };
+    remote_action_test_delay().await;
+    match method {
+        "remoteShellRun" => {
+            crate::remote::run_shell(&profile, &credential, &text(&args, 1)).await
+        }
+        "remoteBrowse" => {
+            crate::remote::browse(&profile, &credential, &text(&args, 1)).await
+        }
+        "remoteMetrics" => crate::remote::metrics(&profile, &credential).await,
+        _ => Err(format!("不支持的操作：{method}")),
+    }
+}
+
 /// 找出任意一个服务器档案（Linux、Windows 都要）—— 文件快传两侧都得用。
 ///
 /// 与 `win_srv_profile` 分开：那个只认 Windows，是因为它后面执行的是 PowerShell。

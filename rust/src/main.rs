@@ -42,6 +42,8 @@ mod models;
 mod paths;
 mod platform;
 mod portable;
+// Linux 服务器远程界面：Web 终端 + 远端文件树 + 系统监控（走现有 SSH 通道）
+mod remote;
 mod server;
 mod sshclient;
 mod ssh;
