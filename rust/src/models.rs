@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::net::IpAddr;
 
-pub const CONFIG_VERSION: i32 = 16;
+pub const CONFIG_VERSION: i32 = 17;
 pub const DEFAULT_SERVER_PROXY_PORT: i32 = 24443;
 pub const COMMON_OVERSEAS_GROUP: &str = "common-overseas";
 /// 「常用国内站点」规则组 id：一组直连规则，默认整组走 DIRECT。
@@ -533,6 +533,9 @@ pub const DEFAULT_PROXY_DOMAINS: &[(&str, &str)] = &[
     ("chatgpt.com", "ChatGPT / OpenAI"),
     ("oaistatic.com", "ChatGPT / OpenAI"),
     ("oaiusercontent.com", "ChatGPT / OpenAI"),
+    // Codex CLI 接 Azure OpenAI 时走 <resource>.openai.azure.com。用这个后缀
+    // 而不是整个 azure.com：后者会把国内 Azure 的所有流量也一起绕出去。
+    ("openai.azure.com", "Azure OpenAI"),
     ("claude.ai", "Claude / Anthropic"),
     ("anthropic.com", "Claude / Anthropic"),
     ("perplexity.ai", "Perplexity"),
@@ -614,6 +617,14 @@ pub const DEFAULT_PROXY_KEYWORDS: &[(&str, &str)] = &[
     ("anthropic", "Claude / Anthropic（含 API 与 CDN 域名）"),
 ];
 
+/// 本次（v17）新加进 [`DEFAULT_PROXY_DOMAINS`] 的域名。
+///
+/// 老配置升级时**只补这几条**，不用 [`PROXY_DOMAINS_V11`] 的差集：那个差集
+/// 是拿 v12 之前的旧清单算的，会连用户后来手动删掉的 `cursor.com` 之类
+/// 一起塞回来。这里按版本记增量，删过的旧条目就不受影响。
+/// 以后再扩清单，往这里加一条并把 CONFIG_VERSION +1 即可。
+pub const PROXY_DOMAINS_V17_ADDED: &[(&str, &str)] = &[("openai.azure.com", "Azure OpenAI")];
+
 /// 上一版内置的域名快照（v12 之前）。
 ///
 /// 「常用海外站点」不是每次启动算出来的派生数据，而是实实在在写进配置文件的
@@ -621,7 +632,8 @@ pub const DEFAULT_PROXY_KEYWORDS: &[(&str, &str)] = &[
 /// 自动出现。升级时要把新域名补进去，但用户自己删掉过的条目不能被塞回来 ——
 /// 只能拿新旧清单做差集，这时就需要上一版的快照。
 ///
-/// 下次再扩充上面的清单时，把当时的旧列表挪到这里即可。
+/// 这个快照只服务 v12 那一次迁移；之后再扩清单走 [`PROXY_DOMAINS_V17_ADDED`]
+/// 这类「按版本记增量」的方式，不要再改这里。
 pub const PROXY_DOMAINS_V11: &[&str] = &[
     "discord.com",
     "discordapp.com",

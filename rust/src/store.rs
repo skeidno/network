@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::models::{
     AppConfig, RoutingRule, COMMON_CHINA_GROUP, COMMON_OVERSEAS_GROUP, DEFAULT_DIRECT_DOMAINS,
-    DEFAULT_PROXY_DOMAINS, DEFAULT_PROXY_KEYWORDS, PROXY_DOMAINS_V11,
+    DEFAULT_PROXY_DOMAINS, DEFAULT_PROXY_KEYWORDS, PROXY_DOMAINS_V11, PROXY_DOMAINS_V17_ADDED,
 };
 use crate::paths::settings_path;
 
@@ -92,6 +92,9 @@ fn migrate(config: &mut AppConfig, stored_version: i64) -> bool {
     }
     if stored_version < 16 {
         changed = append_proxy_keywords(config) || changed;
+    }
+    if stored_version < 17 {
+        changed = append_domains(config, PROXY_DOMAINS_V17_ADDED) || changed;
     }
     changed
 }
@@ -205,12 +208,25 @@ fn append_china_group(config: &mut AppConfig) -> bool {
     true
 }
 
-/// 把新版本追加进去的内置域名补到已有配置里。
+/// v12 的一次性迁移：按 [`PROXY_DOMAINS_V11`] 差集把当时扩充的域名补进来。
 ///
-/// 只补用户「还没见过」的：差集用 [`PROXY_DOMAINS_V11`] 算，用户自己删掉过的
-/// 旧域名不会被塞回来。整组都被删掉时同样不重建 —— 那多半是主动的选择。
-/// 新条目沿用组内现有成员的去向和开关状态，不会出现「补齐后整组变成半启用」。
+/// 之后的版本别再复用这个差集（会把用户删掉的旧条目一起塞回来），
+/// 改用 [`append_domains`] + 按版本记增量的 `PROXY_DOMAINS_V*_ADDED`。
 fn append_new_domains(config: &mut AppConfig) -> bool {
+    let candidates: Vec<(&str, &str)> = DEFAULT_PROXY_DOMAINS
+        .iter()
+        .copied()
+        .filter(|(domain, _)| !PROXY_DOMAINS_V11.contains(domain))
+        .collect();
+    append_domains(config, &candidates)
+}
+
+/// 把 `candidates` 里还缺的内置域名补进海外组。
+///
+/// 整组都被删掉时不重建 —— 那多半是用户主动的选择。新条目沿用组内现有成员的
+/// 去向和开关状态，不会出现「补齐后整组变成半启用」；插入位置在组内最后一条
+/// 之后，保证这一组在规则列表里仍然挨在一起。
+fn append_domains(config: &mut AppConfig, candidates: &[(&str, &str)]) -> bool {
     let mut insert_after: Option<usize> = None;
     let mut sample: Option<(String, bool)> = None;
     let mut present: Vec<String> = Vec::new();
@@ -235,11 +251,9 @@ fn append_new_domains(config: &mut AppConfig) -> bool {
         return false;
     };
     let (target, enabled) = sample.unwrap_or_else(|| ("CLASH".to_string(), true));
-    let added: Vec<RoutingRule> = DEFAULT_PROXY_DOMAINS
+    let added: Vec<RoutingRule> = candidates
         .iter()
-        .filter(|(domain, _)| {
-            !PROXY_DOMAINS_V11.contains(domain) && !present.iter().any(|value| value == *domain)
-        })
+        .filter(|(domain, _)| !present.iter().any(|value| value == *domain))
         .map(|(domain, label)| RoutingRule {
             rule_type: "DOMAIN-SUFFIX".into(),
             value: (*domain).into(),
@@ -252,7 +266,6 @@ fn append_new_domains(config: &mut AppConfig) -> bool {
     if added.is_empty() {
         return false;
     }
-    // 插到组内最后一条之后，让这一组在规则列表里仍然挨在一起。
     let tail = config.rules.split_off(position);
     config.rules.extend(added);
     config.rules.extend(tail);
@@ -532,6 +545,62 @@ mod tests {
             Some("my-rule.example"),
             "兜底不能压到用户自定义规则前面"
         );
+    }
+
+    #[test]
+    fn azure_openai_is_in_fresh_default_rules() {
+        let rules = default_routing_rules();
+        let hit = rules
+            .iter()
+            .find(|rule| rule.value == "openai.azure.com")
+            .expect("新配置必须内置 Azure OpenAI 后缀");
+        assert_eq!(hit.rule_type, "DOMAIN-SUFFIX");
+        assert_eq!(hit.target, "CLASH");
+        assert_eq!(hit.group, COMMON_OVERSEAS_GROUP);
+    }
+
+    #[test]
+    fn v17_migration_seeds_azure_openai_once() {
+        // 模拟 v16 老配置：默认规则齐全，唯独还没有本次新增的 Azure OpenAI。
+        let mut config = AppConfig::default();
+        config.rules = default_routing_rules()
+            .into_iter()
+            .filter(|rule| rule.value != "openai.azure.com")
+            .collect();
+        config.version = 16;
+
+        assert!(migrate(&mut config, 16), "v16 升级必须补上新域名");
+        let hits: Vec<&RoutingRule> = config
+            .rules
+            .iter()
+            .filter(|rule| rule.value == "openai.azure.com")
+            .collect();
+        assert_eq!(hits.len(), 1, "只补一条，不能重复");
+        assert_eq!(hits[0].group, COMMON_OVERSEAS_GROUP);
+        assert_eq!(hits[0].target, "CLASH");
+        assert!(hits[0].enabled, "补齐后不能变成半启用");
+        assert!(!migrate(&mut config, 17), "重复迁移不能加两遍");
+    }
+
+    #[test]
+    fn v17_migration_leaves_user_deleted_domains_alone() {
+        // 不用 V11 差集的原因：那个差集会把用户手动删掉的旧域名一起塞回来。
+        let mut config = AppConfig::default();
+        config.rules = default_routing_rules()
+            .into_iter()
+            .filter(|rule| rule.value != "openai.azure.com" && rule.value != "cursor.com")
+            .collect();
+        config.version = 16;
+
+        assert!(migrate(&mut config, 16));
+        assert!(
+            !config.rules.iter().any(|rule| rule.value == "cursor.com"),
+            "用户之前删掉的旧域名不能被 v17 迁移塞回来"
+        );
+        assert!(config
+            .rules
+            .iter()
+            .any(|rule| rule.value == "openai.azure.com"));
     }
 }
 
