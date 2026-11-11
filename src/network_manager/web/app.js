@@ -3846,6 +3846,22 @@ function cycleTheme() {
   applyTheme(next);
 }
 
+// 外层容器只负责铺满窗口，真正能滚的只有 #page-content。但 html/body 的
+// overflow:hidden 只是藏掉滚动条，Chromium 仍会因「把焦点元素滚进视口」或
+// scrollIntoView 去滚根容器 —— 一旦滚了，整个 #app-shell 会整体位移，侧栏导航
+// 和顶栏被推出视口，用户又没有滚动条能滚回来（表现就是界面变形）。
+// CSS 已把隐藏 checkbox 的定位父级补上，这里再兜一层：任何根容器滚动立刻归零。
+function lockRootScroll() {
+  const reset = () => {
+    const root = document.scrollingElement;
+    if (root && root.scrollTop) root.scrollTop = 0;
+    if (document.body.scrollTop) document.body.scrollTop = 0;
+  };
+  document.addEventListener("scroll", reset, { capture: true, passive: true });
+  window.addEventListener("resize", reset);
+  reset();
+}
+
 function bindScrollShadow() {
   const scroller = byId("page-content");
   const update = () => document.body.classList.toggle("page-scrolled", scroller.scrollTop > 0);
@@ -4335,6 +4351,7 @@ function bindEvents() {
 
 function initialize() {
   window.networkManagerReady = false;
+  lockRootScroll();
   applyTheme(readStoredTheme());
   bindEvents();
   document.addEventListener("visibilitychange", () => scheduleStateRefresh(document.hidden ? 10000 : 0));

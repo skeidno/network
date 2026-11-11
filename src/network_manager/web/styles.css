@@ -859,7 +859,13 @@ label > small { display: block; margin-top: 5px; color: var(--text-3); font-size
 .portable-config-row small { margin-top: 5px; color: var(--text-3); font-size: 11px; }
 .portable-config-actions { display: flex; flex: 0 0 auto; gap: 8px; }
 .switch-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 28px; }
-.switch-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; min-height: 65px; border-top: 1px solid var(--line-hairline); }
+/* 隐藏的 1px checkbox 是 position:absolute。父级不给定位上下文的话，它的包含块
+   会落到初始包含块（<html>），静态位置按整份设置页算到 y≈1600，把
+   documentElement.scrollHeight 从视口高度撑到 1600+。overflow:hidden 只是藏了滚动条，
+   根容器依然能被焦点滚动：点最下面的开关（随 Windows 登录启动）时浏览器把 checkbox
+   滚进视口，整个 #app-shell 上移 600+px，侧栏导航和顶栏一起滚出视口且滚不回来，
+   看起来就是「页面变形」。给开关行补上定位上下文，隐藏 input 不再撑高根容器。 */
+.switch-row { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 20px; min-height: 65px; border-top: 1px solid var(--line-hairline); }
 .switch-row:nth-child(-n + 2) { border-top: 0; }
 .switch-row > span { margin: 0; }
 .switch-row strong, .switch-row small { display: block; }
