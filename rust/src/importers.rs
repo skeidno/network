@@ -116,8 +116,10 @@ pub fn parse_ss_link(link: &str) -> Result<Value, String> {
     let (host, port) = host_part
         .rsplit_once(':')
         .ok_or("ss 链接缺少端口")?;
+    // 端口后面可能跟着路径或查询串（`1.2.3.4:8388/?plugin=…`、`127.0.0.1:1080?udp=0`），
+    // 机场的广告行就爱这么写，不切干净整条链接会被判「ss 端口无效」导不进来。
     let port: i32 = port
-        .split('/')
+        .split(['/', '?'])
         .next()
         .unwrap_or("0")
         .parse()
@@ -536,6 +538,11 @@ fn unstructured_nodes(text: &str) -> (Vec<Value>, Vec<String>) {
         if line.matches(':').count() < 3 {
             continue;
         }
+        // 订阅头部那种 `STATUS=Traffic: 0.00 GiB | Expires: 2026-12-19 00:51:42 +0800 CST`
+        // 也带好几个冒号，但它有等号/空格/竖线，绝不是代理行 —— 别把它算成一条导入失败。
+        if line.contains('=') || line.contains('|') || line.chars().any(char::is_whitespace) {
+            continue;
+        }
         match parse_authenticated_proxy_line(line) {
             Ok(node) => nodes.push(node),
             Err(error) => errors.push(format!("第 {} 行代理 IP：{error}", index + 1)),
@@ -757,5 +764,24 @@ mod tests {
         let node = parse_trojan_link(link).expect("应该能解析");
         assert_eq!(node["sni"], "cdn.example.com");
         assert_eq!(node["skip-cert-verify"], true);
+    }
+
+    #[test]
+    fn ss_port_survives_query_string() {
+        // 机场的广告行：`ss://…@127.0.0.1:1080?udp=0#官方网址`。
+        let node = parse_ss_link("YWVzLTEyOC1nY206bm9uZQ==@127.0.0.1:1080?udp=0").expect("应该能解析");
+        assert_eq!(node["port"], 1080);
+    }
+
+    #[test]
+    fn subscription_header_is_not_counted_as_a_failed_row() {
+        // 订阅开头的 `STATUS=Traffic: 0.00 GiB/100.00 GiB | Expires: ...` 带四个冒号，
+        // 但它是头信息；当成代理 IP 行报错会让「导入成功」旁边永远挂一条失败。
+        let text = "REMARKS=机场\n\
+                    STATUS=Traffic: 0.00 GiB/100.00 GiB | Expires: 2026-12-19 00:51:42 +0800 CST\n\
+                    ss://YWVzLTEyOC1nY206bm9uZQ==@127.0.0.1:1080?udp=0#网址";
+        let (nodes, errors) = parse_import_content(text).expect("应该能导入");
+        assert_eq!(nodes.len(), 1);
+        assert!(errors.is_empty(), "头信息不该报错：{errors:?}");
     }
 }
