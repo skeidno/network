@@ -167,16 +167,31 @@ pub(crate) fn is_loopback_server(server: &str) -> bool {
     }
 }
 
-/// 节点级必填字段兜底：把「内核会为此整份拒绝」的残缺节点清理干净。
+/// 节点级必填字段兜底。返回 false 表示这个节点整条都不能要。
 ///
 /// 起因是 hysteria2 的 `obfs: salamander`：内核解析时要求同时给出 `obfs-password`，
 /// 缺一个就直接 `Parse config error: proxy N: missing obfs password` **整份** fatal
 /// 退出 —— 不是这一个节点不可用，而是整个接管都起不来，而且守护会自动重试形成死循环。
 /// 订阅方给的节点本来就常有字段残缺，节点又是原样透传的，所以只能渲染前统一收口：
 /// 少一层混淆还能连，整份配置被拒就全完。
-fn sanitize_node_proxy(proxy: &mut serde_json::Map<String, Value>) {
+///
+/// 端口同理：机场常在节点列表里塞「剩余流量：101 GB / 套餐到期」这类信息伪节点
+/// （`port: 0`），内核报 `proxy N: invalid port` 一样是整份拒绝，只能丢掉这条。
+fn sanitize_node_proxy(proxy: &mut serde_json::Map<String, Value>) -> bool {
+    // 端口必须是 1..=65535 的整数：订阅里写成字符串 `"443"` 内核同样不认。
+    let port = match proxy.get("port") {
+        Some(Value::Number(number)) => number.as_i64(),
+        Some(Value::String(text)) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    };
+    match port {
+        Some(port) if (1..=65535).contains(&port) => {
+            proxy.insert("port".into(), json!(port));
+        }
+        _ => return false,
+    }
     if proxy.get("type").and_then(Value::as_str) != Some("hysteria2") {
-        return;
+        return true;
     }
     let obfs = proxy
         .get("obfs")
@@ -195,6 +210,7 @@ fn sanitize_node_proxy(proxy: &mut serde_json::Map<String, Value>) {
         proxy.remove("obfs");
         proxy.remove("obfs-password");
     }
+    true
 }
 
 /// 本地 DNS 映射里指向内网地址的那几条，生成显式直连规则。
@@ -248,7 +264,7 @@ pub fn normalize_rule_value(rule_type: &str, value: &str) -> String {
 /// 补进的 `DOMAIN-KEYWORD,claude,UPSTREAM-CLASH` 在「上游 Clash 已关、改用内置
 /// 节点」的机器上正好踩中：点一次接管内核死一次，守护又按退避反复拉起，界面
 /// 表现就是「接管反复被取消」。
-fn available_targets(config: &AppConfig, proxies: &[Value]) -> HashSet<String> {
+fn available_targets(config: &AppConfig, proxies: &[Value], node_group: bool) -> HashSet<String> {
     let mut names: HashSet<String> = ["DIRECT", "REJECT", "PASS", "REJECT-DROP"]
         .iter()
         .map(|name| (*name).to_string())
@@ -258,7 +274,7 @@ fn available_targets(config: &AppConfig, proxies: &[Value]) -> HashSet<String> {
             names.insert(name.to_string());
         }
     }
-    if !config.imported_nodes.is_empty() {
+    if node_group {
         names.insert(target_name("BUILTIN"));
         names.insert("SMART-NODES".into());
     }
@@ -266,8 +282,11 @@ fn available_targets(config: &AppConfig, proxies: &[Value]) -> HashSet<String> {
 }
 
 /// 目标不存在时退到这里：有内置节点就走节点组，否则直连，绝不留一个死名字。
-fn fallback_target(config: &AppConfig) -> String {
-    if config.imported_nodes.is_empty() {
+///
+/// `node_group` 必须是「真的渲染出了节点组」——节点全部被判废时组不会生成，
+/// 这时候再退回 `IMPORTED-NODES` 又是一个不存在的名字。
+fn fallback_target(config: &AppConfig, node_group: bool) -> String {
+    if config.imported_nodes.is_empty() || !node_group {
         "DIRECT".into()
     } else {
         target_name("BUILTIN")
@@ -429,6 +448,9 @@ pub fn build(config: &AppConfig) -> Value {
         }));
     }
     let relay = global_relay(config);
+    // 真正渲染出去的节点名。proxy-groups 必须只引用这个表：引用了被判废的节点名，
+    // 内核同样整份 fatal（`proxy group: node not found`）。
+    let mut node_names: Vec<String> = Vec::new();
     for node in &config.imported_nodes {
         if let Value::Object(map) = &node.config {
             let mut proxy = serde_json::Map::new();
@@ -440,7 +462,9 @@ pub fn build(config: &AppConfig) -> Value {
                 }
                 proxy.insert(key.clone(), value.clone());
             }
-            sanitize_node_proxy(&mut proxy);
+            if !sanitize_node_proxy(&mut proxy) {
+                continue;
+            }
             // 中转自己不能挂自己，否则握手时会无限找拨号代理。
             // 指向本机回环的节点也不能挂：中转在远端，它连的是自己那台机器的
             // 127.0.0.1，永远到不了我们本机这个端口。
@@ -451,19 +475,26 @@ pub fn build(config: &AppConfig) -> Value {
             if !relay.is_empty() && relay != node.name() && !is_loopback_server(server) {
                 proxy.insert("dialer-proxy".into(), Value::String(relay.clone()));
             }
+            node_names.push(node.name());
             proxies.push(Value::Object(proxy));
         }
     }
+    // 节点全被判废时不生成节点组：空 proxies 的 proxy-group 同样会让内核退出。
+    let node_group = !node_names.is_empty();
+    if node_names.contains(&config.selected_node) {
+        node_names.retain(|name| name != &config.selected_node);
+        node_names.insert(0, config.selected_node.clone());
+    }
 
     // 规则里所有出口名都必须真的存在，缺失的一律降级，避免 mihomo 整份配置 fatal。
-    let available = available_targets(config, &proxies);
-    let fallback = fallback_target(config);
+    let available = available_targets(config, &proxies, node_group);
+    let fallback = fallback_target(config, node_group);
 
     // 检测入站必须排在最前面：它要压过下面的 `PROCESS-NAME,NetworkManager.exe,DIRECT`，
     // 否则代理出口检测又会退化成直连（见 PROBE_LISTENER_NAME 的说明）。
     let probe_port = probe_port(config);
     let mut rules: Vec<String> = Vec::new();
-    if !config.imported_nodes.is_empty() {
+    if node_group {
         rules.push(format!("IN-PORT,{probe_port},{}", target_name("BUILTIN")));
     }
     rules.extend(
@@ -587,12 +618,7 @@ pub fn build(config: &AppConfig) -> Value {
         );
     }
 
-    if !config.imported_nodes.is_empty() {
-        let mut node_names: Vec<String> = config.imported_nodes.iter().map(|n| n.name()).collect();
-        if node_names.contains(&config.selected_node) {
-            node_names.retain(|name| name != &config.selected_node);
-            node_names.insert(0, config.selected_node.clone());
-        }
+    if node_group {
         result["proxy-groups"] = json!([
             {"name": target_name("BUILTIN"), "type": "select", "proxies": node_names},
             {
@@ -946,6 +972,45 @@ mod tests {
         let proxy = node(&proxies);
         assert_eq!(proxy["obfs"], "salamander");
         assert_eq!(proxy["obfs-password"], "s3cr3t");
+    }
+
+    #[test]
+    fn node_without_usable_port_is_dropped() {
+        // 机场常在节点列表里塞「剩余流量 / 套餐到期」伪节点（port: 0），
+        // 内核报 `proxy N: invalid port` 同样是整份配置直接退出。
+        let mut config = relay_config(&["正常节点", "剩余流量：1 GB"]);
+        if let Value::Object(map) = &mut config.imported_nodes[1].config {
+            map.insert("port".into(), json!(0));
+        }
+        let value = build(&config);
+        let proxies = value["proxies"].as_array().expect("proxies").clone();
+        assert!(!proxies
+            .iter()
+            .any(|proxy| proxy["name"] == Value::String("剩余流量：1 GB".into())));
+        let names: Vec<&str> = value["proxy-groups"][0]["proxies"]
+            .as_array()
+            .expect("组内节点")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(names, vec!["正常节点"], "组里不能引用被判废的节点");
+    }
+
+    #[test]
+    fn no_usable_node_means_no_node_group() {
+        // 节点全被判废时不能生成空 proxies 的组，规则也不能退回一个不存在的组名。
+        let mut config = relay_config(&["伪节点"]);
+        if let Value::Object(map) = &mut config.imported_nodes[0].config {
+            map.insert("port".into(), json!(0));
+        }
+        let value = build(&config);
+        assert!(value.get("proxy-groups").is_none(), "不该有节点组：{value}");
+        assert!(
+            !rules_of(&value)
+                .iter()
+                .any(|rule| rule.contains("IMPORTED-NODES")),
+            "规则不能指向不存在的组"
+        );
     }
 
     #[test]
