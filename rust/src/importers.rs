@@ -83,6 +83,21 @@ fn parse_query(text: &str) -> HashMap<String, String> {
 
 use std::collections::HashMap;
 
+/// 链接里那些「有就是真」的开关（`insecure=1`、`allowInsecure=true`、`udp=1`）。
+///
+/// 各家客户端写 `1` / `true` / 空的都有，逐个 `== "1"` 比会漏。
+fn query_flag(query: &HashMap<String, String>, keys: &[&str]) -> bool {
+    keys.iter().any(|key| {
+        query
+            .get(*key)
+            .map(|value| {
+                let value = value.trim();
+                value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false)
+    })
+}
+
 pub fn parse_ss_link(link: &str) -> Result<Value, String> {
     let (head, name) = split_name(link);
     let body = head.strip_prefix("ss://").unwrap_or(head);
@@ -181,7 +196,7 @@ pub fn parse_vless_link(link: &str) -> Result<Value, String> {
     let (host_part, query_text) = host_part.split_once('?').unwrap_or((host_part, ""));
     let query = parse_query(query_text);
     let (host, port) = host_part.rsplit_once(':').ok_or("vless 链接缺少端口")?;
-    let port: i32 = port.parse().unwrap_or(0);
+    let port: i32 = port.trim_end_matches('/').parse().unwrap_or(0);
     let mut node = json!({
         "name": if name.is_empty() { format!("{host}:{port}") } else { name },
         "type": "vless",
@@ -196,11 +211,43 @@ pub fn parse_vless_link(link: &str) -> Result<Value, String> {
         if let Some(sni) = query.get("sni") {
             node["servername"] = json!(sni);
         }
+        // uTLS 指纹。Reality 必须与节点一致，不带的话内核用自己的默认值，
+        // 服务端认的却是链接里写的那一个。
+        if let Some(fp) = query.get("fp") {
+            if !fp.is_empty() {
+                node["client-fingerprint"] = json!(fp);
+            }
+        }
+    }
+    // Reality 只写 `tls: true` 是不够的：内核拿不到公钥就只能当普通 TLS 握手，
+    // 服务端直接拒。订阅里的 vless 目前全是 reality，这一条决定它们能不能连。
+    if security == "reality" {
+        let public_key = query.get("pbk").cloned().unwrap_or_default();
+        if !public_key.is_empty() {
+            node["reality-opts"] = json!({
+                "public-key": public_key,
+                "short-id": query.get("sid").cloned().unwrap_or_default(),
+            });
+        }
+    }
+    if let Some(flow) = query.get("flow") {
+        if !flow.is_empty() {
+            node["flow"] = json!(flow);
+        }
+    }
+    if query_flag(&query, &["insecure", "allowInsecure"]) {
+        node["skip-cert-verify"] = json!(true);
     }
     match query.get("type").cloned().unwrap_or_default().as_str() {
         "ws" => {
             node["network"] = json!("ws");
-            node["ws-opts"] = json!({"path": query.get("path").cloned().unwrap_or_default()});
+            let mut opts = json!({"path": query.get("path").cloned().unwrap_or_default()});
+            if let Some(host) = query.get("host") {
+                if !host.is_empty() {
+                    opts["headers"] = json!({"Host": host});
+                }
+            }
+            node["ws-opts"] = opts;
         }
         "grpc" => {
             node["network"] = json!("grpc");
@@ -218,7 +265,7 @@ pub fn parse_trojan_link(link: &str) -> Result<Value, String> {
     let (host_part, query_text) = host_part.split_once('?').unwrap_or((host_part, ""));
     let query = parse_query(query_text);
     let (host, port) = host_part.rsplit_once(':').ok_or("trojan 链接缺少端口")?;
-    let port: i32 = port.parse().unwrap_or(0);
+    let port: i32 = port.trim_end_matches('/').parse().unwrap_or(0);
     let mut node = json!({
         "name": if name.is_empty() { format!("{host}:{port}") } else { name },
         "type": "trojan",
@@ -227,8 +274,34 @@ pub fn parse_trojan_link(link: &str) -> Result<Value, String> {
         "password": userinfo,
         "udp": true,
     });
-    if let Some(sni) = query.get("sni") {
+    // `peer` 是旧客户端沿用的 SNI 写法，和 sni 同义。
+    let sni = query
+        .get("sni")
+        .or_else(|| query.get("peer"))
+        .cloned()
+        .unwrap_or_default();
+    if !sni.is_empty() {
         node["sni"] = json!(sni);
+    }
+    if query_flag(&query, &["allowInsecure", "insecure"]) {
+        node["skip-cert-verify"] = json!(true);
+    }
+    match query.get("type").cloned().unwrap_or_default().as_str() {
+        "ws" => {
+            node["network"] = json!("ws");
+            let mut opts = json!({"path": query.get("path").cloned().unwrap_or_default()});
+            if let Some(host) = query.get("host") {
+                if !host.is_empty() {
+                    opts["headers"] = json!({"Host": host});
+                }
+            }
+            node["ws-opts"] = opts;
+        }
+        "grpc" => {
+            node["network"] = json!("grpc");
+            node["grpc-opts"] = json!({"grpc-service-name": query.get("serviceName").cloned().unwrap_or_default()});
+        }
+        _ => {}
     }
     Ok(node)
 }
@@ -254,6 +327,18 @@ pub fn parse_hysteria2_link(link: &str) -> Result<Value, String> {
     });
     if let Some(sni) = query.get("sni") {
         node["sni"] = json!(sni);
+    }
+    // 自签证书的机场全靠这个：不写就是 TLS 校验失败，节点看起来「通了但连不上」。
+    if query_flag(&query, &["insecure", "allowInsecure"]) {
+        node["skip-cert-verify"] = json!(true);
+    }
+    // 端口跳跃：服务端在一个区间里随机换端口收包，链接用 `mport=35000-39000` 表达，
+    // mihomo 对应的是 `ports`（字符串，原样传）。
+    if let Some(ports) = query.get("mport") {
+        let ports = ports.trim();
+        if !ports.is_empty() {
+            node["ports"] = json!(ports);
+        }
     }
     // hysteria2 的混淆（salamander）必须「类型 + 密码」成对出现。
     // 只搬 obfs 而漏掉密码，内核会 `missing obfs password` 把**整份**配置拒掉，
@@ -631,5 +716,46 @@ mod tests {
         // `hysteria2://…@host:443/?sni=…` 带斜杠时端口不能退化成 0。
         let node = parse_hysteria2_link("pass@example.com:443/?sni=apple.com").unwrap();
         assert_eq!(node["port"], 443);
+    }
+
+    #[test]
+    fn real_airport_hysteria2_link_is_fully_carried_over() {
+        // 真实订阅里的原文（supermanrex 的台湾节点）。旧解析器只留下了 port 0 +
+        // 没有密码的 obfs —— 三处字段全丢。这里逐条钉住。
+        let link = "pass@fktw1keria.itknowledgeblog.com:443/?sni=apple.com&insecure=1\
+                    &obfs=salamander&obfs-password=me1iak4u5hqgioyl&mport=35000-39000&udp=1&tfo=1#台湾";
+        let node = parse_hysteria2_link(link).expect("应该能解析");
+        assert_eq!(node["port"], 443);
+        assert_eq!(node["sni"], "apple.com");
+        assert_eq!(node["obfs"], "salamander");
+        assert_eq!(node["obfs-password"], "me1iak4u5hqgioyl");
+        assert_eq!(node["skip-cert-verify"], true, "自签证书必须跳过校验");
+        assert_eq!(node["ports"], "35000-39000", "端口跳跃");
+    }
+
+    #[test]
+    fn vless_reality_keeps_public_key_and_flow() {
+        // 订阅里的 vless 全是 reality：只搬 tls+servername 是连不上的。
+        let link = "0c482ed5@fkus1keria.itknowledgeblog.com:443?encryption=none\
+                    &flow=xtls-rprx-vision&security=reality&sni=portal.citygrainla.com\
+                    &fp=chrome&pbk=SbVKOEMj4Xg2qN7vYWPUhLmT3rZd1c&sid=a1b2c3&type=tcp&udp=1#美国 VIP 01";
+        let node = parse_vless_link(link).expect("应该能解析");
+        assert_eq!(node["tls"], true);
+        assert_eq!(node["servername"], "portal.citygrainla.com");
+        assert_eq!(node["client-fingerprint"], "chrome");
+        assert_eq!(node["flow"], "xtls-rprx-vision");
+        assert_eq!(
+            node["reality-opts"]["public-key"],
+            "SbVKOEMj4Xg2qN7vYWPUhLmT3rZd1c"
+        );
+        assert_eq!(node["reality-opts"]["short-id"], "a1b2c3");
+    }
+
+    #[test]
+    fn trojan_accepts_peer_and_allow_insecure() {
+        let link = "pw@example.com:443?allowInsecure=1&peer=cdn.example.com&type=tcp#T";
+        let node = parse_trojan_link(link).expect("应该能解析");
+        assert_eq!(node["sni"], "cdn.example.com");
+        assert_eq!(node["skip-cert-verify"], true);
     }
 }
