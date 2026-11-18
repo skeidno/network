@@ -1069,6 +1069,13 @@ async fn download_subscription(
             node.group = source.group.clone();
         }
     }
+    // 节点是按新的解析规则重建的，同名也不代表还是同一个东西（端口、reality 公钥、
+    // 自签证书都可能刚被补上）。旧名字上留着的测速结果必须一起清掉，否则界面会把
+    // 「刷新前那次全红」原样贴回新节点上 —— 表现就是内核里六成节点明明是通的，
+    // 列表却整片显示异常，用户以为全废了。
+    for name in &previous_names {
+        state.node_delays.remove(name);
+    }
     let gone: Vec<String> = previous_names
         .into_iter()
         .filter(|name| !fresh.contains(name))
