@@ -401,12 +401,17 @@ object SingBoxConfigBuilder {
         addTls(outbound, raw, type)
         addTransport(outbound, raw)
         if (type == "hysteria2") {
-            raw.optString("obfs").takeIf(String::isNotBlank)?.let { obfsType ->
+            // 混淆必须「类型 + 密码」成对出现：sing-box 见到只有 type 的 obfs 会
+            // `obfs: password is required` 直接拒绝整份配置，连其它节点一起废掉。
+            // 订阅里字段残缺很常见，缺密码就整对丢掉，少一层混淆仍能连。
+            val obfsType = raw.optString("obfs")
+            val obfsPassword = raw.optString("obfs-password")
+            if (obfsType.isNotBlank() && !obfsType.equals("none", true) && obfsPassword.isNotBlank()) {
                 outbound.put(
                     "obfs",
                     JSONObject()
                         .put("type", obfsType)
-                        .put("password", raw.optString("obfs-password")),
+                        .put("password", obfsPassword),
                 )
             }
         }

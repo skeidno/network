@@ -241,7 +241,9 @@ pub fn parse_hysteria2_link(link: &str) -> Result<Value, String> {
     let (host_part, query_text) = host_part.split_once('?').unwrap_or((host_part, ""));
     let query = parse_query(query_text);
     let (host, port) = host_part.rsplit_once(':').ok_or("hysteria2 链接缺少端口")?;
-    let port: i32 = port.parse().unwrap_or(0);
+    // `hysteria2://…:443/?sni=…` 这种带斜杠的写法很常见，端口后面得先把 `/` 去掉，
+    // 否则 `parse` 失败会静默退化成 0 端口节点。
+    let port: i32 = port.trim_end_matches('/').parse().unwrap_or(0);
     let mut node = json!({
         "name": if name.is_empty() { format!("{host}:{port}") } else { name },
         "type": "hysteria2",
@@ -253,8 +255,26 @@ pub fn parse_hysteria2_link(link: &str) -> Result<Value, String> {
     if let Some(sni) = query.get("sni") {
         node["sni"] = json!(sni);
     }
-    if let Some(obfs) = query.get("obfs") {
+    // hysteria2 的混淆（salamander）必须「类型 + 密码」成对出现。
+    // 只搬 obfs 而漏掉密码，内核会 `missing obfs password` 把**整份**配置拒掉，
+    // 接管直接起不来；所以缺密码时整对丢掉 —— 少一层混淆仍能连。
+    // `obfsParam` 是部分机场/客户端沿用的老写法，和 obfs-password 同义。
+    let obfs = query
+        .get("obfs")
+        .map(|value| value.trim())
+        .unwrap_or_default();
+    let obfs_password = query
+        .get("obfs-password")
+        .or_else(|| query.get("obfs_password"))
+        .or_else(|| query.get("obfsParam"))
+        .map(|value| value.trim())
+        .unwrap_or_default();
+    if !obfs.is_empty()
+        && !obfs.eq_ignore_ascii_case("none")
+        && !obfs_password.is_empty()
+    {
         node["obfs"] = json!(obfs);
+        node["obfs-password"] = json!(obfs_password);
     }
     Ok(node)
 }
@@ -579,5 +599,37 @@ mod tests {
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0]["type"], "ss");
         assert_eq!(nodes[1]["type"], "http");
+    }
+
+    #[test]
+    fn hysteria2_obfs_keeps_its_password() {
+        // 混淆类型和密码必须成对搬走：只留 obfs 会让内核 `missing obfs password`
+        // 把整份配置拒掉（接管直接起不来）。
+        let node =
+            parse_hysteria2_link("pass@example.com:443?sni=apple.com&obfs=salamander&obfs-password=s3cr3t#TW")
+                .expect("hy2 链接应该能解析");
+        assert_eq!(node["port"], 443);
+        assert_eq!(node["obfs"], "salamander");
+        assert_eq!(node["obfs-password"], "s3cr3t");
+        // 老写法 obfsParam 同义。
+        let node = parse_hysteria2_link("pass@example.com:443?obfs=salamander&obfsParam=s3cr3t").unwrap();
+        assert_eq!(node["obfs-password"], "s3cr3t");
+    }
+
+    #[test]
+    fn hysteria2_obfs_without_password_is_dropped() {
+        // 缺密码的混淆留着只会让内核 fatal，整对丢掉更划算。
+        let node = parse_hysteria2_link("pass@example.com:443?obfs=salamander#TW").unwrap();
+        assert!(node.get("obfs").is_none(), "{node:?}");
+        assert!(node.get("obfs-password").is_none(), "{node:?}");
+        let node = parse_hysteria2_link("pass@example.com:443?obfs=none&obfs-password=x").unwrap();
+        assert!(node.get("obfs").is_none(), "{node:?}");
+    }
+
+    #[test]
+    fn hysteria2_port_survives_trailing_slash() {
+        // `hysteria2://…@host:443/?sni=…` 带斜杠时端口不能退化成 0。
+        let node = parse_hysteria2_link("pass@example.com:443/?sni=apple.com").unwrap();
+        assert_eq!(node["port"], 443);
     }
 }

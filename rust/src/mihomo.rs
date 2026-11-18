@@ -167,6 +167,36 @@ pub(crate) fn is_loopback_server(server: &str) -> bool {
     }
 }
 
+/// 节点级必填字段兜底：把「内核会为此整份拒绝」的残缺节点清理干净。
+///
+/// 起因是 hysteria2 的 `obfs: salamander`：内核解析时要求同时给出 `obfs-password`，
+/// 缺一个就直接 `Parse config error: proxy N: missing obfs password` **整份** fatal
+/// 退出 —— 不是这一个节点不可用，而是整个接管都起不来，而且守护会自动重试形成死循环。
+/// 订阅方给的节点本来就常有字段残缺，节点又是原样透传的，所以只能渲染前统一收口：
+/// 少一层混淆还能连，整份配置被拒就全完。
+fn sanitize_node_proxy(proxy: &mut serde_json::Map<String, Value>) {
+    if proxy.get("type").and_then(Value::as_str) != Some("hysteria2") {
+        return;
+    }
+    let obfs = proxy
+        .get("obfs")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let password = proxy
+        .get("obfs-password")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // `none` 等价于没开混淆，留着反而会触发同一处校验。
+    if obfs.is_empty() || obfs.eq_ignore_ascii_case("none") || password.is_empty() {
+        proxy.remove("obfs");
+        proxy.remove("obfs-password");
+    }
+}
+
 /// 本地 DNS 映射里指向内网地址的那几条，生成显式直连规则。
 ///
 /// 局域网里的服务交给节点毫无意义，而兜底的 `IP-CIDR` 规则在这个场景下不一定命中：
@@ -410,6 +440,7 @@ pub fn build(config: &AppConfig) -> Value {
                 }
                 proxy.insert(key.clone(), value.clone());
             }
+            sanitize_node_proxy(&mut proxy);
             // 中转自己不能挂自己，否则握手时会无限找拨号代理。
             // 指向本机回环的节点也不能挂：中转在远端，它连的是自己那台机器的
             // 127.0.0.1，永远到不了我们本机这个端口。
@@ -884,6 +915,37 @@ mod tests {
             !proxies.iter().any(|proxy| proxy.get("dialer-proxy").is_some()),
             "节点上残留的旧前置设置必须作废：{proxies:?}"
         );
+    }
+
+    #[test]
+    fn hysteria2_obfs_without_password_never_reaches_kernel() {
+        // 实测内核会 `Parse config error: proxy 10: missing obfs password` 整份 fatal，
+        // 连带整个接管起不来。节点是原样透传的，只能在渲染时收口。
+        let mut config = relay_config(&["台湾"]);
+        if let Value::Object(map) = &mut config.imported_nodes[0].config {
+            map.insert("type".into(), Value::String("hysteria2".into()));
+            map.insert("obfs".into(), Value::String("salamander".into()));
+        }
+        let proxies = build(&config)["proxies"].as_array().expect("proxies").clone();
+        let node = |list: &[Value]| {
+            list.iter()
+                .find(|proxy| proxy["name"] == Value::String("台湾".into()))
+                .cloned()
+                .expect("节点应该在 proxies 里")
+        };
+        let proxy = node(&proxies);
+        assert!(proxy.get("obfs").is_none(), "{proxies:?}");
+        assert!(proxy.get("obfs-password").is_none(), "{proxies:?}");
+        assert_eq!(proxy["type"], "hysteria2", "节点本身要保留");
+
+        // 密码齐全时原样保留。
+        if let Value::Object(map) = &mut config.imported_nodes[0].config {
+            map.insert("obfs-password".into(), Value::String("s3cr3t".into()));
+        }
+        let proxies = build(&config)["proxies"].as_array().expect("proxies").clone();
+        let proxy = node(&proxies);
+        assert_eq!(proxy["obfs"], "salamander");
+        assert_eq!(proxy["obfs-password"], "s3cr3t");
     }
 
     #[test]
