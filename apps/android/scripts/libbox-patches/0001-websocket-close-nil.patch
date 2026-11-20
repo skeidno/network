@@ -1,0 +1,17 @@
+diff --git a/transport/v2raywebsocket/conn.go b/transport/v2raywebsocket/conn.go
+index ef27723..f4c14a7 100644
+--- a/transport/v2raywebsocket/conn.go
++++ b/transport/v2raywebsocket/conn.go
+@@ -46,6 +46,12 @@ func NewConn(conn net.Conn, remoteAddr net.Addr, state ws.State) *WebsocketConn
+ }
+ 
+ func (c *WebsocketConn) Close() error {
++	// Client.upgrade 在握手失败时返回 (*WebsocketConn)(nil)，塞进 net.Conn 接口后
++	// 接口本身非 nil，调用方（如 vmess 的 common.Close）会走到这里触发空指针，
++	// Go runtime 直接 abort 整个进程。空连接没有任何要关的东西，直接返回。
++	if c == nil || c.Conn == nil {
++		return nil
++	}
+ 	c.Conn.SetWriteDeadline(time.Now().Add(C.TCPTimeout))
+ 	frame := ws.NewCloseFrame(ws.NewCloseFrameBody(
+ 		ws.StatusNormalClosure, "",

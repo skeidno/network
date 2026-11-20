@@ -1,3 +1,9 @@
+# 注意：这个脚本拉的是 sing-box 官方 CI 产出的原始 libbox.aar，**不含**本仓库的
+# nil-close 补丁。仓库里现在这份 AAR 是用 libbox-patches/ 下的补丁从 v1.13.20 源码
+# 重新编译的（只含 arm64-v8a），直接跑本脚本会把它覆盖成会崩溃的版本。
+#
+# 要升级 sing-box：先跑本脚本拿官方 AAR 对照 API，再用
+# scripts/build_libbox_patched.ps1 重新编译，别把官方 AAR 直接提交进仓库。
 param(
     [string]$GitHubToken = $env:GITHUB_TOKEN
 )
